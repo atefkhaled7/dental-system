@@ -4,20 +4,43 @@ const createInvoice = async (req, res) => {
   const { patient_id, appointment_id, items } = req.body;
   const clinic_id = req.user.clinic_id;
 
+  // 1. التحقق من وجود المريض والبنود
   if (!patient_id || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: "المريض وبنود الفاتورة مطلوبة" });
   }
 
-  const totalAmount = items.reduce(
-    (total, item) => total + item.quantity * item.unit_price,
-    0
-  );
+  // 2. فحص صارم لكل بند (Validation) لمنع الـ Data Integrity Bugs
+  for (const item of items) {
+    if (!item.description || typeof item.description !== 'string' || item.description.trim() === '') {
+      return res.status(400).json({ error: "وصف البند (description) مطلوب لكل البنود" });
+    }
+
+    const qty = parseInt(item.quantity, 10);
+    if (isNaN(qty) || qty <= 0) {
+      return res.status(400).json({ error: "الكمية (quantity) يجب أن تكون رقماً صحيحاً أكبر من الصفر" });
+    }
+
+    const price = parseFloat(item.unit_price);
+    if (isNaN(price) || price < 0) {
+      return res.status(400).json({ error: "سعر الوحدة (unit_price) يجب أن يكون رقماً صالحاً وغير سالب" });
+    }
+  }
+
+  // 3. حساب إجمالي الفاتورة بدقة القروش (Cents) لمنع عيوب الـ Floating Point
+  const totalAmountInCents = items.reduce((total, item) => {
+    const qty = parseInt(item.quantity, 10);
+    const unitPriceCents = Math.round(parseFloat(item.unit_price) * 100);
+    return total + (qty * unitPriceCents);
+  }, 0);
+
+  const totalAmount = totalAmountInCents / 100;
 
   const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
 
+    // إنشاء الفاتورة الرئيسية
     const insertInvoiceQuery = `
       INSERT INTO invoices (clinic_id, patient_id, appointment_id, total_amount, status)
       VALUES ($1, $2, $3, $4, 'unpaid')
@@ -33,20 +56,24 @@ const createInvoice = async (req, res) => {
     const newInvoice = invoiceResult.rows[0];
     const invoiceId = newInvoice.id;
 
+    // إدخال البنود بند بند بقيمها النظيفة والمفحوصة
     const insertItemQuery = `
       INSERT INTO invoice_items (clinic_id, invoice_id, procedure_code_id, description, quantity, unit_price, total_price)
       VALUES ($1, $2, $3, $4, $5, $6, $7);
     `;
 
     for (const item of items) {
-      const itemTotal = item.quantity * item.unit_price;
+      const qty = parseInt(item.quantity, 10);
+      const unitPrice = parseFloat(item.unit_price);
+      const itemTotal = (qty * Math.round(unitPrice * 100)) / 100;
+
       await client.query(insertItemQuery, [
         clinic_id,
         invoiceId,
         item.procedure_code_id || null,
-        item.description,
-        item.quantity || 1,
-        item.unit_price,
+        item.description.trim(),
+        qty,
+        unitPrice,
         itemTotal,
       ]);
     }
@@ -69,6 +96,7 @@ const createInvoice = async (req, res) => {
 const getInvoices = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const { search, status } = req.query;
+
   try {
     let query = `
       SELECT 
@@ -83,15 +111,19 @@ const getInvoices = async (req, res) => {
       WHERE invoices.clinic_id = $1
     `;
     const queryParams = [clinic_id];
+
     if (search) {
       queryParams.push(`%${search}%`);
       query += ` AND (patients.name ILIKE $${queryParams.length} OR patients.phone_number ILIKE $${queryParams.length})`;
     }
+
     if (status) {
       queryParams.push(status);
       query += ` AND invoices.status = $${queryParams.length}`;
     }
+
     query += ` ORDER BY invoices.created_at DESC;`;
+
     const invoicesResult = await pool.query(query, queryParams);
     res.status(200).json(invoicesResult.rows);
   } catch (error) {
@@ -141,12 +173,10 @@ const cancelInvoice = async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: "الفاتورة غير موجودة" });
+      return res.status(404).json({ error: "الفاتورة غير موجودة أو تم دفعها ولا يمكن إلغاؤها" });
     }
 
-    res
-      .status(200)
-      .json({ message: "تم إلغاء الفاتورة بنجاح", invoice: result.rows[0] });
+    res.status(200).json({ message: "تم إلغاء الفاتورة بنجاح", invoice: result.rows[0] });
   } catch (error) {
     console.error("Error canceling invoice:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء إلغاء الفاتورة" });

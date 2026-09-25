@@ -14,6 +14,17 @@ const createLabOrder = async (req, res) => {
       notes,
     } = req.body;
 
+    const doctorCheck = await pool.query(
+      "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role IN ('Doctor', 'ClinicAdmin')",
+      [doctor_id, clinic_id]
+    );
+
+    if (doctorCheck.rows.length === 0) {
+      return res.status(400).json({
+        error: "المستخدم المحدد غير مسجل كطبيب مصرح له في هذه العيادة",
+      });
+    }
+
     if (!patient_id || !doctor_id || !lab_name) {
       return res
         .status(400)

@@ -173,3 +173,9 @@ CREATE INDEX idx_invoices_clinic_status ON invoices(clinic_id, status);
 CREATE INDEX idx_invoices_patient ON invoices(clinic_id, patient_id); 
 CREATE INDEX idx_invoice_items_clinic_invoice ON invoice_items(clinic_id, invoice_id);
 CREATE INDEX idx_payments_clinic_invoice ON payments(clinic_id, invoice_id);
+CREATE UNIQUE INDEX uq_scheduled_appointment 
+ON appointments (clinic_id, doctor_id, appointment_date) 
+WHERE status = 'scheduled';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_appointments_doctor_slot 
+ON appointments (clinic_id, doctor_id, appointment_date) 
+WHERE status = 'scheduled';

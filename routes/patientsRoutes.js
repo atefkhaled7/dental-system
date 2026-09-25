@@ -1,12 +1,44 @@
-const express = require('express');
+const express = require("express");
 const router = express.Router();
-const { addPatient, getPatients, getPatientById, updatePatient, deletePatient } = require('../controllers/patientsController');
-const authMiddleware = require('../middleware/authMiddleware');
+const {
+  addPatient,
+  getPatients,
+  getPatientById,
+  updatePatient,
+  deletePatient,
+} = require("../controllers/patientsController");
+const authMiddleware = require("../middleware/authMiddleware");
+const authorizeRole = require("../middleware/roleMiddleware");
 
-router.post('/', authMiddleware, addPatient);
-router.get('/', authMiddleware, getPatients);
-router.get('/:id', authMiddleware, getPatientById);
-router.put('/:id', authMiddleware, updatePatient);
-router.delete('/:id', authMiddleware, deletePatient);
+router.post(
+  "/",
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  authMiddleware,
+  addPatient
+);
+router.get(
+  "/",
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  authMiddleware,
+  getPatients
+);
+router.get(
+  "/:id",
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  authMiddleware,
+  getPatientById
+);
+router.put(
+  "/:id",
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  authMiddleware,
+  updatePatient
+);
+router.delete(
+  "/:id",
+  authorizeRole("ClinicAdmin"),
+  authMiddleware,
+  deletePatient
+);
 
 module.exports = router;

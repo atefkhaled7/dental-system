@@ -4,9 +4,9 @@ const {createClinic, getClinics, updateClinic, deleteClinic} = require('../contr
 const authMiddleware = require('../middleware/authMiddleware');
 const authorizeRole = require('../middleware/roleMiddleware');
 
-router.post('/', authMiddleware, authorizeRole('ClinicAdmin'), createClinic);
-router.get('/', authMiddleware, authorizeRole('ClinicAdmin'), getClinics);
-router.put('/:id', authMiddleware, authorizeRole('ClinicAdmin'), updateClinic);
-router.delete('/:id',authMiddleware, authorizeRole('ClinicAdmin'), deleteClinic);
+router.post('/', authMiddleware, authorizeRole('SuperAdmin'), createClinic);
+router.get('/', authMiddleware, authorizeRole('SuperAdmin','ClinicAdmin'), getClinics);
+router.put('/:id', authMiddleware, authorizeRole('SuperAdmin','ClinicAdmin'), updateClinic);
+router.delete('/:id',authMiddleware, authorizeRole('SuperAdmin'), deleteClinic);
 
 module.exports = router;
