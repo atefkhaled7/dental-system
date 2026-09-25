@@ -26,6 +26,7 @@ app.use("/api/patients", require("./routes/patientsRoutes"));
 app.use("/api/procedure-codes", require("./routes/procedureCodesRoutes"));
 app.use("/api/invoices", require("./routes/invoicesRoutes"));
 app.use("/api/payments", require("./routes/paymentRoutes"));
+app.use("/api/lab-orders", require("./routes/labOrdersRoutes"));
 
 
 app.listen(PORT, () => {

@@ -1,0 +1,175 @@
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE TABLE clinics ( 
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+name VARCHAR(150) NOT NULL,
+subdomain VARCHAR(50) UNIQUE,
+phone_number VARCHAR(20),
+is_active BOOLEAN NOT NULL DEFAULT TRUE,
+created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
+CREATE TABLE users ( 
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+clinic_id UUID REFERENCES clinics(id) ON DELETE RESTRICT,
+name VARCHAR(100) NOT NULL,
+email VARCHAR(150) UNIQUE NOT NULL,
+password VARCHAR(255) NOT NULL,
+role VARCHAR(30) NOT NULL,
+created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+CONSTRAINT chk_users_role CHECK ( role IN ( 'SuperAdmin', 'ClinicAdmin', 'Doctor', 'Receptionist' ) ),
+CONSTRAINT chk_superadmin_clinic CHECK ( (role = 'SuperAdmin' AND clinic_id IS NULL) OR (role <> 'SuperAdmin' AND clinic_id IS NOT NULL) ),
+CONSTRAINT uq_users_clinic_id_id UNIQUE (clinic_id, id) 
+);
+
+
+CREATE TABLE patients ( 
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+clinic_id UUID NOT NULL REFERENCES clinics(id) ON DELETE RESTRICT,
+name VARCHAR(100) NOT NULL,
+phone_number VARCHAR(20) NOT NULL,
+gender VARCHAR(10),
+date_of_birth DATE,
+medical_alerts TEXT,
+is_active BOOLEAN NOT NULL DEFAULT TRUE,
+created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+CONSTRAINT unique_patient_phone_per_clinic UNIQUE (clinic_id, phone_number),
+CONSTRAINT uq_patients_clinic_id_id UNIQUE (clinic_id, id),
+CONSTRAINT chk_patient_gender CHECK ( gender IS NULL OR gender IN ('Male', 'Female', 'Other') ) 
+);
+
+
+CREATE TABLE procedure_codes ( 
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+clinic_id UUID NOT NULL REFERENCES clinics(id) ON DELETE RESTRICT,
+code VARCHAR(50) NOT NULL,
+description VARCHAR(255) NOT NULL,
+default_price NUMERIC(10,2) NOT NULL,
+is_active BOOLEAN NOT NULL DEFAULT TRUE,
+created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+CONSTRAINT unique_procedure_code_per_clinic UNIQUE (clinic_id, code),
+CONSTRAINT uq_procedure_codes_clinic_id_id UNIQUE (clinic_id, id),
+CONSTRAINT chk_procedure_price CHECK (default_price >= 0)
+);
+
+
+CREATE TABLE appointments ( 
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+clinic_id UUID NOT NULL REFERENCES clinics(id) ON DELETE RESTRICT,
+patient_id UUID NOT NULL,
+doctor_id UUID NOT NULL,
+appointment_date TIMESTAMPTZ NOT NULL,
+status VARCHAR(30) NOT NULL DEFAULT 'scheduled',
+notes TEXT,
+created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+CONSTRAINT chk_appointment_status CHECK ( status IN ( 'scheduled', 'completed', 'no_show', 'cancelled' ) ),
+CONSTRAINT fk_appointments_patient_same_clinic FOREIGN KEY (clinic_id, patient_id) REFERENCES patients (clinic_id, id) ON DELETE RESTRICT,
+CONSTRAINT fk_appointments_doctor_same_clinic FOREIGN KEY (clinic_id, doctor_id) REFERENCES users (clinic_id, id) ON DELETE RESTRICT,
+CONSTRAINT uq_appointments_clinic_id_id UNIQUE (clinic_id, id)
+);
+
+
+CREATE TABLE lab_orders ( 
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+clinic_id UUID NOT NULL REFERENCES clinics(id) ON DELETE RESTRICT,
+appointment_id UUID,
+patient_id UUID NOT NULL,
+doctor_id UUID NOT NULL,
+lab_name VARCHAR(150),
+design_software VARCHAR(50),
+case_number VARCHAR(50),
+status VARCHAR(30) NOT NULL DEFAULT 'sent_to_lab',
+sent_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+expected_at TIMESTAMPTZ,
+ready_at TIMESTAMPTZ,
+received_at TIMESTAMPTZ,
+notes TEXT,
+created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+CONSTRAINT chk_lab_order_status CHECK ( status IN ( 'sent_to_lab', 'ready', 'received' ) ),
+CONSTRAINT chk_lab_dates CHECK ( expected_at IS NULL OR expected_at >= sent_at ),
+CONSTRAINT uq_lab_case_number_per_clinic UNIQUE (clinic_id, case_number),
+CONSTRAINT fk_lab_orders_patient_same_clinic FOREIGN KEY (clinic_id, patient_id) REFERENCES patients (clinic_id, id) ON DELETE RESTRICT,
+CONSTRAINT fk_lab_orders_doctor_same_clinic FOREIGN KEY (clinic_id, doctor_id) REFERENCES users (clinic_id, id) ON DELETE RESTRICT,
+CONSTRAINT fk_lab_orders_appointment_same_clinic FOREIGN KEY (clinic_id, appointment_id) REFERENCES appointments (clinic_id, id) ON DELETE RESTRICT
+);
+
+
+CREATE TABLE invoices ( 
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+clinic_id UUID NOT NULL REFERENCES clinics(id) ON DELETE RESTRICT,
+patient_id UUID NOT NULL,
+appointment_id UUID,
+total_amount NUMERIC(10,2) NOT NULL DEFAULT 0,
+status VARCHAR(30) NOT NULL DEFAULT 'unpaid',
+created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+CONSTRAINT chk_invoice_total CHECK (total_amount >= 0),
+CONSTRAINT chk_invoice_status CHECK ( status IN ( 'unpaid', 'partially_paid', 'paid', 'cancelled' ) ),
+CONSTRAINT fk_invoices_patient_same_clinic FOREIGN KEY (clinic_id, patient_id) REFERENCES patients (clinic_id, id) ON DELETE RESTRICT,
+CONSTRAINT uq_invoices_clinic_id_id UNIQUE (clinic_id, id),
+CONSTRAINT fk_invoices_appointment_same_clinic FOREIGN KEY (clinic_id, appointment_id) REFERENCES appointments (clinic_id, id) ON DELETE RESTRICT
+);
+
+
+CREATE TABLE invoice_items ( 
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+clinic_id UUID NOT NULL,
+invoice_id UUID NOT NULL,
+procedure_code_id UUID,
+description VARCHAR(255) NOT NULL,
+quantity INTEGER NOT NULL DEFAULT 1,
+unit_price NUMERIC(10,2) NOT NULL,
+total_price NUMERIC(10,2) NOT NULL,
+created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+CONSTRAINT chk_invoice_item_quantity CHECK (quantity > 0),
+CONSTRAINT chk_invoice_item_unit_price CHECK (unit_price >= 0),
+CONSTRAINT chk_invoice_item_total CHECK (total_price >= 0),
+CONSTRAINT fk_invoice_items_invoice_same_clinic 
+	FOREIGN KEY (clinic_id, invoice_id) 
+	REFERENCES invoices (clinic_id, id) ON DELETE RESTRICT,
+CONSTRAINT fk_invoice_items_procedure_same_clinic
+        FOREIGN KEY (clinic_id, procedure_code_id)
+        REFERENCES procedure_codes (clinic_id, id)
+        ON DELETE RESTRICT
+);
+
+
+CREATE TABLE payments (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+clinic_id UUID NOT NULL REFERENCES clinics(id) ON DELETE RESTRICT,
+invoice_id UUID NOT NULL,
+amount NUMERIC(10,2) NOT NULL,
+payment_method VARCHAR(30) NOT NULL,
+notes TEXT, paid_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+CONSTRAINT chk_payment_amount CHECK (amount > 0),
+CONSTRAINT chk_payment_method CHECK ( payment_method IN ( 'cash', 'card', 'bank_transfer', 'other' ) ),
+CONSTRAINT fk_payments_invoice_same_clinic FOREIGN KEY (clinic_id, invoice_id) REFERENCES invoices (clinic_id, id) ON DELETE RESTRICT
+);
+
+
+CREATE INDEX idx_users_clinic_id ON users(clinic_id); 
+CREATE INDEX idx_users_clinic_role ON users(clinic_id, role); 
+CREATE INDEX idx_patients_clinic_id ON patients(clinic_id); 
+CREATE INDEX idx_patients_clinic_name ON patients(clinic_id, name); 
+CREATE INDEX idx_patients_clinic_phone ON patients(clinic_id, phone_number); 
+CREATE INDEX idx_procedure_codes_clinic_id ON procedure_codes(clinic_id); 
+CREATE INDEX idx_appointments_clinic_date ON appointments(clinic_id, appointment_date); 
+CREATE INDEX idx_appointments_clinic_status ON appointments(clinic_id, status); 
+CREATE INDEX idx_appointments_patient ON appointments(clinic_id, patient_id); 
+CREATE INDEX idx_appointments_doctor_date ON appointments(clinic_id, doctor_id, appointment_date); 
+CREATE INDEX idx_lab_orders_clinic_status ON lab_orders(clinic_id, status); 
+CREATE INDEX idx_lab_orders_clinic_expected ON lab_orders(clinic_id, expected_at); 
+CREATE INDEX idx_lab_orders_patient ON lab_orders(clinic_id, patient_id); 
+CREATE INDEX idx_lab_orders_doctor ON lab_orders(clinic_id, doctor_id); 
+CREATE INDEX idx_invoices_clinic_status ON invoices(clinic_id, status); 
+CREATE INDEX idx_invoices_patient ON invoices(clinic_id, patient_id); 
+CREATE INDEX idx_invoice_items_clinic_invoice ON invoice_items(clinic_id, invoice_id);
+CREATE INDEX idx_payments_clinic_invoice ON payments(clinic_id, invoice_id);
