@@ -15,7 +15,7 @@ const createLabOrder = async (req, res) => {
     } = req.body;
 
     const doctorCheck = await pool.query(
-      "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role IN ('Doctor', 'ClinicAdmin')",
+      "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor'",
       [doctor_id, clinic_id]
     );
 

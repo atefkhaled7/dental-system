@@ -38,7 +38,7 @@ const createAppointment = async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
     const doctorCheck = await pool.query(
-      "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role IN ('Doctor', 'ClinicAdmin')",
+      "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor'",
       [doctor_id, clinic_id]
     );
 
@@ -72,12 +72,6 @@ const createAppointment = async (req, res) => {
     ]);
     res.status(201).json({ appointment: result.rows[0] });
   } catch (error) {
-    // لو الـ Unique Index منع الحجز المزدوج:
-    if (error.code === "23505") {
-      return res.status(409).json({
-        error: "الدكتور لديه ميعاد آخر محجوز بالفعل في هذا التوقيت",
-      });
-    }
 
     if (error.code === "23505") {
       return res.status(409).json({ 

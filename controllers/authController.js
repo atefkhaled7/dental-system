@@ -12,12 +12,13 @@ const registerUser = async (req, res) => {
 
     let targetClinicId = req.user.clinic_id;
 
-    if (req.user.role === 'SuperAdmin') {
+    if (req.user.role === "SuperAdmin") {
       targetClinicId = req.body.clinic_id || null;
-    } else if (req.user.role === 'ClinicAdmin') {
-      if (!['Doctor', 'Receptionist'].includes(role)) {
-        return res.status(403).json({ 
-          error: "غير مصرح لك بمنح هذا الدور. الأدوار المتاحة: Doctor أو Receptionist فقط" 
+    } else if (req.user.role === "ClinicAdmin") {
+      if (!["Doctor", "Receptionist"].includes(role)) {
+        return res.status(403).json({
+          error:
+            "غير مصرح لك بمنح هذا الدور. الأدوار المتاحة: Doctor أو Receptionist فقط",
         });
       }
     }
@@ -36,9 +37,8 @@ const registerUser = async (req, res) => {
       message: "تم تسجيل المستخدم بنجاح",
       user: result.rows[0],
     });
-
   } catch (error) {
-    if (error.code === '23505') {
+    if (error.code === "23505") {
       return res.status(400).json({ error: "البريد الإلكتروني مسجل بالفعل" });
     }
     console.error("Error registering user:", error.message);
@@ -75,9 +75,10 @@ const loginUser = async (req, res) => {
     }
 
     // فحص مصيري: لو اليوزر مش SuperAdmin وعيادته معطلة، امنعه فوراً من الدخول!
-    if (user.role !== 'SuperAdmin' && !user.clinic_is_active) {
-      return res.status(403).json({ 
-        error: "تم تعطيل حساب هذه العيادة. يرجى التواصل مع إدارة المنصة لتجديد الاشتراك." 
+    if (user.role !== "SuperAdmin" && !user.clinic_is_active) {
+      return res.status(403).json({
+        error:
+          "تم تعطيل حساب هذه العيادة. يرجى التواصل مع إدارة المنصة لتجديد الاشتراك.",
       });
     }
 
@@ -89,7 +90,6 @@ const loginUser = async (req, res) => {
     );
 
     res.status(200).json({ message: "Login successful", token });
-
   } catch (error) {
     console.error(error.message);
     res.status(500).json({ error: "Server Error" });
@@ -98,36 +98,118 @@ const loginUser = async (req, res) => {
 
 const registerClinic = async (req, res) => {
   let client;
+
   try {
+    const { clinic_name, phone_number, admin_name, email, password } = req.body;
+
+    if (!clinic_name || !clinic_name.trim()) {
+      return res.status(400).json({
+        error: "اسم العيادة مطلوب",
+      });
+    }
+
+    if (!admin_name || !admin_name.trim()) {
+      return res.status(400).json({
+        error: "اسم مدير العيادة مطلوب",
+      });
+    }
+
+    if (!email || !email.trim()) {
+      return res.status(400).json({
+        error: "البريد الإلكتروني مطلوب",
+      });
+    }
+
+    if (!password || !password.trim()) {
+      return res.status(400).json({
+        error: "كلمة المرور مطلوبة",
+      });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({
+        error: "كلمة المرور يجب أن تكون 8 أحرف على الأقل",
+      });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    if (!emailRegex.test(email.trim())) {
+      return res.status(400).json({
+        error: "البريد الإلكتروني غير صالح",
+      });
+    }
+
     client = await pool.connect();
-    const { clinic_name, phone_number, admin_name, email, password} = req.body;
+
     await client.query("BEGIN");
+
     const clinicResult = await client.query(
-      "INSERT INTO clinics (name, phone_number) VALUES ($1, $2) RETURNING id, name, phone_number",
-      [clinic_name, phone_number]
+      `
+      INSERT INTO clinics (name, phone_number)
+      VALUES ($1, $2)
+      RETURNING id, name, phone_number
+      `,
+      [clinic_name.trim(), phone_number?.trim() || null]
     );
+
     const newClinic = clinicResult.rows[0];
 
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
     const userResult = await client.query(
-      "INSERT INTO users (clinic_id, name, email, password, role) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, role",
-      [newClinic.id, admin_name, email, hashedPassword, 'ClinicAdmin']
+      `
+      INSERT INTO users (
+        clinic_id,
+        name,
+        email,
+        password,
+        role
+      )
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id, name, email, role, clinic_id
+      `,
+      [
+        newClinic.id,
+        admin_name.trim(),
+        email.trim().toLowerCase(),
+        hashedPassword,
+        "ClinicAdmin",
+      ]
     );
+
     await client.query("COMMIT");
 
-    res.status(201).json({
+    return res.status(201).json({
       message: "Clinic and admin user registered successfully",
       clinic: newClinic,
-      admin: userResult.rows[0]
+      admin: userResult.rows[0],
     });
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Rollback error:", rollbackError.message);
+      }
+    }
+
+    if (error.code === "23505") {
+      return res.status(400).json({
+        error: "البريد الإلكتروني مسجل بالفعل",
+      });
+    }
+
     console.error("Transaction error:", error.message);
-    res.status(500).json({ error: "فشل التسجيل" });
+
+    return res.status(500).json({
+      error: "فشل التسجيل",
+    });
   } finally {
-    client.release();
+    if (client) {
+      client.release();
+    }
   }
 };
 

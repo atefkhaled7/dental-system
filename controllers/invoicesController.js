@@ -4,12 +4,10 @@ const createInvoice = async (req, res) => {
   const { patient_id, appointment_id, items } = req.body;
   const clinic_id = req.user.clinic_id;
 
-  // 1. التحقق من وجود المريض والبنود
   if (!patient_id || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: "المريض وبنود الفاتورة مطلوبة" });
   }
 
-  // 2. فحص صارم لكل بند (Validation) لمنع الـ Data Integrity Bugs
   for (const item of items) {
     if (!item.description || typeof item.description !== 'string' || item.description.trim() === '') {
       return res.status(400).json({ error: "وصف البند (description) مطلوب لكل البنود" });
@@ -26,7 +24,6 @@ const createInvoice = async (req, res) => {
     }
   }
 
-  // 3. حساب إجمالي الفاتورة بدقة القروش (Cents) لمنع عيوب الـ Floating Point
   const totalAmountInCents = items.reduce((total, item) => {
     const qty = parseInt(item.quantity, 10);
     const unitPriceCents = Math.round(parseFloat(item.unit_price) * 100);
@@ -35,12 +32,12 @@ const createInvoice = async (req, res) => {
 
   const totalAmount = totalAmountInCents / 100;
 
-  const client = await pool.connect();
+  let client;
 
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
 
-    // إنشاء الفاتورة الرئيسية
     const insertInvoiceQuery = `
       INSERT INTO invoices (clinic_id, patient_id, appointment_id, total_amount, status)
       VALUES ($1, $2, $3, $4, 'unpaid')
@@ -85,11 +82,15 @@ const createInvoice = async (req, res) => {
       invoice: newInvoice,
     });
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (client) {
+      await client.query("ROLLBACK");
+    }
     console.error("Error creating invoice:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء إنشاء الفاتورة" });
   } finally {
-    client.release();
+    if (client) {
+      client.release();
+    }
   }
 };
 
