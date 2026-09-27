@@ -4,6 +4,7 @@ const {
   createLabOrder,
   getLabOrders,
   updateLabOrderStatus,
+  updateLabOrder,
 } = require("../controllers/labOrdersController");
 const authMiddleware = require("../middleware/authMiddleware");
 const authorizeRole = require("../middleware/roleMiddleware");
@@ -19,6 +20,11 @@ router.get(
   "/",
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
   getLabOrders
+);
+router.put(
+  "/:id",
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  updateLabOrder
 );
 router.patch(
   "/:id/status",

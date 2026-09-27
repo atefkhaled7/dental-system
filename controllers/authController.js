@@ -89,7 +89,17 @@ const loginUser = async (req, res) => {
       { expiresIn: "12h" }
     );
 
-    res.status(200).json({ message: "Login successful", token });
+    res.status(200).json({
+      message: "Login successful",
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        clinic_id: user.clinic_id,
+      },
+    });
   } catch (error) {
     console.error(error.message);
     res.status(500).json({ error: "Server Error" });
@@ -213,4 +223,17 @@ const registerClinic = async (req, res) => {
   }
 };
 
-module.exports = { registerUser, loginUser, registerClinic };
+const getDoctors = async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, name FROM users WHERE clinic_id = $1 AND role = 'Doctor'",
+      [req.user.clinic_id]
+    );
+    res.status(200).json({ doctors: result.rows });
+  } catch (error) {
+    console.error("Error fetching doctors:", error.message);
+    res.status(500).json({ error: "خطأ في السيرفر" });
+  }
+};
+
+module.exports = { registerUser, loginUser, registerClinic, getDoctors };

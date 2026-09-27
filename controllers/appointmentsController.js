@@ -57,6 +57,23 @@ const createAppointment = async (req, res) => {
       });
     }
 
+    const now = new Date();
+    const appDate = new Date(appointment_date);
+
+    if (isNaN(appDate.getTime())) {
+      return res.status(400).json({ error: "تاريخ الميعاد غير صالح" });
+    }
+
+    if (appDate < new Date(now.getTime() - 15 * 60 * 1000)) {
+      return res.status(400).json({ error: "لا يمكن حجز ميعاد في تاريخ أو وقت سابق" });
+    }
+
+    const maxFuture = new Date();
+    maxFuture.setFullYear(maxFuture.getFullYear() + 1);
+    if (appDate > maxFuture) {
+      return res.status(400).json({ error: "لا يمكن حجز ميعاد لأكثر من سنة في المستقبل" });
+    }
+
     const query = `
       INSERT INTO appointments (clinic_id, patient_id, doctor_id, appointment_date, notes)
       VALUES ($1, $2, $3, $4, $5)
