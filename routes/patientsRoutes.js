@@ -6,6 +6,7 @@ const {
   getPatientById,
   updatePatient,
   deletePatient,
+  restorePatient,
 } = require("../controllers/patientsController");
 const authMiddleware = require("../middleware/authMiddleware");
 const authorizeRole = require("../middleware/roleMiddleware");
@@ -45,5 +46,7 @@ router.delete(
 
   deletePatient
 );
+
+router.patch("/:id/restore", authMiddleware, restorePatient);
 
 module.exports = router;

@@ -3,8 +3,9 @@ const pool = require("../db");
 const getAppointments = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
+    const { patient_id } = req.query; // استقبلنا patient_id
 
-    const query = `
+    let query = `
       SELECT 
         a.id AS appointment_id,
         a.appointment_date,
@@ -19,10 +20,18 @@ const getAppointments = async (req, res) => {
       JOIN patients p ON a.patient_id = p.id AND a.clinic_id = p.clinic_id
       JOIN users u ON a.doctor_id = u.id AND a.clinic_id = u.clinic_id
       WHERE a.clinic_id = $1
-      ORDER BY a.appointment_date ASC;
     `;
+    const queryParams = [clinicId];
 
-    const result = await pool.query(query, [clinicId]);
+    // لو مبعوث patient_id نفلتر بيه
+    if (patient_id) {
+      queryParams.push(patient_id);
+      query += ` AND a.patient_id = $${queryParams.length}`;
+    }
+
+    query += ` ORDER BY a.appointment_date DESC;`;
+
+    const result = await pool.query(query, queryParams);
     res.status(200).json({ appointments: result.rows });
   } catch (err) {
     console.error("Error fetching appointments:", err.message);
@@ -43,8 +52,8 @@ const createAppointment = async (req, res) => {
     );
 
     if (doctorCheck.rows.length === 0) {
-      return res.status(400).json({ 
-        error: "المستخدم المحدد غير مسجل كطبيب مصرح له في هذه العيادة" 
+      return res.status(400).json({
+        error: "المستخدم المحدد غير مسجل كطبيب مصرح له في هذه العيادة",
       });
     }
     const conflictCheck = await pool.query(
@@ -65,13 +74,17 @@ const createAppointment = async (req, res) => {
     }
 
     if (appDate < new Date(now.getTime() - 15 * 60 * 1000)) {
-      return res.status(400).json({ error: "لا يمكن حجز ميعاد في تاريخ أو وقت سابق" });
+      return res
+        .status(400)
+        .json({ error: "لا يمكن حجز ميعاد في تاريخ أو وقت سابق" });
     }
 
     const maxFuture = new Date();
     maxFuture.setFullYear(maxFuture.getFullYear() + 1);
     if (appDate > maxFuture) {
-      return res.status(400).json({ error: "لا يمكن حجز ميعاد لأكثر من سنة في المستقبل" });
+      return res
+        .status(400)
+        .json({ error: "لا يمكن حجز ميعاد لأكثر من سنة في المستقبل" });
     }
 
     const query = `
@@ -89,10 +102,9 @@ const createAppointment = async (req, res) => {
     ]);
     res.status(201).json({ appointment: result.rows[0] });
   } catch (error) {
-
     if (error.code === "23505") {
-      return res.status(409).json({ 
-        error: "الدكتور لديه ميعاد آخر محجوز بالفعل في هذا التوقيت" 
+      return res.status(409).json({
+        error: "الدكتور لديه ميعاد آخر محجوز بالفعل في هذا التوقيت",
       });
     }
 

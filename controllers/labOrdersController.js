@@ -68,7 +68,7 @@ const createLabOrder = async (req, res) => {
 const getLabOrders = async (req, res) => {
   try {
     const clinic_id = req.user.clinic_id;
-    const { status, lab_name, search } = req.query;
+    const { status, lab_name, search, patient_id } = req.query;
 
     let query = `
       SELECT 
@@ -110,6 +110,11 @@ const getLabOrders = async (req, res) => {
     if (search) {
       queryParams.push(`%${search}%`);
       query += ` AND (patients.name ILIKE $${queryParams.length} OR lab_orders.case_number ILIKE $${queryParams.length} OR lab_orders.lab_name ILIKE $${queryParams.length})`;
+    }
+
+    if (patient_id) {
+      queryParams.push(patient_id);
+      query += ` AND lab_orders.patient_id = $${queryParams.length}`;
     }
 
     query += ` ORDER BY lab_orders.sent_at DESC;`;

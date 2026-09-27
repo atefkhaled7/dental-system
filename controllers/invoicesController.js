@@ -151,7 +151,7 @@ const createInvoice = async (req, res) => {
 
 const getInvoices = async (req, res) => {
   const clinic_id = req.user.clinic_id;
-  const { search, status } = req.query;
+  const { search, status, patient_id } = req.query;
 
   try {
     let query = `
@@ -180,6 +180,11 @@ const getInvoices = async (req, res) => {
     if (status) {
       queryParams.push(status);
       query += ` AND invoices.status = $${queryParams.length}`;
+    }
+
+    if (patient_id) {
+      queryParams.push(patient_id);
+      query += ` AND invoices.patient_id = $${queryParams.length}`;
     }
 
     query += ` GROUP BY invoices.id, patients.name, patients.phone_number ORDER BY invoices.created_at DESC;`;
