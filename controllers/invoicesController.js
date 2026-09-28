@@ -151,7 +151,7 @@ const createInvoice = async (req, res) => {
 
 const getInvoices = async (req, res) => {
   const clinic_id = req.user.clinic_id;
-  const { search, status, patient_id } = req.query;
+  const { search, status, patient_id, archived } = req.query;
 
   try {
     let query = `
@@ -186,6 +186,11 @@ const getInvoices = async (req, res) => {
       queryParams.push(patient_id);
       query += ` AND invoices.patient_id = $${queryParams.length}`;
     }
+
+    // لو باعت archived=true نجيب الفواتير المؤرشفة، غير كدة نجيب النشطة فقط
+    const isArchived = archived === "true" ? true : false;
+    queryParams.push(isArchived);
+    query += ` AND invoices.is_archived = $${queryParams.length}`;
 
     query += ` GROUP BY invoices.id, patients.name, patients.phone_number ORDER BY invoices.created_at DESC;`;
 
@@ -282,4 +287,48 @@ const cancelInvoice = async (req, res) => {
   }
 };
 
-module.exports = { createInvoice, getInvoices, getInvoiceById, cancelInvoice };
+const archiveInvoice = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const clinic_id = req.user.clinic_id;
+    const userRole = req.user.role;
+
+    // حماية صارمة: منع الريسبشن نهائياً من أرشفة الفواتير (الأدمن فقط)
+    if (userRole === "Receptionist") {
+      return res.status(403).json({
+        error: "غير مصرح لك بأرشفة الفواتير، هذه الصلاحية لمدير العيادة فقط",
+      });
+    }
+
+    const query = `
+      UPDATE invoices 
+      SET is_archived = TRUE, updated_at = CURRENT_TIMESTAMP 
+      WHERE id = $1 AND clinic_id = $2 AND is_archived = FALSE
+      RETURNING id, total_amount, is_archived;
+    `;
+
+    const result = await pool.query(query, [id, clinic_id]);
+
+    if (result.rows.length === 0) {
+      return res
+        .status(404)
+        .json({ error: "الفاتورة غير موجودة أو تمت أرشفتها بالفعل" });
+    }
+
+    res.status(200).json({
+      message: "تم أرشفة الفاتورة بنجاح ولا يمكن التراجع عن هذا الإجراء",
+      invoice: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Error archiving invoice:", error.message);
+    res.status(500).json({ error: "خطأ في السيرفر أثناء أرشفة الفاتورة" });
+  }
+};
+
+module.exports = {
+  createInvoice,
+  getInvoices,
+  getInvoiceById,
+  cancelInvoice,
+  archiveInvoice,
+};

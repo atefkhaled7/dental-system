@@ -213,11 +213,9 @@ const rescheduleAppointment = async (req, res) => {
     );
 
     if (conflictCheck.rows.length > 0) {
-      return res
-        .status(409)
-        .json({
-          error: "الدكتور لديه ميعاد آخر محجوز بالفعل في هذا التوقيت الجديد",
-        });
+      return res.status(409).json({
+        error: "الدكتور لديه ميعاد آخر محجوز بالفعل في هذا التوقيت الجديد",
+      });
     }
 
     // تحديث الموعد وإعادته لحالة scheduled
@@ -244,9 +242,113 @@ const rescheduleAppointment = async (req, res) => {
   }
 };
 
+const deleteAppointment = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { id } = req.params;
+    const clinic_id = req.user.clinic_id;
+
+    await client.query("BEGIN");
+
+    // 1. نتأكد إن فيه موعد فعلاً في نفس العيادة
+    const appointmentCheck = await client.query(
+      `SELECT id
+       FROM appointments
+       WHERE id = $1 AND clinic_id = $2
+       FOR UPDATE`,
+      [id, clinic_id]
+    );
+
+    if (appointmentCheck.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        error: "الموعد غير موجود في هذه العيادة",
+      });
+    }
+
+    // 2. لو فيه فاتورة نشطة مربوطة بالموعد -> ممنوع الحذف
+    const activeInvoiceCheck = await client.query(
+      `SELECT id
+       FROM invoices
+       WHERE appointment_id = $1
+         AND clinic_id = $2
+         AND is_archived = FALSE
+       FOR UPDATE`,
+      [id, clinic_id]
+    );
+
+    if (activeInvoiceCheck.rows.length > 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(400).json({
+        error:
+          "لا يمكن حذف هذا الموعد لأنه مرتبط بفاتورة نشطة. يجب أرشفة الفاتورة أولاً.",
+      });
+    }
+
+    // 3. أي فاتورة مؤرشفة مرتبطة بالموعد:
+    // نفصلها عن الموعد مع الاحتفاظ بالفاتورة وسجلها المالي
+    await client.query(
+      `UPDATE invoices
+       SET appointment_id = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE appointment_id = $1
+         AND clinic_id = $2
+         AND is_archived = TRUE`,
+      [id, clinic_id]
+    );
+
+    // 4. نفصل طلبات المعمل عن الموعد
+    // ونحتفظ بطلبات المعمل نفسها
+    await client.query(
+      `UPDATE lab_orders
+       SET appointment_id = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE appointment_id = $1
+         AND clinic_id = $2`,
+      [id, clinic_id]
+    );
+
+    // 5. حذف الموعد نهائياً
+    const result = await client.query(
+      `DELETE FROM appointments
+       WHERE id = $1 AND clinic_id = $2
+       RETURNING id`,
+      [id, clinic_id]
+    );
+
+    if (result.rows.length === 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        error: "فشل حذف الموعد",
+      });
+    }
+
+    await client.query("COMMIT");
+
+    res.status(200).json({
+      message: "تم حذف الموعد نهائياً بنجاح",
+      appointment_id: id,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    console.error("Error deleting appointment:", error.message);
+
+    res.status(500).json({
+      error: "خطأ في السيرفر أثناء حذف الموعد",
+    });
+  } finally {
+    client.release();
+  }
+};
+
 module.exports = {
   getAppointments,
   createAppointment,
   updateAppointmentStatus,
   rescheduleAppointment,
+  deleteAppointment,
 };
