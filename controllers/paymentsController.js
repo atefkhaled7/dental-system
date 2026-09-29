@@ -44,6 +44,13 @@ const recordPayment = async (req, res) => {
       return res.status(400).json({ error: "لا يمكن الدفع لفاتورة ملغاة" });
     }
 
+    if (invoice.is_archived) {
+      await client.query("ROLLBACK");
+      return res
+        .status(400)
+        .json({ error: "لا يمكن تسجيل دفعة على فاتورة مؤرشفة" });
+    }
+
     const paidResult = await client.query(
       "SELECT COALESCE(SUM(amount), 0) AS total_paid FROM payments WHERE invoice_id = $1 AND clinic_id = $2",
       [invoice_id, clinic_id]

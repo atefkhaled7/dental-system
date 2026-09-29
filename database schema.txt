@@ -177,3 +177,12 @@ CREATE INDEX idx_payments_clinic_invoice ON payments(clinic_id, invoice_id);
 CREATE UNIQUE INDEX uq_scheduled_appointment 
 ON appointments (clinic_id, doctor_id, appointment_date) 
 WHERE status = 'scheduled';
+
+
+
+ALTER TABLE invoices ADD COLUMN IF NOT EXISTS is_archived BOOLEAN DEFAULT FALSE;
+ALTER TABLE patients ADD COLUMN IF NOT EXISTS is_archived BOOLEAN DEFAULT FALSE;
+ALTER TABLE lab_orders DROP CONSTRAINT IF EXISTS chk_lab_order_status;
+ALTER TABLE lab_orders ADD CONSTRAINT chk_lab_order_status CHECK ( status IN ( 'sent_to_lab', 'ready', 'received', 'cancelled' ) );
+ALTER TABLE lab_orders ADD COLUMN IF NOT EXISTS lab_notes TEXT;
+

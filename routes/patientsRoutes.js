@@ -47,6 +47,11 @@ router.delete(
   deletePatient
 );
 
-router.patch("/:id/restore", authMiddleware, restorePatient);
+router.patch(
+  "/:id/restore",
+  authMiddleware,
+  authorizeRole("ClinicAdmin"),
+  restorePatient
+);
 
 module.exports = router;

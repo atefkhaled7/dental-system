@@ -30,7 +30,7 @@ const registerUser = async (req, res) => {
       `INSERT INTO users (clinic_id, name, email, password, role) 
        VALUES ($1, $2, $3, $4, $5) 
        RETURNING id, name, email, role, clinic_id;`,
-      [targetClinicId, name, email, hashedPassword, role]
+      [targetClinicId, name, email.trim().toLowerCase(), hashedPassword, role]
     );
 
     res.status(201).json({
@@ -53,13 +53,14 @@ const loginUser = async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    // بنسحب اليوزر وحالة عيادته في نفس الكويري!
+    const normalizedEmail = email.trim().toLowerCase();
+
     const result = await pool.query(
       `SELECT users.*, clinics.is_active AS clinic_is_active 
        FROM users 
        LEFT JOIN clinics ON users.clinic_id = clinics.id 
        WHERE users.email = $1`,
-      [email]
+      [normalizedEmail]
     );
 
     if (result.rows.length === 0) {

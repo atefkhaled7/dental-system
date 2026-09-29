@@ -9,8 +9,6 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
 
-
-
 const testConnection = async () => {
   try {
     const res = await pool.query("SELECT NOW()");
@@ -29,7 +27,8 @@ app.use("/api/procedure-codes", require("./routes/procedureCodesRoutes"));
 app.use("/api/invoices", require("./routes/invoicesRoutes"));
 app.use("/api/payments", require("./routes/paymentRoutes"));
 app.use("/api/lab-orders", require("./routes/labOrdersRoutes"));
-
+app.use("/api/dashboard", require("./routes/dashboardRoutes"));
+app.use("/api/dental-chart", require("./routes/dentalChartRoutes"));
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}... Ready for Cash!`);

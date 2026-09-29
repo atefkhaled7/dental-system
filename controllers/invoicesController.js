@@ -49,12 +49,24 @@ const createInvoice = async (req, res) => {
   const paidNow = initial_payment ? parseFloat(initial_payment.amount) || 0 : 0;
   const paidNowCents = Math.round(paidNow * 100);
 
-  // تحديد الحالة المبدئية
+  if (paidNowCents > totalAmountInCents) {
+    return res.status(400).json({
+      error: "المبلغ المدفوع أكبر من إجمالي الفاتورة",
+    });
+  }
+
   let initialStatus = "unpaid";
   if (paidNowCents >= totalAmountInCents && totalAmountInCents > 0) {
     initialStatus = "paid";
   } else if (paidNowCents > 0) {
     initialStatus = "partially_paid";
+  }
+
+  const validMethods = ["cash", "card", "bank_transfer", "other"];
+  const paymentMethod = initial_payment?.payment_method || "cash";
+
+  if (paidNowCents > 0 && !validMethods.includes(paymentMethod)) {
+    return res.status(400).json({ error: "طريقة الدفع غير صالحة" });
   }
 
   const client = await pool.connect();
@@ -63,8 +75,32 @@ const createInvoice = async (req, res) => {
     await client.query("BEGIN");
 
     let finalAppointmentId = appointment_id || null;
+    if (finalAppointmentId) {
+      const apptCheck = await client.query(
+        "SELECT id FROM appointments WHERE id = $1 AND clinic_id = $2 AND patient_id = $3",
+        [finalAppointmentId, clinic_id, patient_id]
+      );
+      if (apptCheck.rows.length === 0) {
+        await client.query("ROLLBACK");
+        client.release();
+        return res.status(400).json({
+          error: "الموعد المحدد لا يخص هذا المريض",
+        });
+      }
+    }
 
     if (!finalAppointmentId && doctor_id) {
+      const doctorCheck = await client.query(
+        "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor'",
+        [doctor_id, clinic_id]
+      );
+      if (doctorCheck.rows.length === 0) {
+        await client.query("ROLLBACK");
+        client.release();
+        return res.status(400).json({
+          error: "المستخدم المحدد غير مسجل كطبيب مصرح له في هذه العيادة",
+        });
+      }
       const appDate = appointment_date
         ? new Date(appointment_date)
         : new Date();
@@ -128,7 +164,7 @@ const createInvoice = async (req, res) => {
           clinic_id,
           invoiceId,
           paidNow,
-          initial_payment.payment_method || "cash",
+          paymentMethod,
           initial_payment.notes || "دفعة فورية عند إصدار الفاتورة",
         ]
       );
@@ -142,6 +178,11 @@ const createInvoice = async (req, res) => {
     });
   } catch (error) {
     await client.query("ROLLBACK");
+    if (error.code === "23503") {
+      return res
+        .status(400)
+        .json({ error: "بيانات غير صحيحة (مريض أو دكتور أو بند غير موجود)" });
+    }
     console.error("Error creating invoice:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء إنشاء الفاتورة" });
   } finally {
