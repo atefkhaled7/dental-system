@@ -1,0 +1,282 @@
+const pool = require("../db");
+const path = require("path");
+const fs = require("fs");
+
+const VALID_CATEGORIES = [
+  "xray_periapical",
+  "xray_panoramic",
+  "photo_before",
+  "photo_after",
+  "other",
+];
+
+const VALID_FDI_TEETH = new Set([
+  11, 12, 13, 14, 15, 16, 17, 18, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33,
+  34, 35, 36, 37, 38, 41, 42, 43, 44, 45, 46, 47, 48,
+]);
+
+const verifyImageMagicBytes = (filePath) => {
+  try {
+    const buffer = Buffer.alloc(12);
+    const fd = fs.openSync(filePath, "r");
+    fs.readSync(fd, buffer, 0, 12, 0);
+    fs.closeSync(fd);
+
+    // 1. JPEG: FF D8 FF
+    if (
+      buffer[0] === 0xff &&
+      buffer[1] === 0xd8 &&
+      buffer[2] === 0xff
+    ) {
+      return true;
+    }
+
+    // 2. PNG: 89 50 4E 47
+    if (
+      buffer[0] === 0x89 &&
+      buffer[1] === 0x50 &&
+      buffer[2] === 0x4e &&
+      buffer[3] === 0x47
+    ) {
+      return true;
+    }
+
+    // 3. WEBP: RIFF....WEBP
+    if (
+      buffer.toString("ascii", 0, 4) === "RIFF" &&
+      buffer.toString("ascii", 8, 12) === "WEBP"
+    ) {
+      return true;
+    }
+
+    return false;
+  } catch (err) {
+    return false;
+  }
+};
+
+// 1. رفع صورة طبية جديدة لمريض مع التنظيف عند الفشل وفحص الـ Magic Bytes
+const uploadPatientImage = async (req, res) => {
+  // دالة مساعدة لمسح الملف في حالة الخطأ
+  const cleanupFile = () => {
+    if (req.file?.path && fs.existsSync(req.file.path)) {
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch (e) {
+        console.error("Failed to delete orphaned file:", e.message);
+      }
+    }
+  };
+
+  try {
+    const clinicId = req.user.clinic_id;
+    const userId = req.user.id;
+    const { patientId } = req.params;
+    const { tooth_number, category, description } = req.body;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "يرجى اختيار ملف الصورة لرفعه" });
+    }
+
+    // 🔒 1. فحص الـ Magic Bytes الحقيقي للملف
+    const isValidImage = verifyImageMagicBytes(req.file.path);
+    if (!isValidImage) {
+      cleanupFile();
+      return res.status(400).json({
+        error:
+          "الملف المرفوع ليس صورة صالحة أو تم التلاعب بامتداده (يسمح فقط بـ JPG, PNG, WEBP)",
+      });
+    }
+
+    // 🔒 2. فحص المريض وعزل العيادة
+    const patientCheck = await pool.query(
+      "SELECT id FROM patients WHERE id = $1 AND clinic_id = $2 AND is_active = TRUE",
+      [patientId, clinicId]
+    );
+
+    if (patientCheck.rows.length === 0) {
+      cleanupFile();
+      return res
+        .status(404)
+        .json({ error: "المريض غير موجود في هذه العيادة أو تمت أرشفته" });
+    }
+
+    // 3. فحص السن
+    let validatedTooth = null;
+    if (
+      tooth_number !== undefined &&
+      tooth_number !== null &&
+      tooth_number !== ""
+    ) {
+      const parsedTooth = parseInt(tooth_number, 10);
+      if (isNaN(parsedTooth) || !VALID_FDI_TEETH.has(parsedTooth)) {
+        cleanupFile();
+        return res.status(400).json({ error: "رقم السن غير صالح بنظام FDI" });
+      }
+      validatedTooth = parsedTooth;
+    }
+
+    const normalizedCategory =
+      category && VALID_CATEGORIES.includes(category) ? category : "other";
+
+    // اسم الملف الداخلي على القرص (بدون مسار public ثابت)
+    const storageKey = req.file.filename;
+
+    const query = `
+      INSERT INTO patient_images (
+        clinic_id, patient_id, tooth_number, category, 
+        file_url, file_name, mime_type, file_size, description, uploaded_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING *;
+    `;
+
+    const values = [
+      clinicId,
+      patientId,
+      validatedTooth,
+      normalizedCategory,
+      storageKey, // نخزن الـ filename المشفر كـ storage_key
+      req.file.originalname,
+      req.file.mimetype,
+      req.file.size,
+      description ? description.trim() : null,
+      userId,
+    ];
+
+    const result = await pool.query(query, values);
+
+    res.status(201).json({
+      message: "تم رفع وتوثيق الصورة الطبية بنجاح",
+      image: result.rows[0],
+    });
+  } catch (error) {
+    cleanupFile(); // 👈 لو فشل الـ INSERT نمسح الملف فوراً
+    console.error("Error uploading patient image:", error.message);
+    res.status(500).json({ error: "خطأ في السيرفر أثناء رفع الصورة" });
+  }
+};
+
+// 2. جلب صور المريض
+const getPatientImages = async (req, res) => {
+  try {
+    const clinicId = req.user.clinic_id;
+    const { patientId } = req.params;
+    const { tooth_number, category, archived } = req.query;
+
+    const isArchived = archived === "true";
+
+    let query = `
+      SELECT 
+        pi.*,
+        u.name AS doctor_name
+      FROM patient_images pi
+      LEFT JOIN users u ON pi.uploaded_by = u.id
+      WHERE pi.clinic_id = $1 AND pi.patient_id = $2 AND pi.is_archived = $3
+    `;
+    const queryParams = [clinicId, patientId, isArchived];
+
+    if (tooth_number) {
+      queryParams.push(parseInt(tooth_number, 10));
+      query += ` AND pi.tooth_number = $${queryParams.length}`;
+    }
+
+    if (category && VALID_CATEGORIES.includes(category)) {
+      queryParams.push(category);
+      query += ` AND pi.category = $${queryParams.length}`;
+    }
+
+    query += ` ORDER BY pi.created_at DESC;`;
+
+    const result = await pool.query(query, queryParams);
+    res.status(200).json({ images: result.rows });
+  } catch (error) {
+    console.error("Error fetching patient images:", error.message);
+    res.status(500).json({ error: "خطأ في السيرفر أثناء جلب الصور الطبية" });
+  }
+};
+
+// 🌟 3. عرض وتحميل الصورة الطبية عبر Endpoint محمي بـ JWT وعزل العيادة (Stream Protected File)
+const getProtectedImageFile = async (req, res) => {
+  try {
+    const clinicId = req.user.clinic_id;
+    const { id } = req.params;
+
+    // التأكد إن الصورة مسجلة وتخص عيادة المستخدم الحالي
+    const imageQuery = `
+      SELECT file_url, file_name, mime_type 
+      FROM patient_images 
+      WHERE id = $1 AND clinic_id = $2;
+    `;
+    const imageRes = await pool.query(imageQuery, [id, clinicId]);
+
+    if (imageRes.rows.length === 0) {
+      return res
+        .status(404)
+        .json({ error: "الصورة غير موجودة أو غير مصرح لك بالوصول إليها" });
+    }
+
+    const { file_url, mime_type } = imageRes.rows[0];
+    const absolutePath = path.join(
+      __dirname,
+      "../uploads/patient-images",
+      file_url
+    );
+
+    if (!fs.existsSync(absolutePath)) {
+      return res.status(404).json({ error: "ملف الصورة غير موجود على الخادم" });
+    }
+
+    // إرسال الملف بشكل آمن مع تحديد الـ Content-Type الصحيح
+    res.setHeader("Content-Type", mime_type);
+    res.sendFile(absolutePath);
+  } catch (error) {
+    console.error("Error streaming image file:", error.message);
+    res.status(500).json({ error: "خطأ في السيرفر أثناء فتح الصورة" });
+  }
+};
+
+// 4. أرشفة الصورة الطبية (Soft Delete)
+const archivePatientImage = async (req, res) => {
+  try {
+    const clinicId = req.user.clinic_id;
+    const userRole = req.user.role;
+    const { id } = req.params;
+
+    if (!["ClinicAdmin", "Doctor"].includes(userRole)) {
+      return res
+        .status(403)
+        .json({ error: "غير مصرح لك بأرشفة السجلات الطبية أو صور الأشعة" });
+    }
+
+    const query = `
+      UPDATE patient_images
+      SET is_archived = TRUE
+      WHERE id = $1 AND clinic_id = $2 AND is_archived = FALSE
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, [id, clinicId]);
+
+    if (result.rows.length === 0) {
+      return res
+        .status(404)
+        .json({ error: "الصورة الطبية غير موجودة أو تمت أرشفتها بالفعل" });
+    }
+
+    res.status(200).json({
+      message: "تمت أرشفة الصورة الطبية بنجاح مع الحفاظ على السجل القانوني",
+      image: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Error archiving patient image:", error.message);
+    res.status(500).json({ error: "خطأ في السيرفر أثناء أرشفة الصورة" });
+  }
+};
+
+module.exports = {
+  uploadPatientImage,
+  getPatientImages,
+  getProtectedImageFile,
+  archivePatientImage,
+};

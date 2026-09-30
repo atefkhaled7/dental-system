@@ -204,8 +204,18 @@ const getInvoices = async (req, res) => {
         invoices.status, 
         invoices.created_at,
         invoices.appointment_id,
-        COALESCE(SUM(payments.amount), 0) AS paid_amount,
-        (invoices.total_amount - COALESCE(SUM(payments.amount), 0)) AS remaining_amount
+        COALESCE(
+  SUM(CASE WHEN payments.status = 'paid' THEN payments.amount ELSE 0 END),
+  0
+) AS paid_amount,
+
+(
+  invoices.total_amount -
+  COALESCE(
+    SUM(CASE WHEN payments.status = 'paid' THEN payments.amount ELSE 0 END),
+    0
+  )
+) AS remaining_amount
       FROM invoices 
       JOIN patients ON invoices.patient_id = patients.id 
       LEFT JOIN payments ON invoices.id = payments.invoice_id AND invoices.clinic_id = payments.clinic_id
@@ -283,16 +293,16 @@ const getInvoiceById = async (req, res) => {
 
     // جلب سجل المدفوعات بالتفصيل (دفع إيه وإمتى وطريقة الدفع)
     const paymentsResult = await pool.query(
-      "SELECT id, amount, payment_method, notes, paid_at FROM payments WHERE clinic_id = $1 AND invoice_id = $2 ORDER BY paid_at DESC",
+      "SELECT id, amount, payment_method, status, notes, paid_at, created_at FROM payments WHERE clinic_id = $1 AND invoice_id = $2 ORDER BY paid_at DESC",
       [clinic_id, invoiceId]
     );
     invoice.payments = paymentsResult.rows;
 
     // حساب المدفوع والمتبقي
-    const totalPaid = paymentsResult.rows.reduce(
-      (sum, p) => sum + parseFloat(p.amount),
-      0
-    );
+    const totalPaid = paymentsResult.rows
+      .filter((p) => p.status === "paid")
+      .reduce((sum, p) => sum + parseFloat(p.amount), 0);
+
     invoice.paid_amount = totalPaid;
     invoice.remaining_amount = parseFloat(invoice.total_amount) - totalPaid;
 
