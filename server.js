@@ -31,6 +31,7 @@ app.use("/api/dashboard", require("./routes/dashboardRoutes"));
 app.use("/api/dental-chart", require("./routes/dentalChartRoutes"));
 app.use("/api/treatment-plans", require("./routes/treatmentPlansRoutes"));
 app.use("/api/patient-images", require("./routes/patientImagesRoutes"));
+app.use("/api/whatsapp", require("./routes/whatsappRoutes"));
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}... Ready for Cash!`);
