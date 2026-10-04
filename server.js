@@ -2,8 +2,25 @@ require("dotenv").config();
 const cors = require("cors");
 const express = require("express");
 const pool = require("./db");
-
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 const app = express();
+
+
+app.use(helmet());
+
+// 2. حماية تسجيل الدخول من محاولات التخمين (10 محاولات كل 15 دقيقة)
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: {
+    error: "تم تجاوز عدد المحاولات المسموح بها، يرجى المحاولة بعد 15 دقيقة",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use("/api/auth/login", loginLimiter);
+
 app.use(cors());
 app.use(express.json());
 
