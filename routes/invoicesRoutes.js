@@ -28,11 +28,6 @@ router.get(
   getInvoiceById
 );
 router.patch("/:id/cancel", authorizeRole("ClinicAdmin"), cancelInvoice);
-router.patch(
-  "/:id/archive",
-  authMiddleware,
-  authorizeRole("ClinicAdmin"),
-  archiveInvoice
-);
+router.patch("/:id/archive", authorizeRole("ClinicAdmin"), archiveInvoice);
 
 module.exports = router;

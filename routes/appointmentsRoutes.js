@@ -25,7 +25,7 @@ router.post(
 router.patch(
   "/:id/status",
   authMiddleware,
-  authorizeRole("ClinicAdmin", "Doctor"),
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
   updateAppointmentStatus
 );
 router.patch(

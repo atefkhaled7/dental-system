@@ -169,55 +169,71 @@ const updateLabOrder = async (req, res) => {
   try {
     const clinic_id = req.user.clinic_id;
     const { id } = req.params;
-    const {
-      lab_name,
-      case_number,
-      design_software,
-      expected_at,
-      notes,
-      lab_notes,
-    } = req.body;
+
+    const allowedFields = [
+      "lab_name",
+      "case_number",
+      "design_software",
+      "expected_at",
+      "notes",
+      "lab_notes",
+    ];
+
+    const updateParts = [];
+    const queryParams = [];
+
+    for (const field of allowedFields) {
+      if (Object.prototype.hasOwnProperty.call(req.body, field)) {
+        queryParams.push(req.body[field] === "" ? null : req.body[field]);
+        updateParts.push(`${field} = $${queryParams.length}`);
+      }
+    }
+
+    if (updateParts.length === 0) {
+      return res.status(400).json({
+        error: "لا توجد بيانات لتعديلها",
+      });
+    }
+
+    queryParams.push(id);
+    const idParam = queryParams.length;
+
+    queryParams.push(clinic_id);
+    const clinicParam = queryParams.length;
 
     const query = `
       UPDATE lab_orders
-      SET 
-        lab_name = COALESCE($1, lab_name),
-        case_number = COALESCE($2, case_number),
-        design_software = COALESCE($3, design_software),
-        expected_at = COALESCE($4, expected_at),
-        notes = COALESCE($5, notes),
-        lab_notes = COALESCE($6, lab_notes),
+      SET
+        ${updateParts.join(", ")},
         updated_at = CURRENT_TIMESTAMP
-      WHERE id = $7 AND clinic_id = $8
+      WHERE id = $${idParam}
+        AND clinic_id = $${clinicParam}
       RETURNING *;
     `;
 
-    const result = await pool.query(query, [
-      lab_name || null,
-      case_number || null,
-      design_software || null,
-      expected_at || null,
-      notes || null,
-      lab_notes || null,
-      id,
-      clinic_id,
-    ]);
+    const result = await pool.query(query, queryParams);
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: "طلب المعمل غير موجود" });
+      return res.status(404).json({
+        error: "طلب المعمل غير موجود",
+      });
     }
 
-    res
-      .status(200)
-      .json({ message: "تم حفظ التعديلات بنجاح", lab_order: result.rows[0] });
+    res.status(200).json({
+      message: "تم حفظ التعديلات بنجاح",
+      lab_order: result.rows[0],
+    });
   } catch (error) {
     if (error.code === "23505") {
-      return res
-        .status(400)
-        .json({ error: "رقم الحالة مسجل بالفعل في هذه العيادة" });
+      return res.status(400).json({
+        error: "رقم الحالة مسجل بالفعل في هذه العيادة",
+      });
     }
-    console.error("Error updating lab order:", error);
-    res.status(500).json({ error: "حدث خطأ أثناء تعديل طلب المعمل" });
+
+    console.error("Error updating lab order:", error.message);
+    res.status(500).json({
+      error: "حدث خطأ أثناء تعديل طلب المعمل",
+    });
   }
 };
 

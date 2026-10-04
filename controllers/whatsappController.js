@@ -1,4 +1,3 @@
-// controllers/whatsappController.js
 const pool = require("../db");
 const whatsAppService = require("../services/whatsapp/WhatsAppService");
 
@@ -8,6 +7,12 @@ const getAppointmentWhatsAppLink = async (req, res) => {
 
   if (!appointment_id || !type) {
     return res.status(400).json({ error: "معرف الموعد ونوع الرسالة مطلوبان" });
+  }
+
+  const allowedTypes = ["confirmation", "reminder", "no_show", "feedback", "follow_up"];
+
+  if (!allowedTypes.includes(type)) {
+    return res.status(400).json({ error: "نوع رسالة الواتساب غير صالح" });
   }
 
   try {
@@ -39,6 +44,7 @@ const getAppointmentWhatsAppLink = async (req, res) => {
     const formattedDate = new Date(appt.appointment_date).toLocaleDateString(
       "ar-EG",
       {
+        timeZone: "Africa/Cairo",
         weekday: "long",
         year: "numeric",
         month: "long",
@@ -49,6 +55,7 @@ const getAppointmentWhatsAppLink = async (req, res) => {
     const formattedTime = new Date(appt.appointment_date).toLocaleTimeString(
       "ar-EG",
       {
+        timeZone: "Africa/Cairo",
         hour: "2-digit",
         minute: "2-digit",
         hour12: true,

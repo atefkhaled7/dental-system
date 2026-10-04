@@ -10,11 +10,21 @@ const getDashboardStats = async (req, res) => {
       FROM payments p
       JOIN invoices inv ON p.invoice_id = inv.id
       WHERE p.clinic_id = $1 
-        AND DATE(p.paid_at) = CURRENT_DATE 
-        AND inv.is_archived = FALSE;
+      AND p.status = 'paid'
+        AND DATE(p.paid_at) = CURRENT_DATE;
     `;
 
-    // 2. فلوس برة (إجمالي المبالغ المتبقية على المرضى في الفواتير غير المؤرشفة وغير المسددة بالكامل)
+    // 2. إيرادات الشهر الحالي (من أول يوم في الشهر حتى الآن)
+    const monthIncomeQuery = `
+      SELECT COALESCE(SUM(p.amount), 0) AS month_income
+      FROM payments p
+      JOIN invoices inv ON p.invoice_id = inv.id
+      WHERE p.clinic_id = $1  AND p.status = 'paid'
+        AND p.paid_at >= DATE_TRUNC('month', CURRENT_DATE)
+    AND p.paid_at < DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month';
+    `;
+
+    // 3. فلوس برة (إجمالي المبالغ المتبقية على المرضى)
     const totalDuesQuery = `
       SELECT COALESCE(SUM(inv.total_amount - COALESCE(p_sum.total_paid, 0)), 0) AS total_dues
       FROM invoices inv
@@ -22,6 +32,7 @@ const getDashboardStats = async (req, res) => {
         SELECT invoice_id, SUM(amount) AS total_paid
         FROM payments
         WHERE clinic_id = $1
+        AND status = 'paid'
         GROUP BY invoice_id
       ) p_sum ON inv.id = p_sum.invoice_id
       WHERE inv.clinic_id = $1 
@@ -29,46 +40,56 @@ const getDashboardStats = async (req, res) => {
         AND inv.status NOT IN ('paid', 'cancelled');
     `;
 
-    // 3. مواعيد اليوم الحية + فحص الفاتورة السابقة + إجمالي ديون المريض
+    // 4. مواعيد اليوم الحية + فحص الفاتورة + إجمالي ديون المريض
     const todayAppointmentsQuery = `
-   SELECT 
-     a.id AS appointment_id,
-     a.appointment_date,
-     a.status,
-     a.notes,
-     p.id AS patient_id,
-     p.name AS patient_name,
-     p.phone_number AS patient_phone,
-     u.id AS doctor_id,
-     u.name AS doctor_name,
-     inv.id AS appointment_invoice_id,
-     inv.status AS appointment_invoice_status,
-     COALESCE(patient_dues.total_due, 0) AS patient_total_due
-   FROM appointments a
-   JOIN patients p ON a.patient_id = p.id AND a.clinic_id = p.clinic_id
-   JOIN users u ON a.doctor_id = u.id AND a.clinic_id = u.clinic_id
-   -- فحص هل الموعد له فاتورة نشطة
-   LEFT JOIN invoices inv ON a.id = inv.appointment_id AND inv.clinic_id = a.clinic_id AND inv.is_archived = FALSE
-   -- حساب إجمالي الديون المتبقية على هذا المريض في العيادة
-   LEFT JOIN (
-     SELECT 
-       i.patient_id,
-       SUM(i.total_amount - COALESCE(pay_sum.paid, 0)) AS total_due
-     FROM invoices i
-     LEFT JOIN (
-       SELECT invoice_id, SUM(amount) AS paid 
-       FROM payments 
-       WHERE clinic_id = $1 
-       GROUP BY invoice_id
-     ) pay_sum ON i.id = pay_sum.invoice_id
-     WHERE i.clinic_id = $1 AND i.is_archived = FALSE AND i.status NOT IN ('paid', 'cancelled')
-     GROUP BY i.patient_id
-   ) patient_dues ON p.id = patient_dues.patient_id
-   WHERE a.clinic_id = $1 AND DATE(a.appointment_date) = CURRENT_DATE
-   ORDER BY a.appointment_date ASC;
- `;
+      SELECT 
+        a.id AS appointment_id,
+        a.appointment_date,
+        a.status,
+        a.notes,
+        p.id AS patient_id,
+        p.name AS patient_name,
+        p.phone_number AS patient_phone,
+        u.id AS doctor_id,
+        u.name AS doctor_name,
+        inv.id AS appointment_invoice_id,
+        inv.status AS appointment_invoice_status,
+        COALESCE(patient_dues.total_due, 0) AS patient_total_due
+      FROM appointments a
+      JOIN patients p ON a.patient_id = p.id AND a.clinic_id = p.clinic_id
+      JOIN users u ON a.doctor_id = u.id AND a.clinic_id = u.clinic_id
+      LEFT JOIN LATERAL (
+  SELECT
+    i.id,
+    i.status
+  FROM invoices i
+  WHERE i.appointment_id = a.id
+    AND i.clinic_id = a.clinic_id
+    AND i.is_archived = FALSE
+    AND i.status <> 'cancelled'
+  ORDER BY i.created_at DESC
+  LIMIT 1
+) inv ON TRUE
+      LEFT JOIN (
+        SELECT 
+          i.patient_id,
+          SUM(i.total_amount - COALESCE(pay_sum.paid, 0)) AS total_due
+        FROM invoices i
+        LEFT JOIN (
+          SELECT invoice_id, SUM(amount) AS paid 
+          FROM payments 
+          WHERE clinic_id = $1 
+          AND status = 'paid'
+          GROUP BY invoice_id
+        ) pay_sum ON i.id = pay_sum.invoice_id
+        WHERE i.clinic_id = $1 AND i.is_archived = FALSE AND i.status NOT IN ('paid', 'cancelled')
+        GROUP BY i.patient_id
+      ) patient_dues ON p.id = patient_dues.patient_id
+      WHERE a.clinic_id = $1 AND DATE(a.appointment_date) = CURRENT_DATE
+      ORDER BY a.appointment_date ASC;
+    `;
 
-    // 4. طلبات المعمل العاجلة (التي لم تُستلم بعد: متأخرة أو تسليمها اليوم أو غداً)
+    // 5. طلبات المعمل العاجلة
     const urgentLabOrdersQuery = `
       SELECT 
         lo.id,
@@ -93,12 +114,28 @@ const getDashboardStats = async (req, res) => {
       ORDER BY lo.expected_at ASC;
     `;
 
-    // تشغيل الاستعلامات بالتوازي لسرعة فائقة
-    const [incomeRes, duesRes, appointmentsRes, labRes] = await Promise.all([
+    // 6. إجمالي المرضى النشطين المسجلين
+    const activePatientsQuery = `
+      SELECT COUNT(*) AS active_patients_count
+      FROM patients
+      WHERE clinic_id = $1 AND is_active = TRUE;
+    `;
+
+    // تشغيل جميع الاستعلامات بالتوازي لسرعة فائقة
+    const [
+      incomeRes,
+      monthIncomeRes,
+      duesRes,
+      appointmentsRes,
+      labRes,
+      patientsRes,
+    ] = await Promise.all([
       pool.query(todayIncomeQuery, [clinicId]),
+      pool.query(monthIncomeQuery, [clinicId]),
       pool.query(totalDuesQuery, [clinicId]),
       pool.query(todayAppointmentsQuery, [clinicId]),
       pool.query(urgentLabOrdersQuery, [clinicId]),
+      pool.query(activePatientsQuery, [clinicId]),
     ]);
 
     const todayAppointments = appointmentsRes.rows;
@@ -109,10 +146,15 @@ const getDashboardStats = async (req, res) => {
     res.status(200).json({
       stats: {
         today_income: parseFloat(incomeRes.rows[0]?.today_income || 0),
+        month_income: parseFloat(monthIncomeRes.rows[0]?.month_income || 0),
         total_dues: parseFloat(duesRes.rows[0]?.total_dues || 0),
         today_appointments_count: todayAppointments.length,
         today_completed_count: completedCount,
         urgent_lab_orders_count: labRes.rows.length,
+        active_patients_count: parseInt(
+          patientsRes.rows[0]?.active_patients_count || 0,
+          10
+        ),
       },
       today_appointments: todayAppointments,
       urgent_lab_orders: labRes.rows,

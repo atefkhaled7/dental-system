@@ -160,17 +160,20 @@ const updatePatient = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
     const patientId = req.params.id;
-    const { name, phone_number, gender, medical_alerts } = req.body;
+    const { name, phone_number, gender, medical_alerts, date_of_birth } = req.body;
 
     // نفس التحقق الصارم المطبق في الإضافة
     const validationError = validatePatientInput({
       name,
       phone_number,
       gender,
+      date_of_birth,
     });
     if (validationError) {
       return res.status(400).json({ error: validationError });
     }
+    const cleanedDob =
+      date_of_birth && String(date_of_birth).trim() !== "" ? date_of_birth : null;
 
     const query = `
       UPDATE patients 
@@ -179,8 +182,9 @@ const updatePatient = async (req, res) => {
         phone_number = $2,
         gender = $3,
         medical_alerts = $4,
+        date_of_birth = $5,
         updated_at = CURRENT_TIMESTAMP
-      WHERE id = $5 AND clinic_id = $6 AND is_active = TRUE
+      WHERE id = $6 AND clinic_id = $7 AND is_active = TRUE
       RETURNING *;
     `;
 
@@ -189,6 +193,7 @@ const updatePatient = async (req, res) => {
       phone_number.trim(),
       gender || null,
       medical_alerts || null,
+      cleanedDob,
       patientId,
       clinicId,
     ]);

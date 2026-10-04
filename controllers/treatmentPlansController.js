@@ -14,14 +14,12 @@ const getPatientTreatmentPlans = async (req, res) => {
 
     // التحقق من أن المريض مسجل ونشط في هذه العيادة
     const patientCheck = await pool.query(
-      "SELECT id FROM patients WHERE id = $1 AND clinic_id = $2 AND is_active = TRUE",
+      "SELECT id FROM patients WHERE id = $1 AND clinic_id = $2",
       [patientId, clinicId]
     );
 
     if (patientCheck.rows.length === 0) {
-      return res
-        .status(404)
-        .json({ error: "المريض غير موجود في هذه العيادة أو تمت أرشفته" });
+      return res.status(404).json({ error: "المريض غير موجود في هذه العيادة" });
     }
 
     const plansQuery = `
@@ -66,11 +64,9 @@ const createTreatmentPlan = async (req, res) => {
       title.trim().length < 2 ||
       title.trim().length > 255
     ) {
-      return res
-        .status(400)
-        .json({
-          error: "عنوان خطة العلاج مطلوب ويجب أن يتراوح بين حرفين و 255 حرفاً",
-        });
+      return res.status(400).json({
+        error: "عنوان خطة العلاج مطلوب ويجب أن يتراوح بين حرفين و 255 حرفاً",
+      });
     }
 
     // 🔒 التحقق الصارم من أن المريض موجود ونشط ويخص عيادة المستخدم
@@ -134,12 +130,10 @@ const addTreatmentPlanItem = async (req, res) => {
     ) {
       const parsedTooth = parseInt(tooth_number, 10);
       if (isNaN(parsedTooth) || !VALID_FDI_TEETH.has(parsedTooth)) {
-        return res
-          .status(400)
-          .json({
-            error:
-              "رقم السن غير صالح بنظام FDI (يجب أن يكون من أرقام الأسنان الـ 32 الصحيحة)",
-          });
+        return res.status(400).json({
+          error:
+            "رقم السن غير صالح بنظام FDI (يجب أن يكون من أرقام الأسنان الـ 32 الصحيحة)",
+        });
       }
       validatedTooth = parsedTooth;
     }
@@ -147,17 +141,20 @@ const addTreatmentPlanItem = async (req, res) => {
     // 3. التحقق المالي من التكلفة (بدون أرقام سالبة أو كسور غير منطقية)
     const cost = parseFloat(estimated_cost);
     if (isNaN(cost) || cost < 0 || !isFinite(cost)) {
-      return res
-        .status(400)
-        .json({
-          error: "التكلفة التقديرية يجب أن تكون رقماً صالحاً وغير سالب",
-        });
+      return res.status(400).json({
+        error: "التكلفة التقديرية يجب أن تكون رقماً صالحاً وغير سالب",
+      });
     }
     const costFixed = (Math.round(cost * 100) / 100).toFixed(2);
 
     // 4. 🔒 فحص الخطة: التأكد من تبعيتها للعيادة + منع التعديل على خطة مقفولة
     const planCheck = await pool.query(
-      "SELECT id, status FROM treatment_plans WHERE id = $1 AND clinic_id = $2",
+      `SELECT tp.id, tp.status, p.is_active
+       FROM treatment_plans tp
+       JOIN patients p ON p.id = tp.patient_id
+       WHERE tp.id = $1
+         AND tp.clinic_id = $2
+         AND p.clinic_id = $2`,
       [planId, clinicId]
     );
 
@@ -165,6 +162,12 @@ const addTreatmentPlanItem = async (req, res) => {
       return res
         .status(404)
         .json({ error: "خطة العلاج غير موجودة في هذه العيادة" });
+    }
+
+    if (planCheck.rows[0].is_active === false) {
+      return res.status(400).json({
+        error: "لا يمكن تعديل خطة علاج مريض مؤرشف",
+      });
     }
 
     if (
@@ -209,20 +212,26 @@ const updatePlanItemStatus = async (req, res) => {
 
     const validStatuses = ["planned", "in_progress", "completed"];
     if (!validStatuses.includes(status)) {
-      return res
-        .status(400)
-        .json({
-          error:
-            "حالة الإجراء غير صالحة. الحالات المسموحة: planned, in_progress, completed",
-        });
+      return res.status(400).json({
+        error:
+          "حالة الإجراء غير صالحة. الحالات المسموحة: planned, in_progress, completed",
+      });
     }
 
     // 🔒 فحص البند وحالته الحالية والخطة التابع لها
     const itemCheck = await pool.query(
-      `SELECT tpi.id, tpi.status, tpi.invoice_id, tp.status AS plan_status 
+      `SELECT
+         tpi.id,
+         tpi.status,
+         tpi.invoice_id,
+         tp.status AS plan_status,
+         p.is_active
        FROM treatment_plan_items tpi
        JOIN treatment_plans tp ON tpi.plan_id = tp.id
-       WHERE tpi.id = $1 AND tpi.clinic_id = $2`,
+       JOIN patients p ON p.id = tp.patient_id
+       WHERE tpi.id = $1
+         AND tpi.clinic_id = $2
+         AND p.clinic_id = $2`,
       [itemId, clinicId]
     );
 
@@ -233,14 +242,17 @@ const updatePlanItemStatus = async (req, res) => {
     }
 
     const item = itemCheck.rows[0];
+    if (item.is_active === false) {
+      return res.status(400).json({
+        error: "لا يمكن تعديل خطة علاج مريض مؤرشف",
+      });
+    }
 
     // 1. منع تعديل أي بند تم إصدار فاتورة له
     if (item.invoice_id !== null) {
-      return res
-        .status(400)
-        .json({
-          error: "لا يمكن تعديل حالة هذا البند؛ تمت فوترته رسمياً بالفعل",
-        });
+      return res.status(400).json({
+        error: "لا يمكن تعديل حالة هذا البند؛ تمت فوترته رسمياً بالفعل",
+      });
     }
 
     // 2. منع تعديل بنود خطة ملغاة أو مكتملة
@@ -275,11 +287,9 @@ const convertPlanItemsToInvoice = async (req, res) => {
     const { itemIds } = req.body;
 
     if (!Array.isArray(itemIds) || itemIds.length === 0) {
-      return res
-        .status(400)
-        .json({
-          error: "يرجى تحديد بند علاج مكتمل واحد على الأقل لإصدار الفاتورة",
-        });
+      return res.status(400).json({
+        error: "يرجى تحديد بند علاج مكتمل واحد على الأقل لإصدار الفاتورة",
+      });
     }
 
     await client.query("BEGIN");

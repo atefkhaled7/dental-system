@@ -8,6 +8,7 @@ class PaymobProvider extends BasePaymentProvider {
     this.secretKey = process.env.PAYMOB_API_KEY;
     this.publicKey = process.env.PAYMOB_PUBLIC_KEY;
     this.hmacSecret = process.env.PAYMOB_HMAC_SECRET;
+    this.mode = process.env.PAYMOB_MODE || "live";
 
     this.integrationIds = (process.env.PAYMOB_INTEGRATION_IDS || "")
       .split(",")
@@ -15,6 +16,19 @@ class PaymobProvider extends BasePaymentProvider {
       .filter(Number.isInteger);
 
     this.baseUrl = "https://accept.paymob.com/v1";
+  }
+
+  isMock() {
+    return this.mode === "mock";
+  }
+
+  isConfigured() {
+    return Boolean(
+      this.secretKey &&
+        this.publicKey &&
+        this.hmacSecret &&
+        this.integrationIds.length
+    );
   }
 
   /**
@@ -30,11 +44,7 @@ class PaymobProvider extends BasePaymentProvider {
     expiresAt,
   }) {
     // 🛠️ لو المفاتيح لسه مش حقيقية، شغل وضع المحاكاة (Mock) عشان تجرب السيستم والواتساب
-    if (
-      !this.secretKey ||
-      this.secretKey.includes("your_api") ||
-      this.secretKey === "mock"
-    ) {
+    if (this.isMock()) {
       console.log(
         "⚡ [PAYMOB MOCK MODE]: توليد رابط تجريبي لاختبار الواتساب والواجهة"
       );
@@ -43,6 +53,10 @@ class PaymobProvider extends BasePaymentProvider {
         providerOrderId: `mock_order_${Date.now()}`,
         clientSecret: "mock_client_secret_test",
       };
+    }
+
+    if (!this.isConfigured()) {
+      throw new Error("Paymob is not configured.");
     }
 
     if (!this.integrationIds.length) {
@@ -121,12 +135,19 @@ class PaymobProvider extends BasePaymentProvider {
    */
   verifyWebhookSignature(req) {
     if (!this.hmacSecret) return false;
-
+  
     const receivedHmac = req.query?.hmac || req.body?.hmac;
     const data = req.body?.obj || req.body;
-
-    if (!receivedHmac || !data) return false;
-
+  
+    if (!receivedHmac || !data || typeof receivedHmac !== "string") {
+      return false;
+    }
+  
+    // Paymob HMAC-SHA512 = 128 hex characters
+    if (!/^[a-f0-9]{128}$/i.test(receivedHmac)) {
+      return false;
+    }
+  
     const concatenatedValues = [
       data.amount_cents,
       data.created_at,
@@ -151,13 +172,16 @@ class PaymobProvider extends BasePaymentProvider {
     ]
       .map((val) => (val === undefined || val === null ? "" : String(val)))
       .join("");
-
+  
     const calculatedHmac = crypto
       .createHmac("sha512", this.hmacSecret)
       .update(concatenatedValues)
       .digest("hex");
-
-    return calculatedHmac.toLowerCase() === receivedHmac.toLowerCase();
+  
+    const calculatedBuffer = Buffer.from(calculatedHmac, "hex");
+    const receivedBuffer = Buffer.from(receivedHmac, "hex");
+  
+    return crypto.timingSafeEqual(calculatedBuffer, receivedBuffer);
   }
 
   /**
@@ -174,6 +198,7 @@ class PaymobProvider extends BasePaymentProvider {
 
     return {
       isSuccess,
+      isPending,
       transactionId: String(obj.id),
       orderId: String(obj.order?.id || ""),
       paymentId: internalPaymentId,

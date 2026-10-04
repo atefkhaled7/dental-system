@@ -1,6 +1,7 @@
 const pool = require("../db");
 const { getPaymentProvider } = require("../services/payments/paymentFactory");
 const { normalizeEgyptianPhone } = require("../utils/phoneNormalizer");
+const whatsAppService = require("../services/whatsapp/WhatsAppService");
 
 // ==========================================
 // 1. تسجيل دفعة يدوية (Manual Payment)
@@ -131,6 +132,14 @@ const createOnlinePayment = async (req, res) => {
       ? parsedHours
       : 24;
 
+  const provider = getPaymentProvider("paymob");
+
+  if (!provider.isMock() && !provider.isConfigured()) {
+    return res.status(503).json({
+      error: "خدمة الدفع الإلكتروني غير مُهيأة حاليًا.",
+    });
+  }
+
   let client;
   let pendingPaymentId = null;
 
@@ -206,6 +215,12 @@ const createOnlinePayment = async (req, res) => {
     }
 
     const patient = patientResult.rows[0];
+    const clinicResult = await client.query(
+      "SELECT name FROM clinics WHERE id = $1;",
+      [clinic_id]
+    );
+
+    const clinicName = clinicResult.rows[0]?.name || "العيادة";
     const normalizedPhone = normalizeEgyptianPhone(patient.phone_number);
 
     if (!normalizedPhone) {
@@ -244,7 +259,6 @@ const createOnlinePayment = async (req, res) => {
 
     // طلب الجلسة من Paymob
     try {
-      const provider = getPaymentProvider("paymob");
       const session = await provider.createPaymentSession({
         amount: finalAmountEGP,
         currency: "EGP",
@@ -262,21 +276,26 @@ const createOnlinePayment = async (req, res) => {
       );
 
       // تجهيز رابط ورسالة الواتساب الجاهزة (wa.me)
-      const messageText = `مرحباً بك في العيادة، يمكنك سداد دفعة بقيمة ${finalAmountEGP} ج.م الخاصة بالفاتورة رقم #${invoice.id.slice(
-        0,
-        8
-      )} عبر الرابط الآمن التالي:\n${session.paymentUrl}`;
-      const whatsappUrl = `https://wa.me/${normalizedPhone}?text=${encodeURIComponent(
-        messageText
-      )}`;
+      const whatsappLinkData = whatsAppService.generateWhatsAppLink({
+        type: "payment_link",
+        phone: normalizedPhone,
+        data: {
+          patientName: patient.name,
+          clinicName,
+          amount: finalAmountEGP,
+          invoiceId: invoice.id,
+          paymentUrl: session.paymentUrl,
+        },
+      });
 
       res.status(201).json({
         message: "تم إنشاء رابط الدفع بنجاح",
         payment_id: pendingPayment.id,
         amount: finalAmountEGP,
         payment_url: session.paymentUrl,
-        whatsapp_url: whatsappUrl,
+        whatsapp_url: whatsappLinkData.url,
         expires_at: expiresAt,
+        is_mock: provider.isMock(),
       });
     } catch (paymobError) {
       // 🚨 4) لو Paymob فشل بعد الـ INSERT، نحدث حالة الـ pending إلى failed فوراً
@@ -292,9 +311,7 @@ const createOnlinePayment = async (req, res) => {
   } catch (error) {
     if (client) await client.query("ROLLBACK");
     console.error("Error creating online payment:", error.message);
-    res
-      .status(500)
-      .json({ error: error.message || "حدث خطأ أثناء إنشاء رابط الدفع" });
+    res.status(500).json({ error: "حدث خطأ أثناء إنشاء رابط الدفع" });
   } finally {
     if (client) client.release();
   }
@@ -308,12 +325,14 @@ const handlePaymobWebhook = async (req, res) => {
 
   // التحقق من الـ HMAC Signature
   const isValidSignature = provider.verifyWebhookSignature(req);
+
   if (!isValidSignature) {
     console.warn("⚠ Paymob Webhook: Invalid HMAC Signature detected.");
     return res.status(401).json({ error: "Invalid signature" });
   }
 
   const webhookData = provider.parseWebhookData(req.body);
+
   const {
     isSuccess,
     isPending,
@@ -321,132 +340,319 @@ const handlePaymobWebhook = async (req, res) => {
     orderId,
     paymentId,
     amountCents,
-    paymentMethod,
   } = webhookData;
 
   let client;
+
   try {
     client = await pool.connect();
     await client.query("BEGIN");
 
-    // البحث عن الـ Payment بالـ ID
-    let paymentQuery = "SELECT * FROM payments WHERE id = $1 FOR UPDATE;";
-    let queryParams = [paymentId];
+    // البحث عن الدفعة بدون قفل أولاً لمعرفة الـ invoice المرتبطة بها
+    let paymentLookupQuery = "SELECT * FROM payments WHERE id = $1;";
+    let paymentLookupParams = [paymentId];
 
     if (!paymentId && orderId) {
-      paymentQuery =
-        "SELECT * FROM payments WHERE provider_order_id = $1 FOR UPDATE;";
-      queryParams = [orderId];
+      paymentLookupQuery =
+        "SELECT * FROM payments WHERE provider_order_id = $1;";
+      paymentLookupParams = [orderId];
     }
 
-    const paymentResult = await client.query(paymentQuery, queryParams);
+    const paymentLookupResult = await client.query(
+      paymentLookupQuery,
+      paymentLookupParams
+    );
 
-    if (paymentResult.rows.length === 0) {
+    if (paymentLookupResult.rows.length === 0) {
       await client.query("ROLLBACK");
+
       console.warn(
         `Paymob Webhook: Payment not found for reference: ${
           paymentId || orderId
         }`
       );
-      return res
-        .status(200)
-        .json({ message: "Payment record not found, ignored." });
+
+      // نرجع 200 حتى لا يعاد إرسال webhook بلا نهاية
+      return res.status(200).json({
+        message: "Payment record not found, ignored.",
+      });
+    }
+
+    const paymentRef = paymentLookupResult.rows[0];
+
+    // ==========================================
+    // 🔒 ترتيب الـ Locks:
+    // 1) Invoice
+    // 2) Payment
+    //
+    // نفس الترتيب في كل التدفقات المهمة لتقليل deadlock
+    // ==========================================
+
+    const invoiceResult = await client.query(
+      "SELECT * FROM invoices WHERE id = $1 AND clinic_id = $2 FOR UPDATE;",
+      [paymentRef.invoice_id, paymentRef.clinic_id]
+    );
+
+    if (invoiceResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+
+      console.error(
+        `Paymob Webhook: Invoice ${paymentRef.invoice_id} not found for payment ${paymentRef.id}`
+      );
+
+      return res.status(500).json({
+        error: "Invoice associated with payment was not found",
+      });
+    }
+
+    const invoice = invoiceResult.rows[0];
+
+    // قفل الدفعة بعد قفل الفاتورة
+    const paymentResult = await client.query(
+      "SELECT * FROM payments WHERE id = $1 FOR UPDATE;",
+      [paymentRef.id]
+    );
+
+    if (paymentResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(500).json({
+        error: "Payment record disappeared during webhook processing",
+      });
     }
 
     const payment = paymentResult.rows[0];
 
+    // ==========================================
+    // 🔁 Webhook مكرر / حالة الدفعة اتغيرت بالفعل
+    // ==========================================
+
     if (payment.status !== "pending") {
+      // لو Paymob أكد نجاح دفعة لم تعد pending
+      // ولم تكن paid بالفعل، لا نرميها ونحطها تحت المراجعة
+      if (
+        isSuccess &&
+        payment.status !== "paid" &&
+        payment.status !== "needs_review"
+      ) {
+        await client.query(
+          `UPDATE payments
+           SET status = 'needs_review',
+               provider_transaction_id = COALESCE($1, provider_transaction_id),
+               notes = COALESCE(notes, '') ||
+                 ' [مراجعة مطلوبة: Paymob أكد نجاح الدفع بعد تغير حالة الدفعة] '
+           WHERE id = $2;`,
+          [transactionId, payment.id]
+        );
+
+        await client.query("COMMIT");
+
+        console.warn(
+          `⚠ Paymob Webhook: Successful payment ${payment.id} requires manual review because current status is ${payment.status}.`
+        );
+
+        return res.status(200).json({
+          message: "Payment received and marked for manual review.",
+        });
+      }
+
       await client.query("ROLLBACK");
+
       return res.status(200).json({
         message: "Payment is no longer active, ignored.",
       });
     }
-    
-    // التعامل مع pending=true كحالة معلقة وليست فاشلة
+
+    // ==========================================
+    // ⏳ لا يزال Pending
+    // ==========================================
+
     if (isPending) {
       await client.query(
-        "UPDATE payments SET provider_transaction_id = $1 WHERE id = $2;",
+        `UPDATE payments
+         SET provider_transaction_id = $1
+         WHERE id = $2;`,
         [transactionId, payment.id]
       );
+
       await client.query("COMMIT");
+
       return res.status(200).json({
         message: "Payment is still pending confirmation.",
       });
     }
 
-    // لو فشلت نهائياً (success=false و pending=false)
+    // ==========================================
+    // ❌ فشل نهائي
+    // ==========================================
+
     if (!isSuccess) {
       await client.query(
-        "UPDATE payments SET status = 'failed', provider_transaction_id = $1 WHERE id = $2;",
+        `UPDATE payments
+         SET status = 'failed',
+             provider_transaction_id = $1
+         WHERE id = $2;`,
         [transactionId, payment.id]
       );
+
       await client.query("COMMIT");
-      return res.status(200).json({ message: "Payment marked as failed." });
+
+      return res.status(200).json({
+        message: "Payment marked as failed.",
+      });
     }
 
-    // 🚨 1) التحقق الصارم من تطابق المبلغ المستلم من الـ Webhook مع المبلغ المسجل في الداتا بيز
+    // ==========================================
+    // 💰 التحقق من تطابق المبلغ
+    // ==========================================
+
     const expectedAmountCents = Math.round(parseFloat(payment.amount) * 100);
-    if (amountCents !== expectedAmountCents) {
-      await client.query("ROLLBACK");
-      console.warn(
-        `⚠ Paymob Webhook: Amount mismatch! Expected: ${expectedAmountCents}, Received: ${amountCents}`
+
+    if (Number(amountCents) !== expectedAmountCents) {
+      await client.query(
+        `UPDATE payments
+         SET status = 'needs_review',
+             provider_transaction_id = COALESCE($1, provider_transaction_id),
+             notes = COALESCE(notes, '') ||
+               ' [مراجعة مطلوبة: اختلاف مبلغ Paymob عن المبلغ المسجل] '
+         WHERE id = $2;`,
+        [transactionId, payment.id]
       );
-      return res.status(400).json({ error: "Payment amount mismatch" });
+
+      await client.query("COMMIT");
+
+      console.warn(
+        `⚠ Paymob Webhook: Amount mismatch for payment ${payment.id}. Expected: ${expectedAmountCents}, Received: ${amountCents}`
+      );
+
+      return res.status(200).json({
+        message: "Payment received but marked for manual review.",
+      });
     }
 
-    // قفل الفاتورة وتحديثها
-    const invoiceResult = await client.query(
-      "SELECT * FROM invoices WHERE id = $1 AND clinic_id = $2 FOR UPDATE;",
-      [payment.invoice_id, payment.clinic_id]
-    );
+    // ==========================================
+    // 🚫 الفاتورة أُلغيت أو أُرشفت قبل الدفع
+    // ==========================================
 
-    const invoice = invoiceResult.rows[0];
+    if (invoice.status === "cancelled" || invoice.is_archived) {
+      await client.query(
+        `UPDATE payments
+         SET status = 'needs_review',
+             provider_transaction_id = COALESCE($1, provider_transaction_id),
+             notes = COALESCE(notes, '') ||
+               ' [مراجعة مطلوبة: تم تأكيد الدفع على فاتورة ملغاة أو مؤرشفة] '
+         WHERE id = $2;`,
+        [transactionId, payment.id]
+      );
 
-    // تحديث الدفعة لـ paid وتسجيل transaction_id
-    await client.query(
-      `UPDATE payments 
-       SET status = 'paid', 
-           provider_transaction_id = $1, 
-           payment_method = $2, 
-           paid_at = CURRENT_TIMESTAMP 
-       WHERE id = $3;`,
-      [transactionId, paymentMethod, payment.id]
-    );
+      await client.query("COMMIT");
 
-    // إعادة حساب إجمالي المدفوعات الناجحة
+      console.warn(
+        `⚠ Paymob Webhook: Payment ${payment.id} succeeded for cancelled/archived invoice ${invoice.id}.`
+      );
+
+      return res.status(200).json({
+        message: "Payment received and marked for manual review.",
+      });
+    }
+
+    // ==========================================
+    // 🧮 إعادة حساب المتبقي قبل اعتماد الدفع
+    // ==========================================
+
     const totalPaidResult = await client.query(
-      "SELECT COALESCE(SUM(amount), 0) AS total_paid FROM payments WHERE invoice_id = $1 AND clinic_id = $2 AND status = 'paid';",
+      `SELECT COALESCE(SUM(amount), 0) AS total_paid
+       FROM payments
+       WHERE invoice_id = $1
+         AND clinic_id = $2
+         AND status = 'paid';`,
       [payment.invoice_id, payment.clinic_id]
     );
 
     const invoiceTotalCents = Math.round(
       parseFloat(invoice.total_amount) * 100
     );
-    const newTotalPaidCents = Math.round(
+
+    const alreadyPaidCents = Math.round(
       parseFloat(totalPaidResult.rows[0].total_paid) * 100
     );
+
+    const newTotalPaidCents = alreadyPaidCents + expectedAmountCents;
+
+    // ==========================================
+    // ⚠ Overpayment / دفع مزدوج
+    // ==========================================
+
+    if (newTotalPaidCents > invoiceTotalCents) {
+      await client.query(
+        `UPDATE payments
+         SET status = 'needs_review',
+             provider_transaction_id = COALESCE($1, provider_transaction_id),
+             notes = COALESCE(notes, '') ||
+               ' [مراجعة مطلوبة: الدفع الإلكتروني تجاوز المتبقي على الفاتورة] '
+         WHERE id = $2;`,
+        [transactionId, payment.id]
+      );
+
+      await client.query("COMMIT");
+
+      console.warn(
+        `⚠ Paymob Webhook: Overpayment detected for payment ${payment.id}, invoice ${invoice.id}.`
+      );
+
+      return res.status(200).json({
+        message: "Payment received but marked for manual review.",
+      });
+    }
+
+    // ==========================================
+    // ✅ اعتماد الدفعة رسميًا
+    // ==========================================
+
+    await client.query(
+      `UPDATE payments
+       SET status = 'paid',
+           provider_transaction_id = $1,
+           paid_at = CURRENT_TIMESTAMP
+       WHERE id = $2;`,
+      [transactionId, payment.id]
+    );
+
     const newInvoiceStatus =
       newTotalPaidCents >= invoiceTotalCents ? "paid" : "partially_paid";
 
     await client.query(
-      "UPDATE invoices SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND clinic_id = $3;",
+      `UPDATE invoices
+       SET status = $1,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2
+         AND clinic_id = $3;`,
       [newInvoiceStatus, invoice.id, invoice.clinic_id]
     );
 
     await client.query("COMMIT");
+
     console.log(
       `✅ Payment ${payment.id} verified and invoice ${invoice.id} updated to ${newInvoiceStatus}`
     );
 
-    return res
-      .status(200)
-      .json({ message: "Payment successfully confirmed and recorded." });
+    return res.status(200).json({
+      message: "Payment successfully confirmed and recorded.",
+    });
   } catch (error) {
-    if (client) await client.query("ROLLBACK");
+    if (client) {
+      await client.query("ROLLBACK");
+    }
+
     console.error("Error processing Paymob webhook:", error);
-    return res.status(500).json({ error: "Internal webhook processing error" });
+
+    return res.status(500).json({
+      error: "Internal webhook processing error",
+    });
   } finally {
-    if (client) client.release();
+    if (client) {
+      client.release();
+    }
   }
 };
 

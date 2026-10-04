@@ -58,25 +58,6 @@ const createAppointment = async (req, res) => {
     if (!patient_id || !doctor_id || !appointment_date) {
       return res.status(400).json({ error: "Missing required fields" });
     }
-    const doctorCheck = await pool.query(
-      "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor'",
-      [doctor_id, clinic_id]
-    );
-
-    if (doctorCheck.rows.length === 0) {
-      return res.status(400).json({
-        error: "المستخدم المحدد غير مسجل كطبيب مصرح له في هذه العيادة",
-      });
-    }
-    const conflictCheck = await pool.query(
-      "SELECT id FROM appointments WHERE clinic_id = $1 AND doctor_id = $2 AND appointment_date = $3 AND status = 'scheduled'",
-      [clinic_id, doctor_id, appointment_date]
-    );
-    if (conflictCheck.rows.length > 0) {
-      return res.status(409).json({
-        error: "الدكتور لديه ميعاد آخر محجوز بالفعل في هذا التوقيت",
-      });
-    }
 
     const now = new Date();
     const appDate = new Date(appointment_date);
@@ -97,6 +78,41 @@ const createAppointment = async (req, res) => {
       return res
         .status(400)
         .json({ error: "لا يمكن حجز ميعاد لأكثر من سنة في المستقبل" });
+    }
+
+    const patientCheck = await pool.query(
+      `SELECT id
+       FROM patients
+       WHERE id = $1
+         AND clinic_id = $2
+         AND is_active = TRUE`,
+      [patient_id, clinic_id]
+    );
+
+    if (patientCheck.rows.length === 0) {
+      return res.status(400).json({
+        error: "لا يمكن حجز موعد لمريض مؤرشف أو غير موجود في هذه العيادة",
+      });
+    }
+
+    const doctorCheck = await pool.query(
+      "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor'",
+      [doctor_id, clinic_id]
+    );
+
+    if (doctorCheck.rows.length === 0) {
+      return res.status(400).json({
+        error: "المستخدم المحدد غير مسجل كطبيب مصرح له في هذه العيادة",
+      });
+    }
+    const conflictCheck = await pool.query(
+      "SELECT id FROM appointments WHERE clinic_id = $1 AND doctor_id = $2 AND appointment_date = $3 AND status = 'scheduled'",
+      [clinic_id, doctor_id, appDate]
+    );
+    if (conflictCheck.rows.length > 0) {
+      return res.status(409).json({
+        error: "الدكتور لديه ميعاد آخر محجوز بالفعل في هذا التوقيت",
+      });
     }
 
     const query = `
@@ -133,9 +149,10 @@ const createAppointment = async (req, res) => {
 
 const updateAppointmentStatus = async (req, res) => {
   try {
-    const { id } = req.params; // 👈 متطابق مع :id في الراوت
+    const { id } = req.params;
     const { status } = req.body;
-    const clinic_id = req.user.clinic_id; // 👈 هنسحبه ونستخدمه تحت
+    const clinic_id = req.user.clinic_id;
+
     const validStatuses = ["scheduled", "completed", "no_show", "cancelled"];
 
     if (!validStatuses.includes(status)) {
@@ -144,10 +161,46 @@ const updateAppointmentStatus = async (req, res) => {
         .json({ error: "حالة الميعاد غير صالحة (Invalid status)" });
     }
 
+    // لو بنرجع الموعد إلى scheduled، نتأكد إن مفيش تعارض
+    if (status === "scheduled") {
+      const currentAppointment = await pool.query(
+        `SELECT doctor_id, appointment_date
+         FROM appointments
+         WHERE id = $1 AND clinic_id = $2`,
+        [id, clinic_id]
+      );
+
+      if (currentAppointment.rows.length === 0) {
+        return res
+          .status(404)
+          .json({ error: "الميعاد غير موجود في هذه العيادة" });
+      }
+
+      const { doctor_id, appointment_date } = currentAppointment.rows[0];
+
+      const conflictCheck = await pool.query(
+        `SELECT id
+         FROM appointments
+         WHERE clinic_id = $1
+           AND doctor_id = $2
+           AND appointment_date = $3
+           AND status = 'scheduled'
+           AND id != $4
+         LIMIT 1`,
+        [clinic_id, doctor_id, appointment_date, id]
+      );
+
+      if (conflictCheck.rows.length > 0) {
+        return res.status(409).json({
+          error: "الدكتور لديه ميعاد آخر محجوز بالفعل في هذا التوقيت",
+        });
+      }
+    }
+
     const query = `
-      UPDATE appointments 
-      SET status = $1, updated_at = CURRENT_TIMESTAMP 
-      WHERE id = $2 AND clinic_id = $3 
+      UPDATE appointments
+      SET status = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2 AND clinic_id = $3
       RETURNING *;
     `;
 
@@ -164,6 +217,13 @@ const updateAppointmentStatus = async (req, res) => {
       appointment: result.rows[0],
     });
   } catch (error) {
+    // حماية إضافية لو الـ unique constraint مسك تعارض concurrent
+    if (error.code === "23505") {
+      return res.status(409).json({
+        error: "الدكتور لديه ميعاد آخر محجوز بالفعل في هذا التوقيت",
+      });
+    }
+
     console.error("Error updating appointment status:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر" });
   }
@@ -194,7 +254,9 @@ const rescheduleAppointment = async (req, res) => {
 
     // جلب بيانات الموعد الحالي لمعرفة الطبيب
     const currentApp = await pool.query(
-      "SELECT doctor_id FROM appointments WHERE id = $1 AND clinic_id = $2",
+      `SELECT doctor_id, status
+       FROM appointments
+       WHERE id = $1 AND clinic_id = $2`,
       [id, clinic_id]
     );
 
@@ -203,6 +265,12 @@ const rescheduleAppointment = async (req, res) => {
     }
 
     const doctor_id = currentApp.rows[0].doctor_id;
+
+    if (currentApp.rows[0].status === "completed") {
+      return res.status(400).json({
+        error: "لا يمكن إعادة جدولة موعد مكتمل",
+      });
+    }
 
     // فحص تعارض المواعيد مع نفس الدكتور في التوقيت الجديد (باستثناء الموعد نفسه)
     const conflictCheck = await pool.query(
@@ -237,6 +305,12 @@ const rescheduleAppointment = async (req, res) => {
       appointment: result.rows[0],
     });
   } catch (error) {
+    if (error.code === "23505") {
+      return res.status(409).json({
+        error: "الدكتور لديه ميعاد آخر محجوز بالفعل في هذا التوقيت",
+      });
+    }
+
     console.error("Error rescheduling appointment:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء إعادة الجدولة" });
   }

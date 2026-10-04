@@ -77,14 +77,35 @@ const createInvoice = async (req, res) => {
     let finalAppointmentId = appointment_id || null;
     if (finalAppointmentId) {
       const apptCheck = await client.query(
-        "SELECT id FROM appointments WHERE id = $1 AND clinic_id = $2 AND patient_id = $3",
+        `SELECT id
+         FROM appointments
+         WHERE id = $1
+           AND clinic_id = $2
+           AND patient_id = $3
+         FOR UPDATE`,
         [finalAppointmentId, clinic_id, patient_id]
       );
       if (apptCheck.rows.length === 0) {
         await client.query("ROLLBACK");
-        client.release();
         return res.status(400).json({
           error: "الموعد المحدد لا يخص هذا المريض",
+        });
+      }
+      const existingInvoiceCheck = await client.query(
+        `SELECT id
+         FROM invoices
+         WHERE clinic_id = $1
+           AND appointment_id = $2
+           AND is_archived = FALSE
+           AND status <> 'cancelled'
+         LIMIT 1`,
+        [clinic_id, finalAppointmentId]
+      );
+
+      if (existingInvoiceCheck.rows.length > 0) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          error: "هذا الموعد لديه فاتورة بالفعل",
         });
       }
     }
@@ -96,7 +117,6 @@ const createInvoice = async (req, res) => {
       );
       if (doctorCheck.rows.length === 0) {
         await client.query("ROLLBACK");
-        client.release();
         return res.status(400).json({
           error: "المستخدم المحدد غير مسجل كطبيب مصرح له في هذه العيادة",
         });
@@ -293,7 +313,7 @@ const getInvoiceById = async (req, res) => {
 
     // جلب سجل المدفوعات بالتفصيل (دفع إيه وإمتى وطريقة الدفع)
     const paymentsResult = await pool.query(
-      "SELECT id, amount, payment_method, status, notes, paid_at, created_at FROM payments WHERE clinic_id = $1 AND invoice_id = $2 ORDER BY paid_at DESC",
+      "SELECT id, amount, payment_method, CASE WHEN status = 'pending' AND expires_at < NOW() THEN 'expired' ELSE status END AS status, notes, paid_at, created_at FROM payments WHERE clinic_id = $1 AND invoice_id = $2 ORDER BY paid_at DESC",
       [clinic_id, invoiceId]
     );
     invoice.payments = paymentsResult.rows;
@@ -344,7 +364,7 @@ const archiveInvoice = async (req, res) => {
     const clinic_id = req.user.clinic_id;
     const userRole = req.user.role;
 
-    // حماية صارمة: منع الريسبشن نهائياً من أرشفة الفواتير (الأدمن فقط)
+    // منع الريسبشن من أرشفة الفواتير
     if (userRole === "Receptionist") {
       return res.status(403).json({
         error: "غير مصرح لك بأرشفة الفواتير، هذه الصلاحية لمدير العيادة فقط",
@@ -352,27 +372,33 @@ const archiveInvoice = async (req, res) => {
     }
 
     const query = `
-      UPDATE invoices 
-      SET is_archived = TRUE, updated_at = CURRENT_TIMESTAMP 
-      WHERE id = $1 AND clinic_id = $2 AND is_archived = FALSE
-      RETURNING id, total_amount, is_archived;
+      UPDATE invoices
+      SET is_archived = TRUE,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+        AND clinic_id = $2
+        AND is_archived = FALSE
+        AND status IN ('paid', 'cancelled')
+      RETURNING id, total_amount, status, is_archived;
     `;
 
     const result = await pool.query(query, [id, clinic_id]);
 
     if (result.rows.length === 0) {
-      return res
-        .status(404)
-        .json({ error: "الفاتورة غير موجودة أو تمت أرشفتها بالفعل" });
+      return res.status(400).json({
+        error: "لا يمكن أرشفة الفاتورة إلا إذا كانت مدفوعة بالكامل أو ملغاة",
+      });
     }
 
     res.status(200).json({
-      message: "تم أرشفة الفاتورة بنجاح ولا يمكن التراجع عن هذا الإجراء",
+      message: "تم أرشفة الفاتورة بنجاح",
       invoice: result.rows[0],
     });
   } catch (error) {
     console.error("Error archiving invoice:", error.message);
-    res.status(500).json({ error: "خطأ في السيرفر أثناء أرشفة الفاتورة" });
+    res.status(500).json({
+      error: "خطأ في السيرفر أثناء أرشفة الفاتورة",
+    });
   }
 };
 

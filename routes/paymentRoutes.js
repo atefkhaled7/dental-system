@@ -27,7 +27,6 @@ router.post(
 // 3. Webhook من Paymob (عام ومحمي بـ HMAC Signature)
 router.post(
   "/webhook/paymob",
-  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
   handlePaymobWebhook
 );
 
