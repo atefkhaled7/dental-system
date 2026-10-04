@@ -6,7 +6,6 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const app = express();
 
-
 app.use(helmet());
 
 // 2. حماية تسجيل الدخول من محاولات التخمين (10 محاولات كل 15 دقيقة)
@@ -53,3 +52,5 @@ app.use("/api/whatsapp", require("./routes/whatsappRoutes"));
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}... Ready for Cash!`);
 });
+
+module.exports = app;
