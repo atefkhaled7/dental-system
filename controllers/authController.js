@@ -49,48 +49,74 @@ const registerUser = async (req, res) => {
 const loginUser = async (req, res) => {
   try {
     const { email, password } = req.body;
+
     if (!email || !password) {
-      return res.status(400).json({ error: "Missing required fields" });
+      return res.status(400).json({
+        error: "Missing required fields",
+      });
     }
 
     const normalizedEmail = email.trim().toLowerCase();
 
     const result = await pool.query(
-      `SELECT users.*, clinics.is_active AS clinic_is_active 
-       FROM users 
-       LEFT JOIN clinics ON users.clinic_id = clinics.id 
-       WHERE users.email = $1`,
+      `
+      SELECT
+        users.*,
+        clinics.is_active AS clinic_is_active
+      FROM users
+      LEFT JOIN clinics ON users.clinic_id = clinics.id
+      WHERE users.email = $1
+      `,
       [normalizedEmail]
     );
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: "بيانات الدخول غير صحيحة" });
+      return res.status(401).json({
+        error: "بيانات الدخول غير صحيحة",
+      });
     }
 
     const user = result.rows[0];
 
-    // التأكد من كلمة المرور
+    // التأكد من كلمة المرور أولاً
     const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) {
-      return res.status(401).json({ error: "بيانات الدخول غير صحيحة" });
-    }
 
-    // فحص مصيري: لو اليوزر مش SuperAdmin وعيادته معطلة، امنعه فوراً من الدخول!
-    if (user.role !== "SuperAdmin" && !user.clinic_is_active) {
-      return res.status(403).json({
-        error:
-          "تم تعطيل حساب هذه العيادة. يرجى التواصل مع إدارة المنصة لتجديد الاشتراك.",
+    if (!validPassword) {
+      return res.status(401).json({
+        error: "بيانات الدخول غير صحيحة",
       });
     }
 
-    // إصدار التوكن
+    // المستخدم نفسه معطل
+    if (!user.is_active) {
+      return res.status(403).json({
+        error: "تم إيقاف حسابك من قبل إدارة العيادة. يرجى مراجعة المدير.",
+      });
+    }
+
+    // العيادة معطلة
+    if (
+      user.role !== "SuperAdmin" &&
+      (!user.clinic_id || !user.clinic_is_active)
+    ) {
+      return res.status(403).json({
+        error: "تم إيقاف اشتراك هذه العيادة مؤقتاً. يرجى مراجعة إدارة المنصة.",
+      });
+    }
+
     const token = jwt.sign(
-      { id: user.id, role: user.role, clinic_id: user.clinic_id },
+      {
+        id: user.id,
+        role: user.role,
+        clinic_id: user.clinic_id,
+      },
       process.env.JWT_SECRET,
-      { expiresIn: "12h" }
+      {
+        expiresIn: "12h",
+      }
     );
 
-    res.status(200).json({
+    return res.status(200).json({
       message: "Login successful",
       token,
       user: {
@@ -102,8 +128,11 @@ const loginUser = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error(error.message);
-    res.status(500).json({ error: "Server Error" });
+    console.error("Login error:", error.message);
+
+    return res.status(500).json({
+      error: "Server Error",
+    });
   }
 };
 
@@ -227,14 +256,111 @@ const registerClinic = async (req, res) => {
 const getDoctors = async (req, res) => {
   try {
     const result = await pool.query(
-      "SELECT id, name FROM users WHERE clinic_id = $1 AND role = 'Doctor'",
+      `
+      SELECT id, name
+      FROM users
+      WHERE clinic_id = $1
+        AND role = 'Doctor'
+        AND is_active = TRUE
+      ORDER BY name ASC
+      `,
       [req.user.clinic_id]
     );
-    res.status(200).json({ doctors: result.rows });
+
+    return res.status(200).json({
+      doctors: result.rows,
+    });
   } catch (error) {
     console.error("Error fetching doctors:", error.message);
-    res.status(500).json({ error: "خطأ في السيرفر" });
+
+    return res.status(500).json({
+      error: "خطأ في السيرفر",
+    });
   }
 };
 
-module.exports = { registerUser, loginUser, registerClinic, getDoctors };
+// 5. تعديل الاسم الشخصي للمستخدم الحالي (متاح لجميع الأدوار)
+const updateProfile = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { name } = req.body;
+
+    if (!name || name.trim().length < 2) {
+      return res
+        .status(400)
+        .json({ error: "الاسم مطلوب ويجب أن يحتوي على حرفين على الأقل" });
+    }
+
+    const result = await pool.query(
+      `UPDATE users SET name = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING id, name, email, role;`,
+      [name.trim(), userId]
+    );
+
+    res.status(200).json({
+      message: "تم تحديث اسمك بنجاح",
+      user: result.rows[0],
+    });
+  } catch (error) {
+    console.error("Error updating profile:", error.message);
+    res.status(500).json({ error: "خطأ في السيرفر أثناء تعديل الاسم" });
+  }
+};
+
+// 6. تغيير كلمة المرور للمستخدم الحالي (متاح لجميع الأدوار)
+const changePassword = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { current_password, new_password } = req.body;
+
+    if (!current_password || !new_password) {
+      return res
+        .status(400)
+        .json({ error: "يرجى إدخال كلمة المرور الحالية والجديدة" });
+    }
+
+    if (new_password.length < 6) {
+      return res
+        .status(400)
+        .json({ error: "كلمة المرور الجديدة يجب أن لا تقل عن 6 أحرف" });
+    }
+
+    // جلب الباسورد الحالي من الداتابيز للتحقق منه
+    const userRes = await pool.query(
+      "SELECT password FROM users WHERE id = $1",
+      [userId]
+    );
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: "المستخدم غير موجود" });
+    }
+
+    const isMatch = await bcrypt.compare(
+      current_password,
+      userRes.rows[0].password
+    );
+    if (!isMatch) {
+      return res.status(400).json({ error: "كلمة المرور الحالية غير صحيحة" });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(new_password, salt);
+
+    await pool.query(
+      "UPDATE users SET password = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+      [hashedPassword, userId]
+    );
+
+    res.status(200).json({ message: "تم تغيير كلمة المرور بنجاح" });
+  } catch (error) {
+    console.error("Error changing password:", error.message);
+    res.status(500).json({ error: "خطأ في السيرفر أثناء تغيير كلمة المرور" });
+  }
+};
+
+module.exports = {
+  registerUser,
+  loginUser,
+  registerClinic,
+  getDoctors,
+  updateProfile,
+  changePassword,
+};

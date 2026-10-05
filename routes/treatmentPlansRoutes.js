@@ -9,6 +9,9 @@ const {
 } = require("../controllers/treatmentPlansController");
 const authMiddleware = require("../middleware/authMiddleware");
 const authorizeRole = require("../middleware/roleMiddleware");
+const { applyUuidParams } = require("../middleware/validateUuid");
+
+applyUuidParams(router, ["patientId", "planId", "itemId"]);
 
 // مسارات خطط العلاج
 router.get(

@@ -28,12 +28,11 @@ const fileFilter = (req, file, cb) => {
   if (allowedMimeTypes.includes(file.mimetype)) {
     cb(null, true);
   } else {
-    cb(
-      new Error(
-        "نوع الملف غير مدعوم. الأنواع المسموحة هي: JPG, PNG, WEBP فقط."
-      ),
-      false
+    const err = new Error(
+      "نوع الملف غير مدعوم. الأنواع المسموحة هي: JPG, PNG, WEBP فقط."
     );
+    err.status = 400;
+    cb(err, false);
   }
 };
 

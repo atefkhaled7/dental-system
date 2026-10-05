@@ -8,7 +8,9 @@ const {
 } = require("../controllers/labOrdersController");
 const authMiddleware = require("../middleware/authMiddleware");
 const authorizeRole = require("../middleware/roleMiddleware");
+const { applyUuidParams } = require("../middleware/validateUuid");
 
+applyUuidParams(router, ["id"]);
 router.use(authMiddleware);
 
 router.post(

@@ -9,6 +9,9 @@ const {
 } = require("../controllers/appointmentsController");
 const authMiddleware = require("../middleware/authMiddleware");
 const authorizeRole = require("../middleware/roleMiddleware");
+const { applyUuidParams } = require("../middleware/validateUuid");
+
+applyUuidParams(router, ["id"]);
 
 router.get(
   "/",

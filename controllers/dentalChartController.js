@@ -2,13 +2,13 @@ const pool = require("../db");
 
 // الحالات المعتمدة دولياً لحالة السن
 const VALID_CONDITIONS = [
-  "sound",    // سليم
-  "caries",   // تسوس
-  "filled",   // محشو
-  "rct",      // علاج عصب
-  "crown",    // تركيبة / تاج
-  "missing",  // مخلوع
-  "implant",  // زراعة
+  "sound", // سليم
+  "caries", // تسوس
+  "filled", // محشو
+  "rct", // علاج عصب
+  "crown", // تركيبة / تاج
+  "missing", // مخلوع
+  "implant", // زراعة
 ];
 
 // 1. جلب كل الأسنان المسجلة لمريض معين
@@ -43,16 +43,30 @@ const updateToothCondition = async (req, res) => {
 
     const toothNum = parseInt(toothNumber, 10);
     if (isNaN(toothNum) || toothNum < 11 || toothNum > 48) {
-      return res.status(400).json({ error: "رقم السن غير صالح (يجب أن يكون بين 11 و 48)" });
+      return res
+        .status(400)
+        .json({ error: "رقم السن غير صالح (يجب أن يكون بين 11 و 48)" });
     }
 
     if (!condition || !VALID_CONDITIONS.includes(condition.toLowerCase())) {
       return res.status(400).json({
-        error: `حالة السن غير صالحة. الحالات المسموحة: ${VALID_CONDITIONS.join(", ")}`,
+        error: `حالة السن غير صالحة. الحالات المسموحة: ${VALID_CONDITIONS.join(
+          ", "
+        )}`,
       });
     }
 
     const normalizedCondition = condition.toLowerCase();
+
+    const patientCheck = await client.query(
+      "SELECT id FROM patients WHERE id = $1 AND clinic_id = $2 AND is_active = TRUE",
+      [patientId, clinicId]
+    );
+    if (patientCheck.rows.length === 0) {
+      return res
+        .status(404)
+        .json({ error: "المريض غير موجود في هذه العيادة أو تمت أرشفته" });
+    }
 
     await client.query("BEGIN");
 

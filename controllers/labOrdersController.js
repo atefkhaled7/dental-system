@@ -15,21 +15,42 @@ const createLabOrder = async (req, res) => {
       lab_notes,
     } = req.body;
 
+    if (!patient_id || !doctor_id || !lab_name) {
+      return res
+        .status(400)
+        .json({ error: "patient_id, doctor_id, and lab_name are required" });
+    }
+
     const doctorCheck = await pool.query(
       "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor'",
       [doctor_id, clinic_id]
     );
-
     if (doctorCheck.rows.length === 0) {
       return res.status(400).json({
         error: "المستخدم المحدد غير مسجل كطبيب مصرح له في هذه العيادة",
       });
     }
 
-    if (!patient_id || !doctor_id || !lab_name) {
-      return res
-        .status(400)
-        .json({ error: "patient_id, doctor_id, and lab_name are required" });
+    const patientCheck = await pool.query(
+      "SELECT id FROM patients WHERE id = $1 AND clinic_id = $2 AND is_active = TRUE",
+      [patient_id, clinic_id]
+    );
+    if (patientCheck.rows.length === 0) {
+      return res.status(400).json({
+        error: "المريض غير موجود في هذه العيادة أو تمت أرشفته",
+      });
+    }
+
+    if (appointment_id) {
+      const apptCheck = await pool.query(
+        "SELECT id FROM appointments WHERE id = $1 AND clinic_id = $2 AND patient_id = $3",
+        [appointment_id, clinic_id, patient_id]
+      );
+      if (apptCheck.rows.length === 0) {
+        return res.status(400).json({
+          error: "الموعد المحدد لا يخص هذا المريض",
+        });
+      }
     }
     const addLabOrderQuery =
       "INSERT INTO lab_orders (clinic_id, patient_id, doctor_id, appointment_id, lab_name, design_software, case_number, expected_at, notes, lab_notes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *";
@@ -91,8 +112,8 @@ const getLabOrders = async (req, res) => {
         patients.phone_number AS patient_phone,
         users.name AS doctor_name
       FROM lab_orders
-      JOIN patients ON lab_orders.patient_id = patients.id
-      JOIN users ON lab_orders.doctor_id = users.id
+      JOIN patients ON lab_orders.patient_id = patients.id AND patients.clinic_id = lab_orders.clinic_id
+      JOIN users ON lab_orders.doctor_id = users.id AND users.clinic_id = lab_orders.clinic_id
       WHERE lab_orders.clinic_id = $1
     `;
     const queryParams = [clinic_id];

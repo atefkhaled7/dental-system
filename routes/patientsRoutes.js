@@ -10,6 +10,9 @@ const {
 } = require("../controllers/patientsController");
 const authMiddleware = require("../middleware/authMiddleware");
 const authorizeRole = require("../middleware/roleMiddleware");
+const { applyUuidParams } = require("../middleware/validateUuid");
+
+applyUuidParams(router, ["id"]);
 
 router.post(
   "/",
