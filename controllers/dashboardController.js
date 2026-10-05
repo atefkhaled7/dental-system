@@ -86,12 +86,9 @@ WHERE p.clinic_id = $1
         WHERE i.clinic_id = $1 AND i.is_archived = FALSE AND i.status NOT IN ('paid', 'cancelled')
         GROUP BY i.patient_id
       ) patient_dues ON p.id = patient_dues.patient_id
-      WHERE a.clinic_id = $1 AND a.appointment_date >=
-    (NOW() AT TIME ZONE 'Africa/Cairo')::date
-    AT TIME ZONE 'Africa/Cairo'
-AND a.appointment_date <
-    ((NOW() AT TIME ZONE 'Africa/Cairo')::date + INTERVAL '1 day')
-    AT TIME ZONE 'Africa/Cairo'
+WHERE a.clinic_id = $1
+  AND DATE(a.appointment_date AT TIME ZONE 'Africa/Cairo') =
+      (NOW() AT TIME ZONE 'Africa/Cairo')::date
 ORDER BY a.appointment_date ASC;
     `;
 

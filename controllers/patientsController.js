@@ -105,31 +105,76 @@ const addPatient = async (req, res) => {
   }
 };
 
-// 2. جلب قائمة المرضى النشطين
+// 2. جلب قائمة المرضى مع الـ Pagination والبحث
+// 2. جلب قائمة المرضى مع الـ Pagination والبحث
 const getPatients = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
-    const { search, archived } = req.query;
+    const { search, archived, page, limit } = req.query;
 
-    // لو باعت archived=true نجيب المؤرشفين (is_active = FALSE)، غير كدة النشطين (is_active = TRUE)
+    // 1. حساب الـ Pagination
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
+    const offset = (pageNum - 1) * limitNum;
+
+    // 2. تحديد حالة الأرشفة (الافتراضي: المرضى النشطين فقط)
     const isActive = archived === "true" ? false : true;
 
-    if (search) {
-      const result = await pool.query(
-        "SELECT * FROM patients WHERE clinic_id = $1 AND (name ILIKE $2 OR phone_number ILIKE $2) AND is_active = $3 ORDER BY created_at DESC",
-        [clinicId, `%${search}%`, isActive]
-      );
-      return res.status(200).json({ patients: result.rows });
+    let query = `
+      SELECT 
+        id, 
+        clinic_id, 
+        name, 
+        phone_number, 
+        gender, 
+        date_of_birth, 
+        medical_alerts, 
+        is_active, 
+        created_at, 
+        updated_at,
+        COUNT(*) OVER() AS full_count
+      FROM patients
+      WHERE clinic_id = $1 AND is_active = $2
+    `;
+
+    const params = [clinicId, isActive];
+    let paramCounter = 3;
+
+    // 3. فلترة البحث (الاسم أو رقم الهاتف)
+    if (search && search.trim() !== "") {
+      query += ` AND (name ILIKE $${paramCounter} OR phone_number ILIKE $${paramCounter})`;
+      params.push(`%${search.trim()}%`);
+      paramCounter++;
     }
 
-    const result = await pool.query(
-      "SELECT * FROM patients WHERE clinic_id = $1 AND is_active = $2 ORDER BY created_at DESC",
-      [clinicId, isActive]
-    );
-    res.status(200).json({ patients: result.rows });
+    // 4. الترتيب والتقسيم
+    query += ` ORDER BY created_at DESC LIMIT $${paramCounter} OFFSET $${
+      paramCounter + 1
+    };`;
+    params.push(limitNum, offset);
+
+    const result = await pool.query(query, params);
+
+    // استخراج العدد الإجمالي من أول صف (إن وُجد)
+    const total =
+      result.rows.length > 0 ? Number(result.rows[0].full_count) : 0;
+
+    // إزالة full_count من بيانات المرضى لتبقى نظيفة
+    const patients = result.rows.map(({ full_count, ...patient }) => patient);
+    const totalPages = Math.ceil(total / limitNum);
+
+    res.status(200).json({
+      patients,
+      pagination: {
+        total,
+        page: pageNum,
+        limit: limitNum,
+        totalPages,
+      },
+    });
   } catch (err) {
     console.error("Error fetching patients:", err.message);
-    res.status(500).json({ error: "خطأ في السيرفر" });
+    res.status(500).json({ error: "خطأ في السيرفر أثناء جلب قائمة المرضى" });
   }
 };
 
@@ -160,7 +205,8 @@ const updatePatient = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
     const patientId = req.params.id;
-    const { name, phone_number, gender, medical_alerts, date_of_birth } = req.body;
+    const { name, phone_number, gender, medical_alerts, date_of_birth } =
+      req.body;
 
     // نفس التحقق الصارم المطبق في الإضافة
     const validationError = validatePatientInput({
@@ -173,7 +219,9 @@ const updatePatient = async (req, res) => {
       return res.status(400).json({ error: validationError });
     }
     const cleanedDob =
-      date_of_birth && String(date_of_birth).trim() !== "" ? date_of_birth : null;
+      date_of_birth && String(date_of_birth).trim() !== ""
+        ? date_of_birth
+        : null;
 
     const query = `
       UPDATE patients 

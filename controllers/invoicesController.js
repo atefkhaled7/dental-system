@@ -210,11 +210,19 @@ const createInvoice = async (req, res) => {
   }
 };
 
+// ==========================================
+// 2. جلب الفواتير مع الـ Pagination والفلاتر
+// ==========================================
 const getInvoices = async (req, res) => {
   const clinic_id = req.user.clinic_id;
-  const { search, status, patient_id, archived } = req.query;
+  const { search, status, patient_id, archived, page, limit } = req.query;
 
   try {
+    // 1. حساب الـ Pagination
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
+    const offset = (pageNum - 1) * limitNum;
+
     let query = `
       SELECT 
         invoices.id, 
@@ -225,48 +233,80 @@ const getInvoices = async (req, res) => {
         invoices.created_at,
         invoices.appointment_id,
         COALESCE(
-  SUM(CASE WHEN payments.status = 'paid' THEN payments.amount ELSE 0 END),
-  0
-) AS paid_amount,
-
-(
-  invoices.total_amount -
-  COALESCE(
-    SUM(CASE WHEN payments.status = 'paid' THEN payments.amount ELSE 0 END),
-    0
-  )
-) AS remaining_amount
+          SUM(CASE WHEN payments.status = 'paid' THEN payments.amount ELSE 0 END),
+          0
+        ) AS paid_amount,
+        (
+          invoices.total_amount -
+          COALESCE(
+            SUM(CASE WHEN payments.status = 'paid' THEN payments.amount ELSE 0 END),
+            0
+          )
+        ) AS remaining_amount,
+        COUNT(*) OVER() AS full_count
       FROM invoices 
       JOIN patients ON invoices.patient_id = patients.id 
       LEFT JOIN payments ON invoices.id = payments.invoice_id AND invoices.clinic_id = payments.clinic_id
       WHERE invoices.clinic_id = $1
     `;
+
     const queryParams = [clinic_id];
+    let paramCounter = 2;
 
-    if (search) {
-      queryParams.push(`%${search}%`);
-      query += ` AND (patients.name ILIKE $${queryParams.length} OR patients.phone_number ILIKE $${queryParams.length})`;
+    // 2. فلتر البحث بالاسم أو التليفون
+    if (search && search.trim() !== "") {
+      queryParams.push(`%${search.trim()}%`);
+      query += ` AND (patients.name ILIKE $${paramCounter} OR patients.phone_number ILIKE $${paramCounter})`;
+      paramCounter++;
     }
 
-    if (status) {
-      queryParams.push(status);
-      query += ` AND invoices.status = $${queryParams.length}`;
+    // 3. فلتر حالة الدفع (paid / partially_paid / unpaid / cancelled)
+    if (status && status.trim() !== "") {
+      queryParams.push(status.trim());
+      query += ` AND invoices.status = $${paramCounter}`;
+      paramCounter++;
     }
 
+    // 4. فلتر مريض محدد
     if (patient_id) {
       queryParams.push(patient_id);
-      query += ` AND invoices.patient_id = $${queryParams.length}`;
+      query += ` AND invoices.patient_id = $${paramCounter}`;
+      paramCounter++;
     }
 
-    // لو باعت archived=true نجيب الفواتير المؤرشفة، غير كدة نجيب النشطة فقط
-    const isArchived = archived === "true" ? true : false;
+    // 5. فلتر الأرشفة (الافتراضي: الفواتير النشطة فقط)
+    const isArchived = archived === "true";
     queryParams.push(isArchived);
-    query += ` AND invoices.is_archived = $${queryParams.length}`;
+    query += ` AND invoices.is_archived = $${paramCounter}`;
+    paramCounter++;
 
-    query += ` GROUP BY invoices.id, patients.name, patients.phone_number ORDER BY invoices.created_at DESC;`;
+    // 6. الترتيب وتقسيم الصفحات
+    query += ` GROUP BY invoices.id, patients.name, patients.phone_number ORDER BY invoices.created_at DESC LIMIT $${paramCounter} OFFSET $${paramCounter + 1};`;
+    queryParams.push(limitNum, offset);
 
     const invoicesResult = await pool.query(query, queryParams);
-    res.status(200).json(invoicesResult.rows);
+
+    // استخراج الإجمالي الكلي للنتائج المطابقة
+    const total =
+      invoicesResult.rows.length > 0
+        ? Number(invoicesResult.rows[0].full_count)
+        : 0;
+
+    // تنظيف الحقل full_count من كائنات الفواتير
+    const invoices = invoicesResult.rows.map(
+      ({ full_count, ...invoice }) => invoice
+    );
+    const totalPages = Math.ceil(total / limitNum) || 1;
+
+    res.status(200).json({
+      invoices,
+      pagination: {
+        total,
+        page: pageNum,
+        limit: limitNum,
+        totalPages,
+      },
+    });
   } catch (error) {
     console.error("Error fetching invoices:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء جلب الفواتير" });
