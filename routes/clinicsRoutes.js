@@ -5,6 +5,7 @@ const {
   getClinics,
   updateClinic,
   deleteClinic,
+  renewSubscription,
 } = require("../controllers/clinicsController");
 const authMiddleware = require("../middleware/authMiddleware");
 const authorizeRole = require("../middleware/roleMiddleware");
@@ -31,5 +32,7 @@ router.delete(
   authorizeRole("SuperAdmin"),
   deleteClinic
 );
+
+router.put("/:id/subscription", authMiddleware,authorizeRole("SuperAdmin") , renewSubscription);
 
 module.exports = router;

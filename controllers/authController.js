@@ -93,15 +93,36 @@ const loginUser = async (req, res) => {
         error: "تم إيقاف حسابك من قبل إدارة العيادة. يرجى مراجعة المدير.",
       });
     }
+    // التأكد من أن العيادة نشطة وتاريخ اشتراكها لم ينتهِ (باستثناء السوبر أدمن)
+    if (user.role !== "SuperAdmin") {
+      const clinicCheck = await pool.query(
+        "SELECT is_active, subscription_ends_at FROM clinics WHERE id = $1",
+        [user.clinic_id]
+      );
 
-    // العيادة معطلة
-    if (
-      user.role !== "SuperAdmin" &&
-      (!user.clinic_id || !user.clinic_is_active)
-    ) {
-      return res.status(403).json({
-        error: "تم إيقاف اشتراك هذه العيادة مؤقتاً. يرجى مراجعة إدارة المنصة.",
-      });
+      if (clinicCheck.rows.length === 0) {
+        return res.status(403).json({ error: "بيانات العيادة غير موجودة" });
+      }
+
+      const clinic = clinicCheck.rows[0];
+
+      // 1. فحص التجميد اليدوي
+      if (clinic.is_active === false) {
+        return res.status(403).json({
+          error: "تم تجميد حساب هذه العيادة. يرجى التواصل مع إدارة CUROSTA.",
+        });
+      }
+
+      // 2. فحص انتهاء المدة التلقائي (Trial أو اشتراك مدفوع)
+      if (
+        clinic.subscription_ends_at &&
+        new Date(clinic.subscription_ends_at) < new Date()
+      ) {
+        return res.status(403).json({
+          error:
+            "انتهت فترة اشتراك العيادة. يرجى التواصل مع إدارة CUROSTA لتجديد الاشتراك.",
+        });
+      }
     }
 
     const token = jwt.sign(
@@ -318,7 +339,7 @@ const changePassword = async (req, res) => {
         .json({ error: "يرجى إدخال كلمة المرور الحالية والجديدة" });
     }
 
-    if (new_password.length < 6) {
+    if (new_password.length < 8) {
       return res
         .status(400)
         .json({ error: "كلمة المرور الجديدة يجب أن لا تقل عن 6 أحرف" });

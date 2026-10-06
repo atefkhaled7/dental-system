@@ -34,20 +34,21 @@ const authMiddleware = async (req, res, next) => {
     });
   }
 
-  // ② جلب حالة المستخدم الحالية من الداتابيز
+  // ② جلب حالة المستخدم والعيادة والاشتراك الحالية من الداتابيز
   try {
     const userCheck = await pool.query(
       `
-      SELECT
-        u.id,
-        u.clinic_id,
-        u.role,
-        u.is_active,
-        c.is_active AS clinic_active
-      FROM users u
-      LEFT JOIN clinics c ON u.clinic_id = c.id
-      WHERE u.id = $1
-      `,
+    SELECT
+      u.id,
+      u.clinic_id,
+      u.role,
+      u.is_active,
+      c.is_active AS clinic_active,
+      c.subscription_ends_at
+    FROM users u
+    LEFT JOIN clinics c ON u.clinic_id = c.id
+    WHERE u.id = $1
+    `,
       [verified.id]
     );
 
@@ -66,17 +67,27 @@ const authMiddleware = async (req, res, next) => {
       });
     }
 
-    // ④ العيادة متوقفة؟
-    if (
-      currentUser.role !== "SuperAdmin" &&
-      (!currentUser.clinic_id || !currentUser.clinic_active)
-    ) {
-      return res.status(403).json({
-        error: "تم إيقاف اشتراك هذه العيادة مؤقتاً. يرجى مراجعة إدارة المنصة.",
-      });
+    // ④ فحص العيادة والاشتراك لغير الـ SuperAdmin
+    if (currentUser.role !== "SuperAdmin") {
+      // العيادة غير موجودة أو متوقفة
+      if (!currentUser.clinic_id || !currentUser.clinic_active) {
+        return res.status(403).json({
+          error:
+            "تم إيقاف اشتراك هذه العيادة مؤقتاً. يرجى مراجعة إدارة المنصة.",
+        });
+      }
+
+      // الاشتراك منتهي
+      if (
+        currentUser.subscription_ends_at &&
+        new Date(currentUser.subscription_ends_at) < new Date()
+      ) {
+        return res.status(403).json({
+          error: "انتهت فترة اشتراك العيادة، يرجى التجديد.",
+        });
+      }
     }
 
-    // ⑤ نستخدم البيانات الحالية من DB بدل القديمة داخل التوكن
     req.user = {
       ...verified,
       id: currentUser.id,

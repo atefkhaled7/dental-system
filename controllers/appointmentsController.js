@@ -10,23 +10,43 @@ const getAppointments = async (req, res) => {
 
     let query = `
       SELECT 
-        a.id,
-        a.clinic_id,
-        a.patient_id,
-        a.doctor_id,
-        a.appointment_date,
-        a.duration_minutes,
-        (a.appointment_date + (a.duration_minutes * INTERVAL '1 minute')) AS appointment_end,
-        a.status,
-        a.notes,
-        a.created_at,
-        p.name AS patient_name,
-        p.phone_number AS patient_phone,
-        u.name AS doctor_name
-      FROM appointments a
-      JOIN patients p ON a.patient_id = p.id AND a.clinic_id = p.clinic_id
-      JOIN users u ON a.doctor_id = u.id AND a.clinic_id = u.clinic_id
-      WHERE a.clinic_id = $1
+  a.id,
+  a.clinic_id,
+  a.patient_id,
+  a.doctor_id,
+  a.appointment_date,
+  a.duration_minutes,
+  (a.appointment_date + (a.duration_minutes * INTERVAL '1 minute')) AS appointment_end,
+  a.status,
+  a.notes,
+  a.created_at,
+  p.name AS patient_name,
+  p.phone_number AS patient_phone,
+  u.name AS doctor_name,
+  inv.id AS invoice_id,
+  inv.status AS invoice_status,
+  inv.total_amount AS invoice_total
+FROM appointments a
+JOIN patients p
+  ON a.patient_id = p.id
+  AND a.clinic_id = p.clinic_id
+JOIN users u
+  ON a.doctor_id = u.id
+  AND a.clinic_id = u.clinic_id
+  LEFT JOIN LATERAL (
+  SELECT
+    inv.id,
+    inv.status,
+    inv.total_amount
+  FROM invoices inv
+  WHERE inv.appointment_id = a.id
+    AND inv.clinic_id = a.clinic_id
+    AND inv.is_archived = FALSE
+    AND inv.status <> 'cancelled'
+  ORDER BY inv.created_at DESC
+  LIMIT 1
+) inv ON TRUE
+WHERE a.clinic_id = $1
     `;
 
     const params = [clinic_id];
@@ -820,7 +840,6 @@ const updateClinicDurationSettings = async (req, res) => {
   try {
     const { clinic_id, role } = req.user;
     const { default_appointment_duration } = req.body;
-
 
     const duration = Number(default_appointment_duration);
     if (!Number.isInteger(duration) || duration < 5 || duration > 240) {

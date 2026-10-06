@@ -19,7 +19,7 @@ router.post(
   registerUser
 );
 router.post("/login", loginUser);
-router.post("/register-clinic", registerClinic);
+// router.post("/register-clinic", registerClinic);
 router.patch("/profile", authMiddleware, updateProfile);
 router.patch("/change-password", authMiddleware, changePassword);
 
