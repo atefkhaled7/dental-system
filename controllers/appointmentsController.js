@@ -1,4 +1,5 @@
 const pool = require("../db");
+const { logActivity } = require("../utils/auditLogger");
 
 // ==========================================
 // 1. جلب المواعيد مع الفلاتر (بتوقيت Africa/Cairo)
@@ -405,7 +406,23 @@ const createAppointment = async (req, res) => {
 
     await client.query("COMMIT");
 
-    res.status(201).json({
+    await logActivity({
+      clinic_id,
+      user_id: req.user.id,
+      action: "CREATE_APPOINTMENT",
+      entity_type: "appointment",
+      entity_id: insertResult.rows[0].id,
+      description: `قام ${
+        req.user.name
+      } بحجز موعد جديد للمريض #${finalPatientId.slice(0, 8)}`,
+      metadata: {
+        doctor_id,
+        appointment_date: parsedDateForDB,
+        duration_minutes: appointmentDuration,
+      },
+    });
+
+    return res.status(201).json({
       message: "تم حجز الموعد بنجاح",
       appointment: insertResult.rows[0],
     });
@@ -547,6 +564,27 @@ const updateAppointmentStatus = async (req, res) => {
 
     await client.query("COMMIT");
 
+    await logActivity({
+      clinic_id,
+      user_id: req.user.id,
+      action:
+        status === "cancelled"
+          ? "CANCEL_APPOINTMENT"
+          : "UPDATE_APPOINTMENT_STATUS",
+      entity_type: "appointment",
+      entity_id: id,
+      description:
+        status === "cancelled"
+          ? `تمت الغاء الموعد #${id.slice(0, 8)}`
+          : `تم تغيير حالة الموعد #${id.slice(0, 8)} من ${
+              currentApp.status
+            } إلى ${status}`,
+      metadata: {
+        old_status: currentApp.status,
+        new_status: status,
+      },
+    });
+
     res.status(200).json({
       message: "تم تحديث حالة الموعد بنجاح",
       appointment: result.rows[0],
@@ -620,6 +658,8 @@ const rescheduleAppointment = async (req, res) => {
     }
 
     const doctor_id = currentApp.rows[0].doctor_id;
+
+    const oldAppointmentDate = currentApp.rows[0].appointment_date;
 
     // قفل صف الطبيب والتأكد من أنه نشط
     const doctorLock = await client.query(
@@ -698,6 +738,21 @@ const rescheduleAppointment = async (req, res) => {
     );
 
     await client.query("COMMIT");
+
+    await logActivity({
+      clinic_id,
+      user_id: req.user.id,
+      action: "RESCHEDULE_APPOINTMENT",
+      entity_type: "appointment",
+      entity_id: id,
+      description: `تم تعديل موعد الكشف #${id.slice(0, 8)}`,
+      metadata: {
+        old_appointment_date: oldAppointmentDate,
+        new_appointment_date: parsedDateForDB,
+        old_duration_minutes: currentApp.rows[0].duration_minutes,
+        new_duration_minutes: duration,
+      },
+    });
 
     res.status(200).json({
       message: "تم تعديل الموعد بنجاح",
@@ -797,6 +852,15 @@ const deleteAppointment = async (req, res) => {
     );
 
     await client.query("COMMIT");
+
+    await logActivity({
+      clinic_id,
+      user_id: req.user.id,
+      action: "DELETE_APPOINTMENT",
+      entity_type: "appointment",
+      entity_id: id,
+      description: ` حذف موعد نهائياً من السيستم`,
+    });
 
     res.status(200).json({ message: "تم حذف الموعد بنجاح" });
   } catch (error) {

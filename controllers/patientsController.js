@@ -1,4 +1,5 @@
 const pool = require("../db");
+const { logActivity } = require("../utils/auditLogger");
 
 const PHONE_REGEX = /^\+?[0-9]{10,15}$/;
 
@@ -91,9 +92,19 @@ const addPatient = async (req, res) => {
     ];
 
     const result = await pool.query(query, values);
-    res
-      .status(201)
-      .json({ message: "تم إضافة المريض بنجاح", patient: result.rows[0] });
+    await logActivity({
+      clinic_id,
+      user_id: req.user.id,
+      action: "CREATE_PATIENT",
+      entity_type: "patient",
+      entity_id: result.rows[0].id,
+      description: `تمت إضافة مريض جديد (${result.rows[0].name})`,
+    });
+
+    return res.status(201).json({
+      message: "تم إضافة المريض بنجاح",
+      patient: result.rows[0],
+    });
   } catch (err) {
     if (err.code === "23505") {
       return res
@@ -250,6 +261,15 @@ const updatePatient = async (req, res) => {
       return res.status(404).json({ error: "المريض غير موجود أو تمت أرشفته" });
     }
 
+    await logActivity({
+      clinic_id,
+      user_id: req.user.id,
+      action: "UPDATE_PATIENT",
+      entity_type: "patient",
+      entity_id: patientId,
+      description: `تم تعديل بيانات المريض (${result.rows[0].name})`,
+    });
+
     res.status(200).json({
       message: "تم تحديث بيانات المريض بنجاح",
       patient: result.rows[0],
@@ -289,7 +309,14 @@ const deletePatient = async (req, res) => {
         .status(404)
         .json({ error: "المريض غير موجود أو تمت أرشفته بالفعل" });
     }
-
+    await logActivity({
+      clinic_id: clinicId,
+      user_id: req.user.id,
+      action: "ARCHIVE_PATIENT",
+      entity_type: "patient",
+      entity_id: patientId,
+      description: `تمت ارشفة ملف المريض (${result.rows[0].name})`,
+    });
     res
       .status(200)
       .json({ message: "تم أرشفة المريض بنجاح", patient: result.rows[0] });
@@ -313,6 +340,15 @@ const restorePatient = async (req, res) => {
       return res.status(404).json({ error: "المريض غير موجود في الأرشيف" });
     }
 
+    await logActivity({
+      clinic_id: clinicId,
+      user_id: req.user.id,
+      action: "RESTORE_PATIENT",
+      entity_type: "patient",
+      entity_id: patientId,
+      description: `تمت استعادت ملف المريض (${result.rows[0].name}) من الأرشيف`,
+    });
+
     res.status(200).json({
       message: "تمت استعادة المريض بنجاح إلى القائمة النشطة",
       patient: result.rows[0],
@@ -323,6 +359,81 @@ const restorePatient = async (req, res) => {
   }
 };
 
+// ==========================================
+// 7. تصدير قائمة المرضى لملف Excel / CSV (معالجة التواريخ بدقة)
+// ==========================================
+const exportPatients = async (req, res) => {
+  try {
+    const { clinic_id, role } = req.user;
+
+    if (role !== "ClinicAdmin") {
+      return res.status(403).json({
+        error: "غير مصرح لك بتصدير قاعدة بيانات المرضى",
+      });
+    }
+
+    const query = `
+      SELECT
+        name,
+        phone_number,
+        gender,
+        TO_CHAR(date_of_birth, 'DD/MM/YYYY') AS date_of_birth,
+        medical_alerts,
+        TO_CHAR(
+          created_at AT TIME ZONE 'Africa/Cairo',
+          'DD/MM/YYYY'
+        ) AS created_at
+      FROM patients
+      WHERE clinic_id = $1
+        AND is_active = TRUE
+      ORDER BY name ASC;
+    `;
+
+    const result = await pool.query(query, [clinic_id]);
+
+    const escapeCsvValue = (value) => {
+      const stringValue = String(value ?? "");
+
+      const safeValue = /^[=+\-@]/.test(stringValue)
+        ? `'${stringValue}`
+        : stringValue;
+
+      return `"${safeValue.replace(/"/g, '""')}"`;
+    };
+
+    let csv =
+      "\uFEFFاسم المريض,رقم الهاتف,النوع,تاريخ الميلاد,التنبيهات الطبية,تاريخ التسجيل\n";
+
+    result.rows.forEach((p) => {
+      const name = escapeCsvValue(p.name);
+      const phone = escapeCsvValue(p.phone_number);
+
+      const gender =
+        p.gender === "Female" ? "أنثى" : p.gender === "Male" ? "ذكر" : "-";
+
+      const dob = escapeCsvValue(p.date_of_birth || "-");
+      const alerts = escapeCsvValue(p.medical_alerts || "-");
+      const createdAt = escapeCsvValue(p.created_at || "-");
+
+      csv += `${name},${phone},${gender},${dob},${alerts},${createdAt}\n`;
+    });
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=patients_${Date.now()}.csv`
+    );
+
+    return res.status(200).send(csv);
+  } catch (err) {
+    console.error("Error exporting patients:", err.message);
+
+    return res.status(500).json({
+      error: "خطأ في السيرفر أثناء تصدير المرضى",
+    });
+  }
+};
+
 module.exports = {
   addPatient,
   getPatients,
@@ -330,4 +441,5 @@ module.exports = {
   updatePatient,
   deletePatient,
   restorePatient,
+  exportPatients,
 };

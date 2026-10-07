@@ -1,5 +1,7 @@
 const express = require("express");
+
 const router = express.Router();
+
 const {
   addPatient,
   getPatients,
@@ -7,9 +9,12 @@ const {
   updatePatient,
   deletePatient,
   restorePatient,
+  exportPatients,
 } = require("../controllers/patientsController");
+
 const authMiddleware = require("../middleware/authMiddleware");
 const authorizeRole = require("../middleware/roleMiddleware");
+
 const { applyUuidParams } = require("../middleware/validateUuid");
 
 applyUuidParams(router, ["id"]);
@@ -18,35 +23,43 @@ router.post(
   "/",
   authMiddleware,
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
-
   addPatient
 );
+
 router.get(
   "/",
   authMiddleware,
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
-
   getPatients
 );
+
+// تصدير بيانات المرضى - ClinicAdmin فقط
+// مهم: يجب أن يأتي قبل /:id
+router.get(
+  "/export",
+  authMiddleware,
+  authorizeRole("ClinicAdmin"),
+  exportPatients
+);
+
 router.get(
   "/:id",
   authMiddleware,
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
-
   getPatientById
 );
+
 router.put(
   "/:id",
   authMiddleware,
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
-
   updatePatient
 );
+
 router.delete(
   "/:id",
   authMiddleware,
   authorizeRole("ClinicAdmin"),
-
   deletePatient
 );
 

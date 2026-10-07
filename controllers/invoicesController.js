@@ -1,4 +1,5 @@
 const pool = require("../db");
+const { logActivity } = require("../utils/auditLogger");
 
 const createInvoice = async (req, res) => {
   const {
@@ -196,6 +197,22 @@ const createInvoice = async (req, res) => {
       message: "تم إنشاء الفاتورة بنجاح",
       invoice: newInvoice,
     });
+    if (paidNow > 0) {
+      await logActivity({
+        clinic_id,
+        user_id: req.user.id,
+        action: "RECORD_PAYMENT",
+        entity_type: "invoice",
+        entity_id: invoiceId,
+        description: `قام ${
+          req.user.name
+        } بتحصيل دفعة بقيمة ${paidNow} ج.م للفاتورة #${invoiceId.slice(0, 8)}`,
+        metadata: {
+          amount: paidNow,
+          payment_method: paymentMethod,
+        },
+      });
+    }
   } catch (error) {
     await client.query("ROLLBACK");
     if (error.code === "23503") {
@@ -281,7 +298,9 @@ const getInvoices = async (req, res) => {
     paramCounter++;
 
     // 6. الترتيب وتقسيم الصفحات
-    query += ` GROUP BY invoices.id, patients.name, patients.phone_number ORDER BY invoices.created_at DESC LIMIT $${paramCounter} OFFSET $${paramCounter + 1};`;
+    query += ` GROUP BY invoices.id, patients.name, patients.phone_number ORDER BY invoices.created_at DESC LIMIT $${paramCounter} OFFSET $${
+      paramCounter + 1
+    };`;
     queryParams.push(limitNum, offset);
 
     const invoicesResult = await pool.query(query, queryParams);
@@ -392,6 +411,17 @@ const cancelInvoice = async (req, res) => {
     res
       .status(200)
       .json({ message: "تم إلغاء الفاتورة بنجاح", invoice: result.rows[0] });
+    await logActivity({
+      clinic_id,
+      user_id: req.user.id,
+      action: "CANCEL_INVOICE",
+      entity_type: "invoice",
+      entity_id: invoiceId,
+      description: `تم الغاء الفاتورة #${invoiceId.slice(
+        0,
+        8
+      )}`,
+    });
   } catch (error) {
     console.error("Error canceling invoice:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء إلغاء الفاتورة" });
@@ -434,10 +464,139 @@ const archiveInvoice = async (req, res) => {
       message: "تم أرشفة الفاتورة بنجاح",
       invoice: result.rows[0],
     });
+    await logActivity({
+      clinic_id,
+      user_id: req.user.id,
+      action: "ARCHIVE_INVOICE",
+      entity_type: "invoice",
+      entity_id: id,
+      description: `تم ارشفة الفاتورة #${id.slice(0, 8)}`,
+    });
   } catch (error) {
     console.error("Error archiving invoice:", error.message);
     res.status(500).json({
       error: "خطأ في السيرفر أثناء أرشفة الفاتورة",
+    });
+  }
+};
+
+// ==========================================
+// 6. تصدير التقرير المالي والفواتير كـ CSV
+// ClinicAdmin فقط
+// ==========================================
+const exportInvoices = async (req, res) => {
+  try {
+    const { clinic_id, role } = req.user;
+
+    // طبقة حماية إضافية داخل الـcontroller
+    if (role !== "ClinicAdmin") {
+      return res.status(403).json({
+        error: "غير مصرح لك بتصدير التقارير المالية",
+      });
+    }
+
+    const query = `
+      SELECT
+        invoices.id,
+        patients.name AS patient_name,
+        patients.phone_number AS patient_phone,
+        invoices.total_amount,
+        invoices.status,
+        TO_CHAR(
+          invoices.created_at AT TIME ZONE 'Africa/Cairo',
+          'DD/MM/YYYY'
+        ) AS created_at,
+        COALESCE(
+          SUM(
+            CASE
+              WHEN payments.status = 'paid'
+              THEN payments.amount
+              ELSE 0
+            END
+          ),
+          0
+        ) AS paid_amount,
+        (
+          invoices.total_amount -
+          COALESCE(
+            SUM(
+              CASE
+                WHEN payments.status = 'paid'
+                THEN payments.amount
+                ELSE 0
+              END
+            ),
+            0
+          )
+        ) AS remaining_amount
+      FROM invoices
+      JOIN patients
+        ON invoices.patient_id = patients.id
+       AND patients.clinic_id = invoices.clinic_id
+      LEFT JOIN payments
+        ON invoices.id = payments.invoice_id
+       AND invoices.clinic_id = payments.clinic_id
+      WHERE invoices.clinic_id = $1
+        AND invoices.is_archived = FALSE
+      GROUP BY
+        invoices.id,
+        patients.name,
+        patients.phone_number
+      ORDER BY invoices.created_at DESC;
+    `;
+
+    const result = await pool.query(query, [clinic_id]);
+
+    // حماية قيم CSV من الاقتباسات + Formula Injection
+    const escapeCsvValue = (value) => {
+      const stringValue = String(value ?? "");
+
+      const safeValue = /^[=+\-@]/.test(stringValue)
+        ? `'${stringValue}`
+        : stringValue;
+
+      return `"${safeValue.replace(/"/g, '""')}"`;
+    };
+
+    // UTF-8 BOM لدعم العربية بشكل أفضل في Excel
+    let csv =
+      "\uFEFFرقم الفاتورة,اسم المريض,رقم الهاتف,إجمالي الفاتورة (ج.م),المدفوع (ج.م),المتبقي (ج.م),حالة الدفع,تاريخ الفاتورة\n";
+
+    const statusMap = {
+      paid: "مدفوعة بالكامل",
+      partially_paid: "مدفوعة جزئياً",
+      unpaid: "غير مدفوعة",
+      cancelled: "ملغاة",
+    };
+
+    result.rows.forEach((inv) => {
+      const invId = escapeCsvValue(`#${String(inv.id).slice(0, 8)}`);
+      const patient = escapeCsvValue(inv.patient_name || "");
+      const phone = escapeCsvValue(inv.patient_phone || "");
+
+      const total = parseFloat(inv.total_amount || 0);
+      const paid = parseFloat(inv.paid_amount || 0);
+      const remaining = parseFloat(inv.remaining_amount || 0);
+
+      const status = escapeCsvValue(statusMap[inv.status] || inv.status || "-");
+
+      const date = escapeCsvValue(inv.created_at || "-");
+
+      csv += `${invId},${patient},${phone},${total},${paid},${remaining},${status},${date}\n`;
+    });
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename=invoices_report_${Date.now()}.csv`
+    );
+
+    return res.status(200).send(csv);
+  } catch (err) {
+    console.error("Error exporting invoices:", err.message);
+
+    return res.status(500).json({
+      error: "خطأ في السيرفر أثناء تصدير الفواتير",
     });
   }
 };
@@ -448,4 +607,5 @@ module.exports = {
   getInvoiceById,
   cancelInvoice,
   archiveInvoice,
+  exportInvoices,
 };

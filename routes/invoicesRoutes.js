@@ -6,6 +6,7 @@ const {
   getInvoices,
   cancelInvoice,
   archiveInvoice,
+  exportInvoices,
 } = require("../controllers/invoicesController");
 const authMiddleware = require("../middleware/authMiddleware");
 const authorizeRole = require("../middleware/roleMiddleware");
@@ -14,6 +15,8 @@ const { applyUuidParams } = require("../middleware/validateUuid");
 applyUuidParams(router, ["id"]);
 
 router.use(authMiddleware);
+
+router.get("/export",authorizeRole("ClinicAdmin"), exportInvoices);
 
 router.post(
   "/",
