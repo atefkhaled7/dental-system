@@ -1,14 +1,21 @@
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 const crypto = require("crypto");
 
-// مسار تخزين الصور الطبية
-const uploadDir = path.join(__dirname, "../uploads/patient-images");
+// مسار تخزين الصور الطبية (على Vercel المسار الوحيد القابل للكتابة هو /tmp)
+const uploadDir = process.env.VERCEL
+  ? path.join(os.tmpdir(), "patient-images")
+  : path.join(__dirname, "../uploads/patient-images");
 
-// إنشاء المجلد إذا لم يكن موجوداً
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
+// إنشاء المجلد بأمان مع حماية من انهيار السيرفر
+try {
+  if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+  }
+} catch (err) {
+  console.warn("⚠ Warning: Could not create upload directory:", err.message);
 }
 
 const storage = multer.diskStorage({
@@ -45,3 +52,4 @@ const upload = multer({
 });
 
 module.exports = upload;
+module.exports.uploadDir = uploadDir;

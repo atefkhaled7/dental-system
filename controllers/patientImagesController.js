@@ -261,11 +261,11 @@ const getProtectedImageFile = async (req, res) => {
     }
 
     const { file_url, mime_type } = imageRes.rows[0];
-    const absolutePath = path.join(
-      __dirname,
-      "../uploads/patient-images",
-      file_url
-    );
+    const os = require("os");
+    const uploadBaseDir = process.env.VERCEL
+      ? path.join(os.tmpdir(), "patient-images")
+      : path.join(__dirname, "../uploads/patient-images");
+    const absolutePath = path.join(uploadBaseDir, file_url);
 
     if (!fs.existsSync(absolutePath)) {
       return res.status(404).json({ error: "ملف الصورة غير موجود على الخادم" });
