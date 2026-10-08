@@ -1,6 +1,7 @@
 const pool = require("../db");
 const path = require("path");
 const fs = require("fs");
+const { logActivity } = require("../utils/auditLogger");
 
 const VALID_CATEGORIES = [
   "xray_periapical",
@@ -23,11 +24,7 @@ const verifyImageMagicBytes = (filePath) => {
     fs.closeSync(fd);
 
     // 1. JPEG: FF D8 FF
-    if (
-      buffer[0] === 0xff &&
-      buffer[1] === 0xd8 &&
-      buffer[2] === 0xff
-    ) {
+    if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
       return true;
     }
 
@@ -146,6 +143,29 @@ const uploadPatientImage = async (req, res) => {
 
     const result = await pool.query(query, values);
 
+    try {
+      await logActivity({
+        clinic_id: clinicId,
+        user_id: userId,
+        action: "UPLOAD_PATIENT_IMAGE",
+        entity_type: "patient_image",
+        entity_id: result.rows[0].id,
+        description: `قام ${
+          req.user.name || "الطبيب"
+        } برفع صورة طبية (${normalizedCategory}) للمريض #${patientId.slice(
+          0,
+          8
+        )}`,
+        metadata: {
+          category: normalizedCategory,
+          tooth_number: validatedTooth,
+          file_size: req.file.size,
+        },
+      });
+    } catch (auditError) {
+      console.error("Audit log failed:", auditError);
+    }
+
     res.status(201).json({
       message: "تم رفع وتوثيق الصورة الطبية بنجاح",
       image: result.rows[0],
@@ -157,39 +177,63 @@ const uploadPatientImage = async (req, res) => {
   }
 };
 
-// 2. جلب صور المريض
 const getPatientImages = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
     const { patientId } = req.params;
-    const { tooth_number, category, archived } = req.query;
-
+    const { tooth_number, category, archived, page, limit } = req.query;
     const isArchived = archived === "true";
-
     let query = `
       SELECT 
         pi.*,
-        u.name AS doctor_name
+        u.name AS doctor_name,
+        COUNT(*) OVER() AS full_count
       FROM patient_images pi
       LEFT JOIN users u ON pi.uploaded_by = u.id
       WHERE pi.clinic_id = $1 AND pi.patient_id = $2 AND pi.is_archived = $3
     `;
     const queryParams = [clinicId, patientId, isArchived];
-
     if (tooth_number) {
       queryParams.push(parseInt(tooth_number, 10));
       query += ` AND pi.tooth_number = $${queryParams.length}`;
     }
-
     if (category && VALID_CATEGORIES.includes(category)) {
       queryParams.push(category);
       query += ` AND pi.category = $${queryParams.length}`;
     }
+    query += ` ORDER BY pi.created_at DESC`;
 
-    query += ` ORDER BY pi.created_at DESC;`;
+    const isPaginated = page !== undefined || limit !== undefined;
+    if (isPaginated) {
+      const pageNum = Math.max(1, parseInt(page, 10) || 1);
+      const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+      const offset = (pageNum - 1) * limitNum;
 
-    const result = await pool.query(query, queryParams);
-    res.status(200).json({ images: result.rows });
+      query += ` LIMIT $${queryParams.length + 1} OFFSET $${
+        queryParams.length + 2
+      };`;
+      queryParams.push(limitNum, offset);
+
+      const result = await pool.query(query, queryParams);
+      const total =
+        result.rows.length > 0 ? Number(result.rows[0].full_count) : 0;
+      const images = result.rows.map(({ full_count, ...img }) => img);
+      const totalPages = Math.ceil(total / limitNum) || 1;
+
+      return res.status(200).json({
+        images,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: limitNum,
+          totalPages,
+        },
+      });
+    }
+
+    const result = await pool.query(query + ";", queryParams);
+    const images = result.rows.map(({ full_count, ...img }) => img);
+    res.status(200).json({ images });
   } catch (error) {
     console.error("Error fetching patient images:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء جلب الصور الطبية" });
@@ -262,6 +306,24 @@ const archivePatientImage = async (req, res) => {
       return res
         .status(404)
         .json({ error: "الصورة الطبية غير موجودة أو تمت أرشفتها بالفعل" });
+    }
+
+    try {
+      await logActivity({
+        clinic_id: clinicId,
+        user_id: req.user.id,
+        action: "ARCHIVE_PATIENT_IMAGE",
+        entity_type: "patient_image",
+        entity_id: id,
+        description: `قام ${
+          req.user.name || "المستخدم"
+        } بأرشفة صورة طبية للمريض #${result.rows[0].patient_id.slice(0, 8)}`,
+        metadata: {
+          image_id: id,
+        },
+      });
+    } catch (auditError) {
+      console.error("Audit log failed:", auditError);
     }
 
     res.status(200).json({

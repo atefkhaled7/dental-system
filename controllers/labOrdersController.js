@@ -1,4 +1,6 @@
 const pool = require("../db");
+const { logActivity } = require("../utils/auditLogger");
+const { isValidUuid } = require("../middleware/validateUuid");
 
 const createLabOrder = async (req, res) => {
   try {
@@ -15,10 +17,17 @@ const createLabOrder = async (req, res) => {
       lab_notes,
     } = req.body;
 
-    if (!patient_id || !doctor_id || !lab_name) {
-      return res
-        .status(400)
-        .json({ error: "patient_id, doctor_id, and lab_name are required" });
+    if (!patient_id || !isValidUuid(patient_id)) {
+      return res.status(400).json({ error: "معرّف المريض مطلوب وغير صالح" });
+    }
+    if (!doctor_id || !isValidUuid(doctor_id)) {
+      return res.status(400).json({ error: "معرّف الطبيب مطلوب وغير صالح" });
+    }
+    if (appointment_id && !isValidUuid(appointment_id)) {
+      return res.status(400).json({ error: "معرّف الموعد غير صالح" });
+    }
+    if (!lab_name || typeof lab_name !== "string" || lab_name.trim() === "") {
+      return res.status(400).json({ error: "اسم المعمل مطلوب" });
     }
 
     const doctorCheck = await pool.query(
@@ -66,6 +75,28 @@ const createLabOrder = async (req, res) => {
       notes || null,
       lab_notes || null,
     ]);
+    try {
+      await logActivity({
+        clinic_id,
+        user_id: req.user.id,
+        action: "CREATE_LAB_ORDER",
+        entity_type: "lab_order",
+        entity_id: result.rows[0].id,
+        description: `قام ${
+          req.user.name || "الموظف"
+        } بإنشاء طلب معمل (${lab_name.trim()}) للمريض #${patient_id.slice(
+          0,
+          8
+        )}`,
+        metadata: {
+          lab_name: lab_name.trim(),
+          case_number: case_number || null,
+        },
+      });
+    } catch (auditError) {
+      console.error("Audit log failed:", auditError);
+    }
+
     res.status(201).json({
       message: "تم إرسال طلب المعمل بنجاح",
       lab_order: result.rows[0],
@@ -89,7 +120,11 @@ const createLabOrder = async (req, res) => {
 const getLabOrders = async (req, res) => {
   try {
     const clinic_id = req.user.clinic_id;
-    const { status, lab_name, search, patient_id } = req.query;
+    const { status, lab_name, search, patient_id, page, limit } = req.query;
+
+    if (patient_id && !isValidUuid(patient_id)) {
+      return res.status(400).json({ error: "معرّف المريض في الفلتر غير صالح" });
+    }
 
     let query = `
       SELECT 
@@ -110,38 +145,65 @@ const getLabOrders = async (req, res) => {
         lab_orders.lab_notes,
         patients.name AS patient_name,
         patients.phone_number AS patient_phone,
-        users.name AS doctor_name
+        users.name AS doctor_name,
+        COUNT(*) OVER() AS full_count
       FROM lab_orders
       JOIN patients ON lab_orders.patient_id = patients.id AND patients.clinic_id = lab_orders.clinic_id
       JOIN users ON lab_orders.doctor_id = users.id AND users.clinic_id = lab_orders.clinic_id
       WHERE lab_orders.clinic_id = $1
     `;
     const queryParams = [clinic_id];
-
-    if (status) {
+    if (status === "late") {
+      query += ` AND lab_orders.expected_at < CURRENT_DATE AND lab_orders.status NOT IN ('received', 'cancelled')`;
+    } else if (status) {
       queryParams.push(status);
       query += ` AND lab_orders.status = $${queryParams.length}`;
     }
-
     if (lab_name) {
       queryParams.push(lab_name);
       query += ` AND lab_orders.lab_name = $${queryParams.length}`;
     }
-
-    if (search) {
-      queryParams.push(`%${search}%`);
+    if (search && search.trim() !== "") {
+      queryParams.push(`%${search.trim()}%`);
       query += ` AND (patients.name ILIKE $${queryParams.length} OR lab_orders.case_number ILIKE $${queryParams.length} OR lab_orders.lab_name ILIKE $${queryParams.length})`;
     }
-
     if (patient_id) {
       queryParams.push(patient_id);
       query += ` AND lab_orders.patient_id = $${queryParams.length}`;
     }
+    query += ` ORDER BY lab_orders.sent_at DESC`;
 
-    query += ` ORDER BY lab_orders.sent_at DESC;`;
+    const isPaginated = page !== undefined || limit !== undefined;
+    if (isPaginated) {
+      const pageNum = Math.max(1, parseInt(page, 10) || 1);
+      const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+      const offset = (pageNum - 1) * limitNum;
 
-    const result = await pool.query(query, queryParams);
-    res.status(200).json({ lab_orders: result.rows });
+      query += ` LIMIT $${queryParams.length + 1} OFFSET $${
+        queryParams.length + 2
+      };`;
+      queryParams.push(limitNum, offset);
+
+      const result = await pool.query(query, queryParams);
+      const total =
+        result.rows.length > 0 ? Number(result.rows[0].full_count) : 0;
+      const lab_orders = result.rows.map(({ full_count, ...order }) => order);
+      const totalPages = Math.ceil(total / limitNum) || 1;
+
+      return res.status(200).json({
+        lab_orders,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: limitNum,
+          totalPages,
+        },
+      });
+    }
+
+    const result = await pool.query(query + ";", queryParams);
+    const lab_orders = result.rows.map(({ full_count, ...order }) => order);
+    res.status(200).json({ lab_orders });
   } catch (error) {
     console.error("Error fetching lab orders:", error);
     res.status(500).json({ error: "حدث خطأ أثناء جلب طلبات المعمل" });
@@ -173,6 +235,24 @@ const updateLabOrderStatus = async (req, res) => {
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "طلب المعمل غير موجود" });
+    }
+
+    try {
+      await logActivity({
+        clinic_id,
+        user_id: req.user.id,
+        action: "UPDATE_LAB_ORDER_STATUS",
+        entity_type: "lab_order",
+        entity_id: id,
+        description: `قام ${
+          req.user.name || "الموظف"
+        } بتحديث حالة طلب المعمل #${id.slice(0, 8)} إلى "${status}"`,
+        metadata: {
+          new_status: status,
+        },
+      });
+    } catch (auditError) {
+      console.error("Audit log failed:", auditError);
     }
 
     res.status(200).json({
@@ -258,9 +338,26 @@ const updateLabOrder = async (req, res) => {
   }
 };
 
+// جلب قائمة المعامل المميزة للعيادة
+const getDistinctLabs = async (req, res) => {
+  try {
+    const { clinic_id } = req.user;
+    const result = await pool.query(
+      "SELECT DISTINCT lab_name FROM lab_orders WHERE clinic_id = $1 AND lab_name IS NOT NULL AND lab_name <> '' ORDER BY lab_name ASC",
+      [clinic_id]
+    );
+    res.status(200).json({ labs: result.rows.map((r) => r.lab_name) });
+  } catch (error) {
+    console.error("Error fetching distinct labs:", error.message);
+    res.status(500).json({ error: "فشل جلب قائمة المعامل" });
+  }
+};
+
+// ضيف getDistinctLabs في module.exports:
 module.exports = {
   createLabOrder,
   getLabOrders,
   updateLabOrderStatus,
   updateLabOrder,
+  getDistinctLabs, // 👈
 };

@@ -4,6 +4,8 @@
   "description": "",
   "main": "server.js",
   "scripts": {
+    "migrate": "node migrations/runner.js",
+    "test": "node tests/financial-lifecycle-test.js",
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
@@ -11,6 +13,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@sentry/node": "^11.5.0",
     "axios": "^1.20.0",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.6",

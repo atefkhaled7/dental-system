@@ -1,55 +1,67 @@
 const pool = require("../db");
 const { logActivity } = require("../utils/auditLogger");
-
+const { normalizeEgyptianPhone } = require("../utils/phoneNormalizer");
+const { isValidUuid } = require("../middleware/validateUuid");
 // ==========================================
 // 1. جلب المواعيد مع الفلاتر (بتوقيت Africa/Cairo)
+// ==========================================
+// ==========================================
+// 1. جلب المواعيد مع الفلاتر والـ Pagination (بتوقيت Africa/Cairo)
 // ==========================================
 const getAppointments = async (req, res) => {
   try {
     const { clinic_id } = req.user;
-    const { date, doctor_id, patient_id, status } = req.query;
+    const { date, doctor_id, patient_id, status, page, limit } = req.query;
+
+    // فحص صحة الـ UUIDs في الفلاتر
+    if (doctor_id && !isValidUuid(doctor_id)) {
+      return res.status(400).json({ error: "معرّف الطبيب في الفلتر غير صالح" });
+    }
+    if (patient_id && !isValidUuid(patient_id)) {
+      return res.status(400).json({ error: "معرّف المريض في الفلتر غير صالح" });
+    }
 
     let query = `
       SELECT 
-  a.id,
-  a.clinic_id,
-  a.patient_id,
-  a.doctor_id,
-  a.appointment_date,
-  a.duration_minutes,
-  (a.appointment_date + (a.duration_minutes * INTERVAL '1 minute')) AS appointment_end,
-  a.status,
-  a.notes,
-  a.created_at,
-  p.name AS patient_name,
-  p.phone_number AS patient_phone,
-  u.name AS doctor_name,
-  inv.id AS invoice_id,
-  inv.status AS invoice_status,
-  inv.total_amount AS invoice_total
-FROM appointments a
-JOIN patients p
-  ON a.patient_id = p.id
-  AND a.clinic_id = p.clinic_id
-JOIN users u
-  ON a.doctor_id = u.id
-  AND a.clinic_id = u.clinic_id
-  LEFT JOIN LATERAL (
-  SELECT
-    inv.id,
-    inv.status,
-    inv.total_amount
-  FROM invoices inv
-  WHERE inv.appointment_id = a.id
-    AND inv.clinic_id = a.clinic_id
-    AND inv.is_archived = FALSE
-    AND inv.status <> 'cancelled'
-  ORDER BY inv.created_at DESC
-  LIMIT 1
-) inv ON TRUE
-WHERE a.clinic_id = $1
+        a.id,
+        a.clinic_id,
+        a.patient_id,
+        a.doctor_id,
+        a.appointment_date,
+        a.duration_minutes,
+        (a.appointment_date + (a.duration_minutes * INTERVAL '1 minute')) AS appointment_end,
+        a.status,
+        a.notes,
+        a.created_at,
+        p.name AS patient_name,
+        p.phone_number AS patient_phone,
+        u.name AS doctor_name,
+        inv.id AS invoice_id,
+        inv.status AS invoice_status,
+        inv.total_amount AS invoice_total,
+        COUNT(*) OVER() AS full_count
+      FROM appointments a
+      JOIN patients p
+        ON a.patient_id = p.id
+        AND a.clinic_id = p.clinic_id
+      JOIN users u
+        ON a.doctor_id = u.id
+        AND a.clinic_id = u.clinic_id
+      LEFT JOIN LATERAL (
+        SELECT
+          inv.id,
+          inv.status,
+          inv.total_amount
+        FROM invoices inv
+        WHERE inv.appointment_id = a.id
+          AND inv.clinic_id = a.clinic_id
+          AND inv.is_archived = FALSE
+          AND inv.status <> 'cancelled'
+        ORDER BY inv.created_at DESC
+        LIMIT 1
+      ) inv ON TRUE
+      WHERE a.clinic_id = $1
     `;
-
     const params = [clinic_id];
     let paramCounter = 2;
 
@@ -64,29 +76,55 @@ WHERE a.clinic_id = $1
       params.push(date);
       paramCounter++;
     }
-
     if (doctor_id) {
       query += ` AND a.doctor_id = $${paramCounter}`;
       params.push(doctor_id);
       paramCounter++;
     }
-
     if (patient_id) {
       query += ` AND a.patient_id = $${paramCounter}`;
       params.push(patient_id);
       paramCounter++;
     }
-
     if (status) {
       query += ` AND a.status = $${paramCounter}`;
       params.push(status);
       paramCounter++;
     }
 
-    query += ` ORDER BY a.appointment_date ASC;`;
+    query += ` ORDER BY a.appointment_date ASC`;
 
-    const result = await pool.query(query, params);
-    res.status(200).json({ appointments: result.rows });
+    // دعم الـ Pagination إذا طُلبت في الـ query params
+    const isPaginated = page !== undefined || limit !== undefined;
+    if (isPaginated) {
+      const pageNum = Math.max(1, parseInt(page, 10) || 1);
+      const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+      const offset = (pageNum - 1) * limitNum;
+
+      query += ` LIMIT $${paramCounter} OFFSET $${paramCounter + 1};`;
+      params.push(limitNum, offset);
+
+      const result = await pool.query(query, params);
+      const total =
+        result.rows.length > 0 ? Number(result.rows[0].full_count) : 0;
+      const appointments = result.rows.map(({ full_count, ...appt }) => appt);
+      const totalPages = Math.ceil(total / limitNum) || 1;
+
+      return res.status(200).json({
+        appointments,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: limitNum,
+          totalPages,
+        },
+      });
+    }
+
+    // إذا لم تُطلب pagination (مثل الكالندر اليومي)، نرجع النتائج مباشرة
+    const result = await pool.query(query + ";", params);
+    const appointments = result.rows.map(({ full_count, ...appt }) => appt);
+    return res.status(200).json({ appointments });
   } catch (error) {
     console.error("Error fetching appointments:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء جلب المواعيد" });
@@ -153,9 +191,19 @@ const createAppointment = async (req, res) => {
     notes,
   } = req.body;
 
-  if (!doctor_id || !appointment_date) {
+  if (!doctor_id || !isValidUuid(doctor_id)) {
     return res.status(400).json({
-      error: "بيانات الطبيب وموعد الكشف مطلوبة",
+      error: "معرّف الطبيب مطلوب وغير صالح",
+    });
+  }
+  if (patient_id && !isValidUuid(patient_id)) {
+    return res.status(400).json({
+      error: "معرّف المريض المختار غير صالح",
+    });
+  }
+  if (!appointment_date) {
+    return res.status(400).json({
+      error: "موعد الكشف مطلوب",
     });
   }
 
@@ -257,18 +305,16 @@ const createAppointment = async (req, res) => {
           .json({ error: "اسم المريض مطلوب ويجب ألا يقل عن حرفين" });
       }
 
-      const cleanPhone =
-        typeof phone_number === "string" ? phone_number.trim() : "";
-      const PHONE_REGEX = /^\+?[0-9]{10,15}$/;
-      if (!PHONE_REGEX.test(cleanPhone)) {
+      const cleanPhone = normalizeEgyptianPhone(phone_number);
+      if (!cleanPhone) {
         await client.query("ROLLBACK");
         return res.status(400).json({
-          error: "رقم الهاتف غير صالح (أرقام فقط من 10 إلى 15 رقم)",
+          error: "رقم الهاتف المصري غير صحيح",
         });
       }
 
       // توحيد النوع وتجاوز حساسية الأحرف
-      let normalizedGender = "Male";
+      let normalizedGender = null;
       if (gender) {
         const lowerGender = String(gender).trim().toLowerCase();
         if (lowerGender === "female") normalizedGender = "Female";
@@ -807,60 +853,68 @@ const deleteAppointment = async (req, res) => {
         .json({ error: "الموعد غير موجود أو لا ينتمي لعيادتك" });
     }
 
-    // فحص الفواتير النشطة
+    // فحص الفواتير النشطة (غير المؤرشفة وغير الملغاة)
     const activeInvoiceCheck = await client.query(
       `
-      SELECT id
-      FROM invoices
-      WHERE clinic_id = $1 AND appointment_id = $2 AND is_archived = false;
-      `,
+  SELECT id
+  FROM invoices
+  WHERE clinic_id = $1 
+    AND appointment_id = $2 
+    AND is_archived = false
+    AND status <> 'cancelled';
+  `,
       [clinic_id, id]
     );
-
     if (activeInvoiceCheck.rows.length > 0) {
       await client.query("ROLLBACK");
       return res.status(400).json({
         error:
-          "لا يمكن حذف هذا الموعد لوجود فاتورة نشطة مرتبطة به. يرجى إلغاء الموعد أو أرشفة الفاتورة أولاً.",
+          "لا يمكن حذف هذا الموعد لوجود فاتورة نشطة مرتبطة به. يرجى إلغاء الموعد أو أرشفة/إلغاء الفاتورة أولاً.",
       });
     }
-
     // فك ارتباط طلبات المعمل وتحديث updated_at
     await client.query(
       `
-      UPDATE lab_orders
-      SET appointment_id = NULL, updated_at = CURRENT_TIMESTAMP
-      WHERE clinic_id = $1 AND appointment_id = $2;
-      `,
+  UPDATE lab_orders
+  SET appointment_id = NULL, updated_at = CURRENT_TIMESTAMP
+  WHERE clinic_id = $1 AND appointment_id = $2;
+  `,
       [clinic_id, id]
     );
-
-    // فك ارتباط الفواتير المؤرشفة وتحديث updated_at
+    // فك ارتباط أي فواتير أخرى (سواء مؤرشفة أو ملغاة) لتفادي Foreign Key Error
     await client.query(
       `
-      UPDATE invoices
-      SET appointment_id = NULL, updated_at = CURRENT_TIMESTAMP
-      WHERE clinic_id = $1 AND appointment_id = $2 AND is_archived = true;
-      `,
+  UPDATE invoices
+  SET appointment_id = NULL, updated_at = CURRENT_TIMESTAMP
+  WHERE clinic_id = $1 AND appointment_id = $2;
+  `,
       [clinic_id, id]
     );
-
     // حذف الموعد
     await client.query(
       `DELETE FROM appointments WHERE id = $1 AND clinic_id = $2;`,
       [id, clinic_id]
     );
-
     await client.query("COMMIT");
 
-    await logActivity({
-      clinic_id,
-      user_id: req.user.id,
-      action: "DELETE_APPOINTMENT",
-      entity_type: "appointment",
-      entity_id: id,
-      description: ` حذف موعد نهائياً من السيستم`,
-    });
+    try {
+      await logActivity({
+        clinic_id,
+        user_id: req.user.id,
+        action: "DELETE_APPOINTMENT",
+        entity_type: "appointment",
+        entity_id: id,
+        description: `قام ${req.user.name || "المدير"} بحذف الموعد #${id.slice(
+          0,
+          8
+        )} نهائياً من السيستم`,
+        metadata: {
+          appointment_id: id,
+        },
+      });
+    } catch (auditError) {
+      console.error("Audit log failed:", auditError);
+    }
 
     res.status(200).json({ message: "تم حذف الموعد بنجاح" });
   } catch (error) {
@@ -898,7 +952,7 @@ const getClinicDurationSettings = async (req, res) => {
 };
 
 // ==========================================
-// 8. تحديث مدة الكشف الافتراضية للعيادة (ClinicAdmin فقط)
+// 8. تحديث مدة الكشف الافتراضية للعيادة
 // ==========================================
 const updateClinicDurationSettings = async (req, res) => {
   try {

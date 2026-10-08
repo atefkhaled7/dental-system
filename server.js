@@ -5,7 +5,7 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const multer = require("multer");
 const pool = require("./db");
-
+const { captureError } = require("./utils/errorTracker");
 const app = express();
 
 // 1. خلف Vercel / Reverse Proxy نثق في أول Hop عشان نقرأ IP العميل الحقيقي
@@ -114,6 +114,7 @@ app.use("/api/patient-images", require("./routes/patientImagesRoutes"));
 app.use("/api/whatsapp", require("./routes/whatsappRoutes"));
 app.use("/api/staff", require("./routes/staffRoutes"));
 app.use("/api/audit-logs", require("./routes/auditRoutes"));
+app.use("/api/doctor-availability", require("./routes/doctorAvailabilityRoutes"));
 
 // 8. مسار 404
 app.use((req, res) => {
@@ -141,12 +142,21 @@ app.use((err, req, res, next) => {
   }
 
   const status = err.status || err.statusCode || 500;
-
   if (status < 500) {
     return res.status(status).json({ error: err.message });
   }
 
   console.error("Unhandled Server Error:", err);
+
+  // إرسال الخطأ إلى Sentry مع بيانات العيادة والمستخدم والمسار
+  captureError(err, {
+    method: req.method,
+    url: req.originalUrl,
+    clinic_id: req.user?.clinic_id || null,
+    user_id: req.user?.id || null,
+    ip: req.ip,
+  });
+
   res.status(500).json({ error: "حدث خطأ غير متوقع في الخادم" });
 });
 

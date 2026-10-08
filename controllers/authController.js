@@ -1,6 +1,7 @@
 const pool = require("../db");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const { logActivity } = require("../utils/auditLogger");
 
 const registerUser = async (req, res) => {
   try {
@@ -57,66 +58,51 @@ const loginUser = async (req, res) => {
     }
 
     const normalizedEmail = email.trim().toLowerCase();
-
+    // جلب بيانات المستخدم والعيادة والاشتراك في استعلام واحد لتسريع الـ Login
     const result = await pool.query(
       `
       SELECT
         users.*,
-        clinics.is_active AS clinic_is_active
+        clinics.is_active AS clinic_is_active,
+        clinics.subscription_ends_at
       FROM users
       LEFT JOIN clinics ON users.clinic_id = clinics.id
       WHERE users.email = $1
       `,
       [normalizedEmail]
     );
-
     if (result.rows.length === 0) {
       return res.status(401).json({
         error: "بيانات الدخول غير صحيحة",
       });
     }
-
     const user = result.rows[0];
 
     // التأكد من كلمة المرور أولاً
     const validPassword = await bcrypt.compare(password, user.password);
-
     if (!validPassword) {
       return res.status(401).json({
         error: "بيانات الدخول غير صحيحة",
       });
     }
 
-    // المستخدم نفسه معطل
+    // فحص هل المستخدم معطل
     if (!user.is_active) {
       return res.status(403).json({
         error: "تم إيقاف حسابك من قبل إدارة العيادة. يرجى مراجعة المدير.",
       });
     }
-    // التأكد من أن العيادة نشطة وتاريخ اشتراكها لم ينتهِ (باستثناء السوبر أدمن)
+
+    // التأكد من أن العيادة نشطة وتاريخ اشتراكها سارٍ (باستثناء السوبر أدمن)
     if (user.role !== "SuperAdmin") {
-      const clinicCheck = await pool.query(
-        "SELECT is_active, subscription_ends_at FROM clinics WHERE id = $1",
-        [user.clinic_id]
-      );
-
-      if (clinicCheck.rows.length === 0) {
-        return res.status(403).json({ error: "بيانات العيادة غير موجودة" });
-      }
-
-      const clinic = clinicCheck.rows[0];
-
-      // 1. فحص التجميد اليدوي
-      if (clinic.is_active === false) {
+      if (!user.clinic_id || user.clinic_is_active === false) {
         return res.status(403).json({
           error: "تم تجميد حساب هذه العيادة. يرجى التواصل مع إدارة CUROSTA.",
         });
       }
-
-      // 2. فحص انتهاء المدة التلقائي (Trial أو اشتراك مدفوع)
       if (
-        clinic.subscription_ends_at &&
-        new Date(clinic.subscription_ends_at) < new Date()
+        user.subscription_ends_at &&
+        new Date(user.subscription_ends_at) < new Date()
       ) {
         return res.status(403).json({
           error:
@@ -125,11 +111,13 @@ const loginUser = async (req, res) => {
       }
     }
 
+    // تضمين token_version في التوكن لدعم الـ Token Invalidation
     const token = jwt.sign(
       {
         id: user.id,
         role: user.role,
         clinic_id: user.clinic_id,
+        token_version: user.token_version || 1,
       },
       process.env.JWT_SECRET,
       {
@@ -342,7 +330,7 @@ const changePassword = async (req, res) => {
     if (new_password.length < 8) {
       return res
         .status(400)
-        .json({ error: "كلمة المرور الجديدة يجب أن لا تقل عن 6 أحرف" });
+        .json({ error: "كلمة المرور الجديدة يجب أن لا تقل عن 8 أحرف" });
     }
 
     // جلب الباسورد الحالي من الداتابيز للتحقق منه
@@ -365,12 +353,34 @@ const changePassword = async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(new_password, salt);
 
+    // تحديث كلمة المرور مع زيادة token_version لإبطال جميع الجلسات والتوكنات القديمة
     await pool.query(
-      "UPDATE users SET password = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+      `UPDATE users 
+       SET password = $1, 
+           token_version = COALESCE(token_version, 1) + 1, 
+           updated_at = CURRENT_TIMESTAMP 
+       WHERE id = $2`,
       [hashedPassword, userId]
     );
 
-    res.status(200).json({ message: "تم تغيير كلمة المرور بنجاح" });
+    try {
+      await logActivity({
+        clinic_id: req.user.clinic_id,
+        user_id: userId,
+        action: "CHANGE_PASSWORD",
+        entity_type: "user",
+        entity_id: userId,
+        description: `قام ${
+          req.user.name || "المستخدم"
+        } بتغيير كلمة المرور الخاصة به وإبطال الجلسات السابقة`,
+      });
+    } catch (auditError) {
+      console.error("Audit log failed:", auditError);
+    }
+
+    res.status(200).json({
+      message: "تم تغيير كلمة المرور بنجاح، تم إنهاء الجلسات السابقة",
+    });
   } catch (error) {
     console.error("Error changing password:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء تغيير كلمة المرور" });

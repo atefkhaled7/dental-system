@@ -22,7 +22,7 @@ router.use(authMiddleware);
 router.get("/settings/duration", getClinicDurationSettings);
 router.patch(
   "/settings/duration",
-  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  authorizeRole("ClinicAdmin"),
   updateClinicDurationSettings
 );
 

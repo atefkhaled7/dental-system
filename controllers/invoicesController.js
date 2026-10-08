@@ -1,5 +1,6 @@
 const pool = require("../db");
 const { logActivity } = require("../utils/auditLogger");
+const { isValidUuid } = require("../middleware/validateUuid");
 
 const createInvoice = async (req, res) => {
   const {
@@ -12,11 +13,21 @@ const createInvoice = async (req, res) => {
   } = req.body;
   const clinic_id = req.user.clinic_id;
 
-  if (!patient_id || !Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ error: "المريض وبنود الفاتورة مطلوبة" });
+  // 🔒 فحص الـ UUIDs لمدخلات الـ body (بدون أي queryParams)
+  if (!patient_id || !isValidUuid(patient_id)) {
+    return res.status(400).json({ error: "معرّف المريض غير صالح" });
+  }
+  if (appointment_id && !isValidUuid(appointment_id)) {
+    return res.status(400).json({ error: "معرّف الموعد غير صالح" });
+  }
+  if (doctor_id && !isValidUuid(doctor_id)) {
+    return res.status(400).json({ error: "معرّف الطبيب غير صالح" });
+  }
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: "بنود الفاتورة مطلوبة" });
   }
 
-  // فحص البنود
+  // فحص بنود الفاتورة والأسعار
   for (const item of items) {
     if (
       !item.description ||
@@ -39,7 +50,7 @@ const createInvoice = async (req, res) => {
     }
   }
 
-  // حساب الإجمالي بالقروش
+  // حساب الإجمالي بالقروش لتجنب مشاكل الفاصلة العائمة
   const totalAmountInCents = items.reduce((total, item) => {
     const qty = parseInt(item.quantity, 10);
     const unitPriceCents = Math.round(parseFloat(item.unit_price) * 100);
@@ -57,25 +68,53 @@ const createInvoice = async (req, res) => {
   }
 
   let initialStatus = "unpaid";
-  if (paidNowCents >= totalAmountInCents && totalAmountInCents > 0) {
+  // إذا كانت الفاتورة بقيمة صفر (كشف مجاني) أو تم سداد كامل المبلغ فوراً
+  if (
+    totalAmountInCents === 0 ||
+    (paidNowCents >= totalAmountInCents && totalAmountInCents > 0)
+  ) {
     initialStatus = "paid";
   } else if (paidNowCents > 0) {
     initialStatus = "partially_paid";
   }
 
-  const validMethods = ["cash", "card", "bank_transfer", "other"];
-  const paymentMethod = initial_payment?.payment_method || "cash";
+  const validMethods = [
+    "cash",
+    "card",
+    "bank_transfer",
+    "vodafone_cash",
+    "other",
+  ];
+  // توحيد الحروف الصغيرة ومعالجة الفروق الشائعة
+  let rawMethod = (initial_payment?.payment_method || "cash")
+    .toLowerCase()
+    .trim();
+  if (rawMethod === "transfer") rawMethod = "bank_transfer";
+  if (rawMethod === "vodafonecash") rawMethod = "vodafone_cash";
+  const paymentMethod = rawMethod;
 
   if (paidNowCents > 0 && !validMethods.includes(paymentMethod)) {
     return res.status(400).json({ error: "طريقة الدفع غير صالحة" });
   }
 
   const client = await pool.connect();
-
   try {
     await client.query("BEGIN");
 
+    // 🔒 1. فحص عزل المريض أولاً (Tenant Isolation Check)
+    const patientCheck = await client.query(
+      `SELECT id FROM patients WHERE id = $1 AND clinic_id = $2`,
+      [patient_id, clinic_id]
+    );
+
+    if (patientCheck.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "المريض غير موجود في هذه العيادة" });
+    }
+
     let finalAppointmentId = appointment_id || null;
+
+    // 2. التحقق من الموعد إذا تم تمريره
     if (finalAppointmentId) {
       const apptCheck = await client.query(
         `SELECT id
@@ -86,12 +125,14 @@ const createInvoice = async (req, res) => {
          FOR UPDATE`,
         [finalAppointmentId, clinic_id, patient_id]
       );
+
       if (apptCheck.rows.length === 0) {
         await client.query("ROLLBACK");
         return res.status(400).json({
-          error: "الموعد المحدد لا يخص هذا المريض",
+          error: "الموعد المحدد لا يخص هذا المريض أو العيادة",
         });
       }
+
       const existingInvoiceCheck = await client.query(
         `SELECT id
          FROM invoices
@@ -106,38 +147,86 @@ const createInvoice = async (req, res) => {
       if (existingInvoiceCheck.rows.length > 0) {
         await client.query("ROLLBACK");
         return res.status(409).json({
-          error: "هذا الموعد لديه فاتورة بالفعل",
+          error: "هذا الموعد لديه فاتورة نشطة بالفعل",
         });
       }
     }
 
+    // 3. إنشاء موعد تلقائي سليم ومحمى من التعارض إذا حُدد دكتور بدون موعد سابق
     if (!finalAppointmentId && doctor_id) {
+      // قفل صف الطبيب النشط لحماية التزامن
       const doctorCheck = await client.query(
-        "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor'",
+        "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor' AND is_active = TRUE FOR UPDATE",
         [doctor_id, clinic_id]
       );
       if (doctorCheck.rows.length === 0) {
         await client.query("ROLLBACK");
         return res.status(400).json({
-          error: "المستخدم المحدد غير مسجل كطبيب مصرح له في هذه العيادة",
+          error: "المستخدم المحدد غير مسجل كطبيب مصرح له أو حسابه معطل",
         });
       }
-      const appDate = appointment_date
-        ? new Date(appointment_date)
-        : new Date();
-      // لو التاريخ في المستقبل يبقى scheduled، لو دلوقتي أو ماضي بسيط يبقى completed
-      const appStatus = appDate > new Date() ? "scheduled" : "completed";
+
+      // فحص صحة التاريخ
+      let appDate;
+      if (appointment_date) {
+        appDate = new Date(appointment_date);
+        if (isNaN(appDate.getTime())) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ error: "تاريخ ووقت الموعد غير صالح" });
+        }
+      } else {
+        appDate = new Date();
+      }
+
+      // جلب مدة الكشف الافتراضية للعيادة
+      const clinicRes = await client.query(
+        "SELECT default_appointment_duration FROM clinics WHERE id = $1",
+        [clinic_id]
+      );
+      const apptDuration =
+        Number(clinicRes.rows[0]?.default_appointment_duration) || 30;
+
+      const isFuture = appDate > new Date();
+      const appStatus = isFuture ? "scheduled" : "completed";
+
+      // إذا كان الموعد في المستقبل، نطبق فحص التعارض الزمني
+      if (isFuture) {
+        const conflictCheck = await client.query(
+          `SELECT id FROM appointments
+       WHERE clinic_id = $1 
+         AND doctor_id = $2 
+         AND status = 'scheduled'
+         AND appointment_date < ($3::timestamptz + ($4 * INTERVAL '1 minute'))
+         AND (appointment_date + (duration_minutes * INTERVAL '1 minute')) > $3::timestamptz
+       LIMIT 1`,
+          [clinic_id, doctor_id, appDate.toISOString(), apptDuration]
+        );
+
+        if (conflictCheck.rows.length > 0) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            error: "يوجد تعارض: الطبيب لديه كشف آخر محجوز في نفس هذا التوقيت",
+          });
+        }
+      }
 
       const autoAppt = await client.query(
-        `INSERT INTO appointments (clinic_id, patient_id, doctor_id, appointment_date, status, notes)
-         VALUES ($1, $2, $3, $4, $5, 'كشف مربوط بالفاتورة')
-         RETURNING id;`,
-        [clinic_id, patient_id, doctor_id, appDate, appStatus]
+        `INSERT INTO appointments (clinic_id, patient_id, doctor_id, appointment_date, duration_minutes, status, notes)
+     VALUES ($1, $2, $3, $4, $5, $6, 'كشف مربوط بالفاتورة')
+     RETURNING id;`,
+        [
+          clinic_id,
+          patient_id,
+          doctor_id,
+          appDate.toISOString(),
+          apptDuration,
+          appStatus,
+        ]
       );
       finalAppointmentId = autoAppt.rows[0].id;
     }
 
-    // وبعدها بنحط finalAppointmentId في كويري الفاتورة:
+    // 4. إنشاء الفاتورة
     const insertInvoiceQuery = `
       INSERT INTO invoices (clinic_id, patient_id, appointment_id, total_amount, status)
       VALUES ($1, $2, $3, $4, $5)
@@ -146,7 +235,7 @@ const createInvoice = async (req, res) => {
     const invoiceResult = await client.query(insertInvoiceQuery, [
       clinic_id,
       patient_id,
-      finalAppointmentId, // 👈 بقى مربوط بالدكتور أوتوماتيك
+      finalAppointmentId,
       totalAmount,
       initialStatus,
     ]);
@@ -154,7 +243,7 @@ const createInvoice = async (req, res) => {
     const newInvoice = invoiceResult.rows[0];
     const invoiceId = newInvoice.id;
 
-    // 2. إدخال البنود
+    // 5. إدخال البنود
     const insertItemQuery = `
       INSERT INTO invoice_items (clinic_id, invoice_id, procedure_code_id, description, quantity, unit_price, total_price)
       VALUES ($1, $2, $3, $4, $5, $6, $7);
@@ -176,43 +265,70 @@ const createInvoice = async (req, res) => {
       ]);
     }
 
-    // 3. الدفع الفوري التلقائي لو تم تحديد مبلغ مدفوع الآن
+    // 6. تسجيل الدفعة الفورية إذا وُجدت
     if (paidNow > 0) {
       await client.query(
-        `INSERT INTO payments (clinic_id, invoice_id, amount, payment_method, notes)
-         VALUES ($1, $2, $3, $4, $5);`,
+        `INSERT INTO payments (clinic_id, invoice_id, amount, payment_method, notes, status, created_by, paid_at)
+     VALUES ($1, $2, $3, $4, $5, 'paid', $6, CURRENT_TIMESTAMP);`,
         [
           clinic_id,
           invoiceId,
           paidNow,
           paymentMethod,
-          initial_payment.notes || "دفعة فورية عند إصدار الفاتورة",
+          initial_payment?.notes || "دفعة فورية عند إصدار الفاتورة",
+          req.user.id,
         ]
       );
     }
 
     await client.query("COMMIT");
 
+    try {
+      await logActivity({
+        clinic_id,
+        user_id: req.user.id,
+        action: "CREATE_INVOICE",
+        entity_type: "invoice",
+        entity_id: invoiceId,
+        description: `قام ${
+          req.user.name || "الموظف"
+        } بإنشاء فاتورة جديدة بقيمة ${totalAmount} ج.م للمريض #${String(
+          patient_id
+        ).slice(0, 8)}`,
+        metadata: {
+          total_amount: totalAmount,
+          status: initialStatus,
+          items_count: items.length,
+        },
+      });
+
+      if (paidNow > 0) {
+        await logActivity({
+          clinic_id,
+          user_id: req.user.id,
+          action: "RECORD_PAYMENT",
+          entity_type: "invoice",
+          entity_id: invoiceId,
+          description: `قام ${
+            req.user.name || "الموظف"
+          } بتحصيل دفعة بقيمة ${paidNow} ج.م للفاتورة #${invoiceId.slice(
+            0,
+            8
+          )}`,
+          metadata: {
+            amount: paidNow,
+            payment_method: paymentMethod,
+          },
+        });
+      }
+    } catch (auditError) {
+      console.error("Audit log failed:", auditError);
+    }
+
     res.status(201).json({
       message: "تم إنشاء الفاتورة بنجاح",
       invoice: newInvoice,
     });
-    if (paidNow > 0) {
-      await logActivity({
-        clinic_id,
-        user_id: req.user.id,
-        action: "RECORD_PAYMENT",
-        entity_type: "invoice",
-        entity_id: invoiceId,
-        description: `قام ${
-          req.user.name
-        } بتحصيل دفعة بقيمة ${paidNow} ج.م للفاتورة #${invoiceId.slice(0, 8)}`,
-        metadata: {
-          amount: paidNow,
-          payment_method: paymentMethod,
-        },
-      });
-    }
   } catch (error) {
     await client.query("ROLLBACK");
     if (error.code === "23503") {
@@ -262,7 +378,7 @@ const getInvoices = async (req, res) => {
         ) AS remaining_amount,
         COUNT(*) OVER() AS full_count
       FROM invoices 
-      JOIN patients ON invoices.patient_id = patients.id 
+      JOIN patients ON invoices.patient_id = patients.id AND patients.clinic_id = invoices.clinic_id
       LEFT JOIN payments ON invoices.id = payments.invoice_id AND invoices.clinic_id = payments.clinic_id
       WHERE invoices.clinic_id = $1
     `;
@@ -396,35 +512,67 @@ const cancelInvoice = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const invoiceId = req.params.id;
 
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
-      "UPDATE invoices SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE clinic_id = $1 AND id = $2 AND status = 'unpaid' RETURNING *",
+    await client.query("BEGIN");
+
+    // إلغاء الفاتورة فقط إذا كانت غير مدفوعة وتتبع نفس العيادة
+    const result = await client.query(
+      `UPDATE invoices 
+       SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP 
+       WHERE clinic_id = $1 AND id = $2 AND status = 'unpaid' 
+       RETURNING *`,
       [clinic_id, invoiceId]
     );
 
     if (result.rows.length === 0) {
-      return res
-        .status(404)
-        .json({ error: "الفاتورة غير موجودة أو تم دفعها ولا يمكن إلغاؤها" });
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        error: "الفاتورة غير موجودة أو تم سدادها بالفعل ولا يمكن إلغاؤها",
+      });
     }
 
-    res
-      .status(200)
-      .json({ message: "تم إلغاء الفاتورة بنجاح", invoice: result.rows[0] });
+    // فك بنود خطط العلاج المربوطة بهذه الفاتورة لترجع قابلة للفوترة من جديد
+    await client.query(
+      `UPDATE treatment_plan_items 
+   SET invoice_id = NULL
+   WHERE clinic_id = $1 AND invoice_id = $2`,
+      [clinic_id, invoiceId]
+    );
+
+    // إلغاء أي روابط دفع إلكتروني معلقة (pending) تابعة لهذه الفاتورة
+    await client.query(
+      `UPDATE payments 
+   SET status = 'cancelled', 
+       notes = COALESCE(notes, '') || ' [ملغى: تم إلغاء الفاتورة الأصلية]'
+   WHERE clinic_id = $1 AND invoice_id = $2 AND status = 'pending'`,
+      [clinic_id, invoiceId]
+    );
+
+    await client.query("COMMIT");
+
+    // تسجيل العملية في الرقابة
     await logActivity({
       clinic_id,
       user_id: req.user.id,
       action: "CANCEL_INVOICE",
       entity_type: "invoice",
       entity_id: invoiceId,
-      description: `تم الغاء الفاتورة #${invoiceId.slice(
-        0,
-        8
-      )}`,
+      description: `قام ${
+        req.user.name || "المستخدم"
+      } بإلغاء الفاتورة #${invoiceId.slice(0, 8)}`,
+    });
+
+    res.status(200).json({
+      message: "تم إلغاء الفاتورة وفك بنود العلاج المرتبطة بنجاح",
+      invoice: result.rows[0],
     });
   } catch (error) {
+    await client.query("ROLLBACK");
     console.error("Error canceling invoice:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء إلغاء الفاتورة" });
+  } finally {
+    client.release();
   }
 };
 
@@ -590,6 +738,23 @@ const exportInvoices = async (req, res) => {
       "Content-Disposition",
       `attachment; filename=invoices_report_${Date.now()}.csv`
     );
+
+    try {
+      await logActivity({
+        clinic_id,
+        user_id: req.user.id,
+        action: "EXPORT_INVOICES",
+        entity_type: "invoice",
+        description: `قام ${
+          req.user.name || "المدير"
+        } بتصدير تقرير الفواتير المالي بصيغة CSV`,
+        metadata: {
+          exported_count: result.rows.length,
+        },
+      });
+    } catch (auditError) {
+      console.error("Audit log failed:", auditError);
+    }
 
     return res.status(200).send(csv);
   } catch (err) {

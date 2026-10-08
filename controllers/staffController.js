@@ -1,5 +1,6 @@
 const pool = require("../db");
 const bcrypt = require("bcrypt");
+const { logActivity } = require("../utils/auditLogger");
 
 // 1. جلب طاقم العيادة الحالية
 const getClinicStaff = async (req, res) => {
@@ -46,9 +47,9 @@ const addStaffMember = async (req, res) => {
       });
     }
 
-    if (password.length < 6) {
+    if (password.length < 8) {
       return res.status(400).json({
-        error: "كلمة المرور يجب أن لا تقل عن 6 أحرف",
+        error: "كلمة المرور يجب أن لا تقل عن 8 أحرف",
       });
     }
 
@@ -136,6 +137,17 @@ const toggleStaffStatus = async (req, res) => {
 
     const updated = result.rows[0];
 
+    await logActivity({
+      clinic_id: clinicId,
+      user_id: req.user.id,
+      action: updated.is_active ? "ENABLE_STAFF" : "DISABLE_STAFF",
+      entity_type: "user",
+      entity_id: targetUserId,
+      description: `قام ${req.user.name || "المدير"} بـ ${
+        updated.is_active ? "تفعيل" : "إيقاف"
+      } حساب الموظف (${updated.name}) دور: ${updated.role}`,
+    });
+
     return res.status(200).json({
       message: updated.is_active
         ? "تم تفعيل الحساب بنجاح"
@@ -158,20 +170,16 @@ const resetStaffPassword = async (req, res) => {
     const targetUserId = req.params.id;
     const { new_password } = req.body;
 
-    if (!new_password || new_password.length < 6) {
+    if (!new_password || new_password.length < 8) {
       return res.status(400).json({
-        error: "كلمة المرور الجديدة يجب أن لا تقل عن 6 أحرف",
+        error: "كلمة المرور الجديدة يجب أن لا تقل عن 8 أحرف",
       });
     }
 
     const hashedPassword = await bcrypt.hash(new_password, 10);
 
     const query = `
-      UPDATE users
-      SET password = $1,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = $2
-        AND clinic_id = $3
+ UPDATE users SET password = $1, token_version = COALESCE(token_version, 1) + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND clinic_id = $3
         AND role IN ('Doctor', 'Receptionist')
       RETURNING id, name;
     `;
@@ -187,6 +195,17 @@ const resetStaffPassword = async (req, res) => {
         error: "الموظف غير موجود في هذه العيادة",
       });
     }
+
+    await logActivity({
+      clinic_id: clinicId,
+      user_id: req.user.id,
+      action: "RESET_STAFF_PASSWORD",
+      entity_type: "user",
+      entity_id: targetUserId,
+      description: `قام ${
+        req.user.name || "المدير"
+      } بإعادة تعيين كلمة مرور الموظف (${result.rows[0].name})`,
+    });
 
     return res.status(200).json({
       message: "تمت إعادة تعيين كلمة المرور بنجاح",
@@ -272,10 +291,10 @@ const changeMyPassword = async (req, res) => {
         .json({ error: "يرجى إدخال كلمة المرور الحالية والجديدة" });
     }
 
-    if (new_password.length < 6) {
+    if (new_password.length < 8) {
       return res
         .status(400)
-        .json({ error: "كلمة المرور الجديدة يجب أن لا تقل عن 6 أحرف" });
+        .json({ error: "كلمة المرور الجديدة يجب أن لا تقل عن 8 أحرف" });
     }
 
     // جلب الباسورد المشفر الحالي

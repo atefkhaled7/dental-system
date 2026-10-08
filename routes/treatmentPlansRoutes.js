@@ -6,6 +6,8 @@ const {
   addTreatmentPlanItem,
   updatePlanItemStatus,
   convertPlanItemsToInvoice,
+  updateTreatmentPlanStatus,
+  deleteTreatmentPlanItem,
 } = require("../controllers/treatmentPlansController");
 const authMiddleware = require("../middleware/authMiddleware");
 const authorizeRole = require("../middleware/roleMiddleware");
@@ -45,4 +47,16 @@ router.post(
   convertPlanItemsToInvoice
 );
 
+router.patch(
+  "/:planId/status",
+  authMiddleware,
+  authorizeRole("ClinicAdmin", "Doctor"),
+  updateTreatmentPlanStatus
+);
+router.delete(
+  "/items/:itemId",
+  authMiddleware,
+  authorizeRole("ClinicAdmin", "Doctor"),
+  deleteTreatmentPlanItem
+);
 module.exports = router;

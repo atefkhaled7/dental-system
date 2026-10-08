@@ -2,6 +2,8 @@ const pool = require("../db");
 const { getPaymentProvider } = require("../services/payments/paymentFactory");
 const { normalizeEgyptianPhone } = require("../utils/phoneNormalizer");
 const whatsAppService = require("../services/whatsapp/WhatsAppService");
+const { logActivity } = require("../utils/auditLogger");
+const { isValidUuid } = require("../middleware/validateUuid");
 
 // ==========================================
 // 1. تسجيل دفعة يدوية (Manual Payment)
@@ -11,15 +13,30 @@ const recordPayment = async (req, res) => {
   const user_id = req.user.id;
   const { invoice_id, amount, payment_method, notes } = req.body;
 
+  if (!invoice_id || !isValidUuid(invoice_id)) {
+    return res.status(400).json({ error: "معرّف الفاتورة غير صالح" });
+  }
+
   const payingAmount = parseFloat(amount);
+
   if (isNaN(payingAmount) || payingAmount <= 0) {
     return res
       .status(400)
       .json({ error: "المبلغ المدفوع يجب أن يكون أكبر من الصفر" });
   }
 
-  const validMethods = ["cash", "card", "bank_transfer", "other"];
-  if (!validMethods.includes(payment_method)) {
+  const validMethods = [
+    "cash",
+    "card",
+    "bank_transfer",
+    "vodafone_cash",
+    "other",
+  ];
+  let normalizedMethod = (payment_method || "").toLowerCase().trim();
+  if (normalizedMethod === "transfer") normalizedMethod = "bank_transfer";
+  if (normalizedMethod === "vodafonecash") normalizedMethod = "vodafone_cash";
+
+  if (!validMethods.includes(normalizedMethod)) {
     return res.status(400).json({ error: "طريقة الدفع غير صالحة" });
   }
 
@@ -35,7 +52,9 @@ const recordPayment = async (req, res) => {
 
     if (invoiceResult.rows.length === 0) {
       await client.query("ROLLBACK");
-      return res.status(404).json({ error: "الفاتورة غير موجودة" });
+      return res
+        .status(404)
+        .json({ error: "الفاتورة غير موجودة في هذه العيادة" });
     }
 
     const invoice = invoiceResult.rows[0];
@@ -75,15 +94,16 @@ const recordPayment = async (req, res) => {
       });
     }
 
+    // إضافة الدفعة مع تثبيت paid_at لضمان حسابها في إيرادات الداشبورد اليومية
     const paymentResult = await client.query(
-      `INSERT INTO payments (clinic_id, invoice_id, amount, payment_method, status, notes, created_by)
-       VALUES ($1, $2, $3, $4, 'paid', $5, $6)
+      `INSERT INTO payments (clinic_id, invoice_id, amount, payment_method, status, notes, created_by, paid_at)
+       VALUES ($1, $2, $3, $4, 'paid', $5, $6, CURRENT_TIMESTAMP)
        RETURNING *;`,
       [
         clinic_id,
         invoice_id,
         payingAmount,
-        payment_method,
+        normalizedMethod,
         notes || null,
         user_id,
       ]
@@ -100,6 +120,26 @@ const recordPayment = async (req, res) => {
     await client.query("COMMIT");
 
     const remainingFinal = (invoiceTotalCents - newTotalPaidCents) / 100;
+
+    // تسجيل العملية في سجل الرقابة قبل إرسال الرد
+    await logActivity({
+      clinic_id,
+      user_id,
+      action: "RECORD_PAYMENT",
+      entity_type: "invoice",
+      entity_id: invoice_id,
+      description: `قام ${
+        req.user.name || "الموظف"
+      } بتحصيل دفعة بقيمة ${payingAmount} ج.م للفاتورة #${invoice_id.slice(
+        0,
+        8
+      )}`,
+      metadata: {
+        amount: payingAmount,
+        payment_method: normalizedMethod,
+        remaining_amount: remainingFinal,
+      },
+    });
 
     res.status(201).json({
       message: "تم تسجيل الدفعة وتحديث الفاتورة بنجاح",
@@ -124,6 +164,10 @@ const createOnlinePayment = async (req, res) => {
   const user_id = req.user.id;
   const clinic_email = req.user.email; // ✅ إيميل المستخدم الحالي كـ fallback رسمي للعيادة
   const { invoice_id, amount, notes, expires_hours = 24 } = req.body;
+
+  if (!invoice_id || !isValidUuid(invoice_id)) {
+    return res.status(400).json({ error: "معرّف الفاتورة غير صالح" });
+  }
 
   // ✅ Validation لـ expires_hours (من ساعة إلى 7 أيام كحد أقصى)
   const parsedHours = parseInt(expires_hours, 10);
@@ -631,6 +675,29 @@ const handlePaymobWebhook = async (req, res) => {
     );
 
     await client.query("COMMIT");
+
+    // الـ audit log لا يجب أن يعطل نجاح الدفع
+    try {
+      await logActivity({
+        clinic_id: payment.clinic_id,
+        user_id: payment.created_by || null,
+        action: "ONLINE_PAYMENT_CONFIRMED",
+        entity_type: "invoice",
+        entity_id: invoice.id,
+        description: `تم تأكيد دفع إلكتروني (Paymob) بقيمة ${
+          payment.amount
+        } ج.م للفاتورة #${invoice.id.slice(0, 8)}`,
+        metadata: {
+          payment_id: payment.id,
+          transaction_id: transactionId,
+          amount: payment.amount,
+          provider: "paymob",
+          invoice_status: newInvoiceStatus,
+        },
+      });
+    } catch (auditError) {
+      console.error("Audit log failed:", auditError);
+    }
 
     console.log(
       `✅ Payment ${payment.id} verified and invoice ${invoice.id} updated to ${newInvoiceStatus}`

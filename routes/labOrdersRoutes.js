@@ -5,6 +5,7 @@ const {
   getLabOrders,
   updateLabOrderStatus,
   updateLabOrder,
+  getDistinctLabs,
 } = require("../controllers/labOrdersController");
 const authMiddleware = require("../middleware/authMiddleware");
 const authorizeRole = require("../middleware/roleMiddleware");
@@ -22,6 +23,11 @@ router.get(
   "/",
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
   getLabOrders
+);
+router.get(
+  "/labs",
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  getDistinctLabs
 );
 router.put(
   "/:id",

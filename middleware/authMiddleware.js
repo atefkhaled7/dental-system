@@ -38,29 +38,42 @@ const authMiddleware = async (req, res, next) => {
   try {
     const userCheck = await pool.query(
       `
-    SELECT
-      u.id,
-      u.clinic_id,
-      u.role,
-      u.is_active,
-      c.is_active AS clinic_active,
-      c.subscription_ends_at
-    FROM users u
-    LEFT JOIN clinics c ON u.clinic_id = c.id
-    WHERE u.id = $1
-    `,
+      SELECT
+        u.id,
+        u.clinic_id,
+        u.name,
+        u.email,
+        u.role,
+        u.is_active,
+        u.token_version,
+        c.is_active AS clinic_active,
+        c.subscription_ends_at
+      FROM users u
+      LEFT JOIN clinics c ON u.clinic_id = c.id
+      WHERE u.id = $1
+      `,
       [verified.id]
     );
-
     if (userCheck.rows.length === 0) {
       return res.status(401).json({
         error: "المستخدم غير موجود",
       });
     }
-
     const currentUser = userCheck.rows[0];
 
-    // ③ المستخدم متوقف؟
+    // ③ التحقق من صلاحية التوكن (Token Invalidation بعد تغيير الباسورد)
+    if (
+      verified.token_version !== undefined &&
+      currentUser.token_version !== undefined &&
+      verified.token_version !== currentUser.token_version
+    ) {
+      return res.status(401).json({
+        error:
+          "انتهت صلاحية الجلسة بسبب تغيير كلمة المرور. يرجى تسجيل الدخول مجدداً.",
+      });
+    }
+
+    // ④ المستخدم متوقف؟
     if (!currentUser.is_active) {
       return res.status(403).json({
         error: "تم إيقاف حسابك من قبل إدارة العيادة.",
@@ -92,6 +105,8 @@ const authMiddleware = async (req, res, next) => {
       ...verified,
       id: currentUser.id,
       clinic_id: currentUser.clinic_id,
+      name: currentUser.name,
+      email: currentUser.email,
       role: currentUser.role,
     };
 

@@ -8,4 +8,9 @@ const pool = new Pool({
   },
 });
 
+// معالج الأخطاء للاتصالات الخاملة
+pool.on("error", (err) => {
+  console.error("⚠ Unexpected error on idle Postgres client:", err.message);
+});
+
 module.exports = pool;

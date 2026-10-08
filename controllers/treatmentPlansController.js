@@ -1,5 +1,5 @@
 const pool = require("../db");
-
+const { logActivity } = require("../utils/auditLogger");
 // 🦷 القائمة البيضاء لأرقام الأسنان الـ 32 بنظام FDI الدولي
 const VALID_FDI_TEETH = new Set([
   11, 12, 13, 14, 15, 16, 17, 18, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33,
@@ -416,10 +416,136 @@ const convertPlanItemsToInvoice = async (req, res) => {
   }
 };
 
+// 6. تحديث حالة خطة العلاج (مع تسجيل الرقابة)
+const updateTreatmentPlanStatus = async (req, res) => {
+  try {
+    const clinicId = req.user.clinic_id;
+    const { planId } = req.params;
+    const { status } = req.body;
+
+    const validStatuses = ["active", "completed", "cancelled"];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        error:
+          "حالة الخطة غير صالحة. الحالات المسموحة: active, completed, cancelled",
+      });
+    }
+
+    const query = `
+      UPDATE treatment_plans
+      SET status = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2 AND clinic_id = $3
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, [status, planId, clinicId]);
+
+    if (result.rows.length === 0) {
+      return res
+        .status(404)
+        .json({ error: "خطة العلاج غير موجودة في هذه العيادة" });
+    }
+
+    const updatedPlan = result.rows[0];
+
+    const statusArabic =
+      status === "completed"
+        ? "مكتملة"
+        : status === "cancelled"
+        ? "ملغاة"
+        : "نشطة";
+
+    // تسجيل العملية في سجل الرقابة قبل إرسال الرد
+    await logActivity({
+      clinic_id: clinicId,
+      user_id: req.user.id,
+      action: "UPDATE_TREATMENT_PLAN_STATUS",
+      entity_type: "treatment_plan",
+      entity_id: planId,
+      description: `تم تغيير حالة خطة العلاج (${updatedPlan.title}) إلى ${statusArabic}`,
+      metadata: {
+        title: updatedPlan.title,
+        new_status: status,
+      },
+    });
+
+    res.status(200).json({
+      message: "تم تحديث حالة خطة العلاج بنجاح",
+      plan: updatedPlan,
+    });
+  } catch (error) {
+    console.error("Error updating treatment plan status:", error.message);
+    res.status(500).json({ error: "خطأ في السيرفر أثناء تحديث حالة الخطة" });
+  }
+};
+
+// 7. حذف بند علاجي (مع تسجيل الرقابة)
+const deleteTreatmentPlanItem = async (req, res) => {
+  try {
+    const clinicId = req.user.clinic_id;
+    const { itemId } = req.params;
+
+    // 🔒 1. فحص البند وهل متفوتر ولا لأ
+    const checkQuery = `
+      SELECT tpi.id, tpi.invoice_id, tpi.procedure_name, tpi.tooth_number, tp.title AS plan_title
+      FROM treatment_plan_items tpi
+      JOIN treatment_plans tp ON tpi.plan_id = tp.id
+      WHERE tpi.id = $1 AND tpi.clinic_id = $2;
+    `;
+    const checkRes = await pool.query(checkQuery, [itemId, clinicId]);
+
+    if (checkRes.rows.length === 0) {
+      return res
+        .status(404)
+        .json({ error: "بند العلاج غير موجود في هذه العيادة" });
+    }
+
+    const item = checkRes.rows[0];
+
+    // منع حذف بند تم إصدار فاتورة له
+    if (item.invoice_id !== null) {
+      return res.status(400).json({
+        error: "لا يمكن حذف هذا البند؛ تم إصدار فاتورة رسمية له بالفعل",
+      });
+    }
+
+    // 2. حذف البند
+    await pool.query(
+      "DELETE FROM treatment_plan_items WHERE id = $1 AND clinic_id = $2;",
+      [itemId, clinicId]
+    );
+
+    const toothDesc = item.tooth_number ? `للسن #${item.tooth_number}` : "";
+
+    // تسجيل العملية في سجل الرقابة قبل إرسال الرد
+    await logActivity({
+      clinic_id: clinicId,
+      user_id: req.user.id,
+      action: "DELETE_TREATMENT_PLAN_ITEM",
+      entity_type: "treatment_plan_item",
+      entity_id: itemId,
+      description: `تم حذف بند (${item.procedure_name}) ${toothDesc} من خطة (${item.plan_title})`,
+      metadata: {
+        procedure_name: item.procedure_name,
+        tooth_number: item.tooth_number,
+      },
+    });
+
+    res.status(200).json({
+      message: "تم حذف بند العلاج بنجاح",
+    });
+  } catch (error) {
+    console.error("Error deleting treatment plan item:", error.message);
+    res.status(500).json({ error: "خطأ في السيرفر أثناء حذف بند العلاج" });
+  }
+};
+
 module.exports = {
   getPatientTreatmentPlans,
   createTreatmentPlan,
   addTreatmentPlanItem,
   updatePlanItemStatus,
   convertPlanItemsToInvoice,
+  updateTreatmentPlanStatus,
+  deleteTreatmentPlanItem,
 };
