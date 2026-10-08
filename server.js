@@ -115,6 +115,8 @@ app.use("/api/whatsapp", require("./routes/whatsappRoutes"));
 app.use("/api/staff", require("./routes/staffRoutes"));
 app.use("/api/audit-logs", require("./routes/auditRoutes"));
 app.use("/api/doctor-availability", require("./routes/doctorAvailabilityRoutes"));
+app.use("/api/public", require("./routes/publicBookingRoutes"));
+app.use("/api/booking-requests", require("./routes/bookingRequestsRoutes"));
 
 // 8. مسار 404
 app.use((req, res) => {

@@ -1,5 +1,6 @@
 const pool = require("../db");
 const bcrypt = require("bcrypt");
+const { logActivity } = require("../utils/auditLogger");
 
 // ==========================================
 // 1. إنشاء عيادة جديدة مع تحديد الخطة (تجريبي / شهري / سنوي)
@@ -162,7 +163,6 @@ const getClinics = async (req, res) => {
   }
 };
 
-
 // 3. تجديد أو ترقية الاشتراك (مع تحديث بداية الخطة وحفظ الأيام المتبقية)
 const renewSubscription = async (req, res) => {
   try {
@@ -170,12 +170,16 @@ const renewSubscription = async (req, res) => {
     const { plan } = req.body; // 'trial', 'monthly', 'yearly'
 
     if (req.user.role !== "SuperAdmin") {
-      return res.status(403).json({ error: "غير مصرح لك بتعديل اشتراكات العيادات" });
+      return res
+        .status(403)
+        .json({ error: "غير مصرح لك بتعديل اشتراكات العيادات" });
     }
 
     const validPlans = ["trial", "monthly", "yearly"];
     if (!validPlans.includes(plan)) {
-      return res.status(400).json({ error: "نوع الخطة غير صالح (trial, monthly, yearly)" });
+      return res
+        .status(400)
+        .json({ error: "نوع الخطة غير صالح (trial, monthly, yearly)" });
     }
 
     let intervalStr = "14 days";
@@ -219,12 +223,12 @@ const renewSubscription = async (req, res) => {
 };
 
 // ==========================================
-// 4. تعديل بيانات العيادة أو حالة النشاط
+// 4. تعديل بيانات العيادة (الاسم، الهاتف، العنوان، النبذة، والرابط)
 // ==========================================
 const updateClinic = async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, phone_number, is_active } = req.body;
+    const { name, phone_number, address, bio, slug, is_active } = req.body;
 
     if (req.user.role === "ClinicAdmin" && id !== req.user.clinic_id) {
       return res
@@ -232,33 +236,105 @@ const updateClinic = async (req, res) => {
         .json({ error: "غير مصرح لك بتعديل بيانات عيادة أخرى" });
     }
 
-    let activeStatus = undefined;
+    const updates = [];
+    const values = [];
+    let pCount = 1;
+
+    if (name !== undefined) {
+      const cleanName = typeof name === "string" ? name.trim() : "";
+
+      if (!cleanName) {
+        return res.status(400).json({
+          error: "اسم العيادة مطلوب ولا يمكن أن يكون فارغاً",
+        });
+      }
+
+      updates.push(`name = $${pCount++}`);
+      values.push(cleanName);
+    }
+    if (phone_number !== undefined) {
+      updates.push(`phone_number = $${pCount++}`);
+      values.push(phone_number ? phone_number.trim() : null);
+    }
+    if (address !== undefined) {
+      updates.push(`address = $${pCount++}`);
+      values.push(address ? address.trim() : null);
+    }
+    if (bio !== undefined) {
+      updates.push(`bio = $${pCount++}`);
+      values.push(bio ? bio.trim() : null);
+    }
+    if (slug !== undefined) {
+      updates.push(`slug = $${pCount++}`);
+      const cleanSlug = slug
+        ? slug
+            .trim()
+            .toLowerCase()
+            .replace(/\s+/g, "-")
+            .replace(/[^a-z0-9_-]/g, "")
+        : null;
+      values.push(cleanSlug);
+    }
     if (req.user.role === "SuperAdmin" && typeof is_active === "boolean") {
-      activeStatus = is_active;
+      updates.push(`is_active = $${pCount++}`);
+      values.push(is_active);
     }
 
-    const result = await pool.query(
-      `UPDATE clinics 
-       SET name = COALESCE($1, name), 
-           phone_number = COALESCE($2, phone_number), 
-           is_active = COALESCE($3, is_active), 
-           updated_at = CURRENT_TIMESTAMP 
-       WHERE id = $4 
-       RETURNING *;`,
-      [name?.trim() || null, phone_number?.trim() || null, activeStatus, id]
-    );
+    if (updates.length === 0) {
+      return res.status(400).json({ error: "لا توجد بيانات لتحديثها" });
+    }
+
+    updates.push("updated_at = CURRENT_TIMESTAMP");
+    values.push(id);
+
+    const query = `
+      UPDATE clinics 
+      SET ${updates.join(", ")}
+      WHERE id = $${pCount}
+      RETURNING *;
+    `;
+
+    const result = await pool.query(query, values);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "العيادة غير موجودة" });
     }
 
+    const updatedClinic = result.rows[0];
+
+    // توثيق التعديل في سجل الرقابة
+    try {
+      await logActivity({
+        clinic_id: id,
+        user_id: req.user.id,
+        action: "UPDATE_CLINIC",
+        entity_type: "clinic",
+        entity_id: id,
+        description: `قام ${req.user.name || "المدير"} بتحديث بيانات العيادة (${
+          updatedClinic.name
+        })`,
+        metadata: {
+          address: updatedClinic.address,
+          slug: updatedClinic.slug,
+        },
+      });
+    } catch (auditErr) {
+      console.warn("Audit log warning:", auditErr.message);
+    }
+
     res.status(200).json({
       message: "تم تحديث بيانات العيادة بنجاح",
-      clinic: result.rows[0],
+      clinic: updatedClinic,
     });
   } catch (error) {
+    if (error.code === "23505") {
+      return res.status(400).json({
+        error:
+          "اسم الرابط (Slug) مستخدم بالفعل لعيادة أخرى، يرجى اختيار اسم فريد",
+      });
+    }
     console.error("Error updating clinic:", error.message);
-    res.status(500).json({ error: "خطأ في السيرفر" });
+    res.status(500).json({ error: "خطأ في السيرفر أثناء تعديل العيادة" });
   }
 };
 

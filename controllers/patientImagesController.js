@@ -1,7 +1,8 @@
 const pool = require("../db");
 const path = require("path");
-const fs = require("fs");
+const crypto = require("crypto");
 const { logActivity } = require("../utils/auditLogger");
+const storageService = require("../utils/storageService");
 
 const VALID_CATEGORIES = [
   "xray_periapical",
@@ -16,54 +17,39 @@ const VALID_FDI_TEETH = new Set([
   34, 35, 36, 37, 38, 41, 42, 43, 44, 45, 46, 47, 48,
 ]);
 
-const verifyImageMagicBytes = (filePath) => {
-  try {
-    const buffer = Buffer.alloc(12);
-    const fd = fs.openSync(filePath, "r");
-    fs.readSync(fd, buffer, 0, 12, 0);
-    fs.closeSync(fd);
+// 🔒 فحص الـ Magic Bytes مباشرة من الذاكرة (Buffer) بدون I/O
+const verifyImageMagicBytes = (buffer) => {
+  if (!buffer || buffer.length < 12) return false;
 
-    // 1. JPEG: FF D8 FF
-    if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
-      return true;
-    }
-
-    // 2. PNG: 89 50 4E 47
-    if (
-      buffer[0] === 0x89 &&
-      buffer[1] === 0x50 &&
-      buffer[2] === 0x4e &&
-      buffer[3] === 0x47
-    ) {
-      return true;
-    }
-
-    // 3. WEBP: RIFF....WEBP
-    if (
-      buffer.toString("ascii", 0, 4) === "RIFF" &&
-      buffer.toString("ascii", 8, 12) === "WEBP"
-    ) {
-      return true;
-    }
-
-    return false;
-  } catch (err) {
-    return false;
+  // 1. JPEG: FF D8 FF
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return true;
   }
+
+  // 2. PNG: 89 50 4E 47
+  if (
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47
+  ) {
+    return true;
+  }
+
+  // 3. WEBP: RIFF....WEBP
+  if (
+    buffer.toString("ascii", 0, 4) === "RIFF" &&
+    buffer.toString("ascii", 8, 12) === "WEBP"
+  ) {
+    return true;
+  }
+
+  return false;
 };
 
-// 1. رفع صورة طبية جديدة لمريض مع التنظيف عند الفشل وفحص الـ Magic Bytes
+// 1. رفع صورة طبية جديدة لمريض
 const uploadPatientImage = async (req, res) => {
-  // دالة مساعدة لمسح الملف في حالة الخطأ
-  const cleanupFile = () => {
-    if (req.file?.path && fs.existsSync(req.file.path)) {
-      try {
-        fs.unlinkSync(req.file.path);
-      } catch (e) {
-        console.error("Failed to delete orphaned file:", e.message);
-      }
-    }
-  };
+  let uploadedKey = null;
 
   try {
     const clinicId = req.user.clinic_id;
@@ -75,10 +61,9 @@ const uploadPatientImage = async (req, res) => {
       return res.status(400).json({ error: "يرجى اختيار ملف الصورة لرفعه" });
     }
 
-    // 🔒 1. فحص الـ Magic Bytes الحقيقي للملف
-    const isValidImage = verifyImageMagicBytes(req.file.path);
+    // 🔒 1. فحص الـ Magic Bytes الحقيقي للملف من الـ Buffer
+    const isValidImage = verifyImageMagicBytes(req.file.buffer);
     if (!isValidImage) {
-      cleanupFile();
       return res.status(400).json({
         error:
           "الملف المرفوع ليس صورة صالحة أو تم التلاعب بامتداده (يسمح فقط بـ JPG, PNG, WEBP)",
@@ -92,13 +77,12 @@ const uploadPatientImage = async (req, res) => {
     );
 
     if (patientCheck.rows.length === 0) {
-      cleanupFile();
       return res
         .status(404)
         .json({ error: "المريض غير موجود في هذه العيادة أو تمت أرشفته" });
     }
 
-    // 3. فحص السن
+    // 3. فحص رقم السن بنظام FDI
     let validatedTooth = null;
     if (
       tooth_number !== undefined &&
@@ -107,7 +91,6 @@ const uploadPatientImage = async (req, res) => {
     ) {
       const parsedTooth = parseInt(tooth_number, 10);
       if (isNaN(parsedTooth) || !VALID_FDI_TEETH.has(parsedTooth)) {
-        cleanupFile();
         return res.status(400).json({ error: "رقم السن غير صالح بنظام FDI" });
       }
       validatedTooth = parsedTooth;
@@ -116,8 +99,18 @@ const uploadPatientImage = async (req, res) => {
     const normalizedCategory =
       category && VALID_CATEGORIES.includes(category) ? category : "other";
 
-    // اسم الملف الداخلي على القرص (بدون مسار public ثابت)
-    const storageKey = req.file.filename;
+    // توليد اسم فريد للملف
+    const uniqueSuffix = crypto.randomBytes(16).toString("hex");
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    const storageKey = `clinic_${clinicId}_${uniqueSuffix}${ext}`;
+
+    // 🚀 الرفع عبر خدمة التخزين
+    const uploadRes = await storageService.uploadFile({
+      buffer: req.file.buffer,
+      filename: storageKey,
+      mimeType: req.file.mimetype,
+    });
+    uploadedKey = uploadRes.key;
 
     const query = `
       INSERT INTO patient_images (
@@ -133,7 +126,7 @@ const uploadPatientImage = async (req, res) => {
       patientId,
       validatedTooth,
       normalizedCategory,
-      storageKey, // نخزن الـ filename المشفر كـ storage_key
+      uploadRes.key,
       req.file.originalname,
       req.file.mimetype,
       req.file.size,
@@ -171,7 +164,9 @@ const uploadPatientImage = async (req, res) => {
       image: result.rows[0],
     });
   } catch (error) {
-    cleanupFile(); // 👈 لو فشل الـ INSERT نمسح الملف فوراً
+    if (uploadedKey) {
+      await storageService.deleteFile(uploadedKey);
+    }
     console.error("Error uploading patient image:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء رفع الصورة" });
   }
@@ -183,6 +178,7 @@ const getPatientImages = async (req, res) => {
     const { patientId } = req.params;
     const { tooth_number, category, archived, page, limit } = req.query;
     const isArchived = archived === "true";
+
     let query = `
       SELECT 
         pi.*,
@@ -193,6 +189,7 @@ const getPatientImages = async (req, res) => {
       WHERE pi.clinic_id = $1 AND pi.patient_id = $2 AND pi.is_archived = $3
     `;
     const queryParams = [clinicId, patientId, isArchived];
+
     if (tooth_number) {
       queryParams.push(parseInt(tooth_number, 10));
       query += ` AND pi.tooth_number = $${queryParams.length}`;
@@ -240,13 +237,12 @@ const getPatientImages = async (req, res) => {
   }
 };
 
-// 🌟 3. عرض وتحميل الصورة الطبية عبر Endpoint محمي بـ JWT وعزل العيادة (Stream Protected File)
+// 🌟 3. عرض وتحميل الصورة الطبية بأمان (Streaming من Cloudinary أو محلياً)
 const getProtectedImageFile = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
     const { id } = req.params;
 
-    // التأكد إن الصورة مسجلة وتخص عيادة المستخدم الحالي
     const imageQuery = `
       SELECT file_url, file_name, mime_type 
       FROM patient_images 
@@ -261,19 +257,23 @@ const getProtectedImageFile = async (req, res) => {
     }
 
     const { file_url, mime_type } = imageRes.rows[0];
-    const os = require("os");
-    const uploadBaseDir = process.env.VERCEL
-      ? path.join(os.tmpdir(), "patient-images")
-      : path.join(__dirname, "../uploads/patient-images");
-    const absolutePath = path.join(uploadBaseDir, file_url);
 
-    if (!fs.existsSync(absolutePath)) {
+    const fileData = await storageService.getFileStream(file_url);
+    if (!fileData) {
       return res.status(404).json({ error: "ملف الصورة غير موجود على الخادم" });
     }
 
-    // إرسال الملف بشكل آمن مع تحديد الـ Content-Type الصحيح
     res.setHeader("Content-Type", mime_type);
-    res.sendFile(absolutePath);
+    res.setHeader("Cache-Control", "private, max-age=86400"); // كاش آمن لمدة يوم للمستخدم المصرح له
+
+    // لو الـ stream متاح (سواء من R2 أو FileStream)
+    if (fileData.stream?.pipe) {
+      fileData.stream.pipe(res);
+    } else if (fileData.filePath) {
+      res.sendFile(fileData.filePath);
+    } else {
+      res.status(500).json({ error: "تعذر قراءة بيانات الملف" });
+    }
   } catch (error) {
     console.error("Error streaming image file:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء فتح الصورة" });
