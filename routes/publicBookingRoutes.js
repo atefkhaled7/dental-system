@@ -29,8 +29,8 @@ router.get("/clinics/:slug", publicBookingController.getPublicClinicProfile);
 
 // 2. جلب المواعيد المتاحة لدكتور في يوم معين
 router.get(
-  "/clinics/:slugOrId/slots",
-  publicBookingController.getPublicAvailableSlots
+  "/clinics/:slug/slots",
+  publicBookingController.getPublicAvailableSlots,
 );
 
 // 3. تقديم طلب حجز (محمي بالـ Rate Limiter والـ Honeypot)
@@ -38,7 +38,7 @@ router.post(
   "/clinics/:slug/booking-requests",
   bookingLimiter,
   checkHoneypot,
-  publicBookingController.createPublicBookingRequest
+  publicBookingController.createPublicBookingRequest,
 );
 
 module.exports = router;

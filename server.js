@@ -77,8 +77,10 @@ app.get("/api/health", async (req, res) => {
       timestamp: new Date().toISOString(),
     });
   } catch (err) {
+    captureError(err, req);
     console.error("Health Check Failed:", err.message);
-    res.status(503).json({
+
+    return res.status(503).json({
       status: "unhealthy",
       error: "فشل الاتصال بقاعدة البيانات",
       timestamp: new Date().toISOString(),
@@ -114,7 +116,10 @@ app.use("/api/patient-images", require("./routes/patientImagesRoutes"));
 app.use("/api/whatsapp", require("./routes/whatsappRoutes"));
 app.use("/api/staff", require("./routes/staffRoutes"));
 app.use("/api/audit-logs", require("./routes/auditRoutes"));
-app.use("/api/doctor-availability", require("./routes/doctorAvailabilityRoutes"));
+app.use(
+  "/api/doctor-availability",
+  require("./routes/doctorAvailabilityRoutes")
+);
 app.use("/api/public", require("./routes/publicBookingRoutes"));
 app.use("/api/booking-requests", require("./routes/bookingRequestsRoutes"));
 
@@ -130,7 +135,7 @@ app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     const message =
       err.code === "LIMIT_FILE_SIZE"
-        ? "حجم الصورة أكبر من الحد المسموح (10 ميجابايت)"
+        ? "حجم الصورة أكبر من الحد المسموح (4 ميجابايت)"
         : "خطأ في رفع الملف";
     return res.status(400).json({ error: message });
   }

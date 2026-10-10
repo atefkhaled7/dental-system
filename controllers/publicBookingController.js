@@ -1,6 +1,7 @@
 const pool = require("../db");
 const { isValidUuid } = require("../middleware/validateUuid");
 const { normalizeEgyptianPhone } = require("../utils/phoneNormalizer");
+const { captureError } = require("../utils/errorTracker");
 
 // تحويل وقت محلي في القاهرة إلى Date/UTC بدون hardcoded +03:00
 const cairoLocalTimeToDate = (dateStr, timeStr) => {
@@ -36,7 +37,7 @@ const cairoLocalTimeToDate = (dateStr, timeStr) => {
       Number(values.day),
       Number(values.hour),
       Number(values.minute),
-      Number(values.second)
+      Number(values.second),
     );
 
     const offsetMs = cairoAsUtcMs - utcMs;
@@ -66,10 +67,10 @@ const resolveClinic = async (identifier) => {
 
 // 1. جلب بيانات الصفحة العامة للعيادة (الأطباء والخدمات)
 const getPublicClinicProfile = async (req, res) => {
-  const { slugOrId } = req.params;
+  const slug = req.params.slug || req.params.slugOrId;
 
   try {
-    const clinic = await resolveClinic(slugOrId);
+    const clinic = await resolveClinic(slug);
     if (!clinic) {
       return res
         .status(404)
@@ -81,7 +82,7 @@ const getPublicClinicProfile = async (req, res) => {
       `SELECT id, name FROM users 
        WHERE clinic_id = $1 AND role = 'Doctor' AND is_active = TRUE 
        ORDER BY name ASC;`,
-      [clinic.id]
+      [clinic.id],
     );
 
     // جلب الخدمات وأكواد العلاج النشطة مع مدة كل خدمة وأسعارها
@@ -90,7 +91,7 @@ const getPublicClinicProfile = async (req, res) => {
        FROM procedure_codes 
        WHERE clinic_id = $1 AND is_active = TRUE 
        ORDER BY description ASC;`,
-      [clinic.id]
+      [clinic.id],
     );
 
     res.status(200).json({
@@ -106,6 +107,7 @@ const getPublicClinicProfile = async (req, res) => {
       services: servicesRes.rows,
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching public clinic profile:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء تحميل بيانات العيادة" });
   }
@@ -113,11 +115,11 @@ const getPublicClinicProfile = async (req, res) => {
 
 // 2. حساب المواعيد والـ Slots المتاحة للحجز العام أونلاين
 const getPublicAvailableSlots = async (req, res) => {
-  const { slugOrId } = req.params;
+  const slug = req.params.slug || req.params.slugOrId;
   const { doctor_id, date, procedure_id } = req.query;
 
   try {
-    const clinic = await resolveClinic(slugOrId);
+    const clinic = await resolveClinic(slug);
     if (!clinic) {
       return res.status(404).json({ error: "العيادة غير موجودة" });
     }
@@ -143,7 +145,7 @@ const getPublicAvailableSlots = async (req, res) => {
     // فحص إجازات الطبيب
     const leaveCheck = await pool.query(
       "SELECT id FROM doctor_leaves WHERE clinic_id = $1 AND doctor_id = $2 AND leave_date = $3::date;",
-      [clinic.id, doctor_id, date]
+      [clinic.id, doctor_id, date],
     );
     if (leaveCheck.rows.length > 0) {
       return res.status(200).json({
@@ -162,7 +164,7 @@ const getPublicAvailableSlots = async (req, res) => {
       `SELECT start_time, end_time FROM doctor_availability 
        WHERE clinic_id = $1 AND doctor_id = $2 AND day_of_week = $3 AND is_active = TRUE 
        ORDER BY start_time ASC;`,
-      [clinic.id, doctor_id, dayOfWeek]
+      [clinic.id, doctor_id, dayOfWeek],
     );
 
     if (shiftsRes.rows.length === 0) {
@@ -189,7 +191,7 @@ const getPublicAvailableSlots = async (req, res) => {
          WHERE id = $1
            AND clinic_id = $2
            AND is_active = TRUE;`,
-        [procedure_id, clinic.id]
+        [procedure_id, clinic.id],
       );
 
       if (procRes.rows.length === 0) {
@@ -207,7 +209,7 @@ const getPublicAvailableSlots = async (req, res) => {
          FROM clinics
          WHERE id = $1
            AND is_active = TRUE;`,
-        [clinic.id]
+        [clinic.id],
       );
 
       slotDuration =
@@ -220,7 +222,7 @@ const getPublicAvailableSlots = async (req, res) => {
        FROM appointments
        WHERE clinic_id = $1 AND doctor_id = $2 AND status <> 'cancelled'
          AND DATE(appointment_date AT TIME ZONE 'Africa/Cairo') = $3::date;`,
-      [clinic.id, doctor_id, date]
+      [clinic.id, doctor_id, date],
     );
 
     // جلب طلبات الحجز المعلقة التي لم تنتهِ صلاحيتها لمنع تكرار نفس الـ Slot
@@ -229,7 +231,7 @@ const getPublicAvailableSlots = async (req, res) => {
        FROM booking_requests
        WHERE clinic_id = $1 AND doctor_id = $2 AND status = 'pending' AND expires_at > CURRENT_TIMESTAMP
          AND DATE(requested_date AT TIME ZONE 'Africa/Cairo') = $3::date;`,
-      [clinic.id, doctor_id, date]
+      [clinic.id, doctor_id, date],
     );
 
     const bookedIntervals = [
@@ -254,13 +256,13 @@ const getPublicAvailableSlots = async (req, res) => {
         date,
         `${String(startHour).padStart(2, "0")}:${String(startMin).padStart(
           2,
-          "0"
-        )}`
+          "0",
+        )}`,
       ).getTime();
 
       const shiftEndTime = cairoLocalTimeToDate(
         date,
-        `${String(endHour).padStart(2, "0")}:${String(endMin).padStart(2, "0")}`
+        `${String(endHour).padStart(2, "0")}:${String(endMin).padStart(2, "0")}`,
       ).getTime();
       const slotDurationMs = slotDuration * 60 * 1000;
 
@@ -268,9 +270,9 @@ const getPublicAvailableSlots = async (req, res) => {
         const slotStart = currentSlotTime;
         const slotEnd = currentSlotTime + slotDurationMs;
 
-        const isPast = slotStart < nowTime + 10 * 60 * 1000; // سماحية 10 دقائق من الآن
+        const isPast = slotStart <= nowTime + 2 * 60 * 60 * 1000; // منع المواعيد قبل أو عند ساعتين من الآن
         const hasOverlap = bookedIntervals.some(
-          (b) => slotStart < b.end && slotEnd > b.start
+          (b) => slotStart < b.end && slotEnd > b.start,
         );
 
         if (!isPast && !hasOverlap) {
@@ -299,6 +301,7 @@ const getPublicAvailableSlots = async (req, res) => {
       slots: availableSlots,
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching public slots:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء حساب الأوقات المتاحة" });
   }
@@ -306,7 +309,7 @@ const getPublicAvailableSlots = async (req, res) => {
 
 // 3. إنشاء طلب حجز جديد من قبل المريض (Cash at Clinic)
 const createPublicBookingRequest = async (req, res) => {
-  const { slugOrId } = req.params;
+  const slug = req.params.slug || req.params.slugOrId;
 
   const {
     doctor_id,
@@ -318,7 +321,7 @@ const createPublicBookingRequest = async (req, res) => {
   } = req.body;
 
   try {
-    const clinic = await resolveClinic(slugOrId);
+    const clinic = await resolveClinic(slug);
 
     if (!clinic) {
       return res.status(404).json({
@@ -395,7 +398,7 @@ const createPublicBookingRequest = async (req, res) => {
          AND clinic_id = $2
          AND role = 'Doctor'
          AND is_active = TRUE;`,
-      [doctor_id, clinic.id]
+      [doctor_id, clinic.id],
     );
 
     if (doctorRes.rows.length === 0) {
@@ -415,7 +418,7 @@ const createPublicBookingRequest = async (req, res) => {
          WHERE id = $1
            AND clinic_id = $2
            AND is_active = TRUE;`,
-        [procedure_id, clinic.id]
+        [procedure_id, clinic.id],
       );
 
       if (procRes.rows.length === 0) {
@@ -436,7 +439,7 @@ const createPublicBookingRequest = async (req, res) => {
          FROM clinics
          WHERE id = $1
            AND is_active = TRUE;`,
-        [clinic.id]
+        [clinic.id],
       );
 
       duration = Number(clinicRes.rows[0]?.default_appointment_duration) || 30;
@@ -456,7 +459,7 @@ const createPublicBookingRequest = async (req, res) => {
     }).formatToParts(reqDate);
 
     const weekdayName = cairoParts.find(
-      (part) => part.type === "weekday"
+      (part) => part.type === "weekday",
     )?.value;
 
     const weekdayMap = {
@@ -478,7 +481,7 @@ const createPublicBookingRequest = async (req, res) => {
        WHERE clinic_id = $1
          AND doctor_id = $2
          AND leave_date = $3::date;`,
-      [clinic.id, doctor_id, cairoDate]
+      [clinic.id, doctor_id, cairoDate],
     );
 
     if (leaveRes.rows.length > 0) {
@@ -496,7 +499,7 @@ const createPublicBookingRequest = async (req, res) => {
          AND day_of_week = $3
          AND is_active = TRUE
        ORDER BY start_time ASC;`,
-      [clinic.id, doctor_id, dayOfWeek]
+      [clinic.id, doctor_id, dayOfWeek],
     );
 
     // التأكد أن الموعد المطلوب يقع بالكامل داخل أحد الشفتات
@@ -509,13 +512,13 @@ const createPublicBookingRequest = async (req, res) => {
         cairoDate,
         `${String(startHour).padStart(2, "0")}:${String(startMin).padStart(
           2,
-          "0"
-        )}`
+          "0",
+        )}`,
       ).getTime();
 
       const shiftEnd = cairoLocalTimeToDate(
         cairoDate,
-        `${String(endHour).padStart(2, "0")}:${String(endMin).padStart(2, "0")}`
+        `${String(endHour).padStart(2, "0")}:${String(endMin).padStart(2, "0")}`,
       ).getTime();
 
       return reqDate.getTime() >= shiftStart && slotEnd.getTime() <= shiftEnd;
@@ -535,6 +538,33 @@ const createPublicBookingRequest = async (req, res) => {
     try {
       await client.query("BEGIN");
 
+      // منع طلبات الحجز المعلقة المتعددة لنفس رقم الهاتف داخل العيادة
+      // القفل يمنع طلبين متزامنين من تجاوز الفحص
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text));`,
+        [clinic.id, cleanPhone],
+      );
+
+      const pendingCheck = await client.query(
+        `SELECT id
+         FROM booking_requests
+         WHERE clinic_id = $1
+           AND patient_phone = $2
+           AND status = 'pending'
+           AND expires_at > CURRENT_TIMESTAMP
+         LIMIT 1;`,
+        [clinic.id, cleanPhone],
+      );
+
+      if (pendingCheck.rows.length > 0) {
+        await client.query("ROLLBACK");
+
+        return res.status(409).json({
+          error:
+            "لديك طلب حجز سابق قيد المراجعة بالفعل، يرجى انتظار رد العيادة قبل إرسال طلب جديد.",
+        });
+      }
+
       // قفل صف الطبيب مؤقتاً أثناء فحص + إنشاء الطلب
       await client.query(
         `SELECT id
@@ -544,7 +574,7 @@ const createPublicBookingRequest = async (req, res) => {
            AND role = 'Doctor'
            AND is_active = TRUE
          FOR UPDATE;`,
-        [doctor_id, clinic.id]
+        [doctor_id, clinic.id],
       );
 
       // فحص المواعيد المؤكدة المتعارضة
@@ -560,7 +590,7 @@ const createPublicBookingRequest = async (req, res) => {
              (duration_minutes * INTERVAL '1 minute')
            ) > $3
          LIMIT 1;`,
-        [clinic.id, doctor_id, reqDate.toISOString(), slotEnd.toISOString()]
+        [clinic.id, doctor_id, reqDate.toISOString(), slotEnd.toISOString()],
       );
 
       if (appointmentConflictRes.rows.length > 0) {
@@ -585,7 +615,7 @@ const createPublicBookingRequest = async (req, res) => {
              (duration_minutes * INTERVAL '1 minute')
            ) > $3
          LIMIT 1;`,
-        [clinic.id, doctor_id, reqDate.toISOString(), slotEnd.toISOString()]
+        [clinic.id, doctor_id, reqDate.toISOString(), slotEnd.toISOString()],
       );
 
       if (pendingConflictRes.rows.length > 0) {
@@ -596,13 +626,12 @@ const createPublicBookingRequest = async (req, res) => {
         });
       }
 
-      // مهلة انتهاء الطلب
+      // ينتهي الطلب بعد 24 ساعة كحد أقصى، أو عند موعد الحجز، أيهما أقرب
       const expiry24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
 
-      const expiryBeforeAppt = new Date(reqDate.getTime() - 2 * 60 * 60 * 1000);
-
-      const expiresAt =
-        expiryBeforeAppt < expiry24h ? expiryBeforeAppt : expiry24h;
+      const expiresAt = new Date(
+        Math.min(expiry24h.getTime(), reqDate.getTime()),
+      );
 
       const insertRes = await client.query(
         `INSERT INTO booking_requests (
@@ -629,7 +658,7 @@ const createPublicBookingRequest = async (req, res) => {
           duration,
           notes?.trim() || null,
           expiresAt.toISOString(),
-        ]
+        ],
       );
 
       await client.query("COMMIT");
@@ -653,6 +682,7 @@ const createPublicBookingRequest = async (req, res) => {
       client.release();
     }
   } catch (error) {
+    captureError(error, req);
     console.error("Error creating public booking request:", error.message);
 
     res.status(500).json({

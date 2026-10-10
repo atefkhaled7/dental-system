@@ -1,4 +1,5 @@
 const pool = require("../db");
+const { captureError } = require("../utils/errorTracker");
 
 // الحالات المعتمدة لحالة السن
 const VALID_CONDITIONS = [
@@ -68,6 +69,7 @@ const getPatientTeeth = async (req, res) => {
       teeth: result.rows,
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching patient teeth:", error.message);
 
     return res.status(500).json({
@@ -205,6 +207,7 @@ const updateToothCondition = async (req, res) => {
       tooth: toothRes.rows[0],
     });
   } catch (error) {
+    captureError(error, req);
     try {
       await client.query("ROLLBACK");
     } catch (rollbackError) {
@@ -279,6 +282,7 @@ const getToothHistory = async (req, res) => {
       history: result.rows,
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching tooth history:", error.message);
 
     return res.status(500).json({

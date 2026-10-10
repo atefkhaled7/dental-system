@@ -1,6 +1,7 @@
 const pool = require("../db");
 const bcrypt = require("bcrypt");
 const { logActivity } = require("../utils/auditLogger");
+const { captureError } = require("../utils/errorTracker");
 
 // ==========================================
 // 1. إنشاء عيادة جديدة مع تحديد الخطة (تجريبي / شهري / سنوي)
@@ -22,6 +23,18 @@ const createClinic = async (req, res) => {
       return res.status(400).json({ error: "اسم العيادة مطلوب" });
     }
 
+    let generatedSlug = name
+      .toString()
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+
+    if (!generatedSlug || generatedSlug.length < 3) {
+      const randomSuffix = Math.random().toString(36).substring(2, 8);
+      generatedSlug = `clinic-${randomSuffix}`;
+    }
+
     await client.query("BEGIN");
 
     // حساب فترة الاشتراك حسب الخطة
@@ -39,34 +52,37 @@ const createClinic = async (req, res) => {
     // 1. إنشاء العيادة
     const clinicResult = await client.query(
       `INSERT INTO clinics (
-         name, 
-         phone_number, 
-         subdomain, 
-         is_active, 
-         subscription_plan,
-         subscription_status,
-         subscription_starts_at, 
-         subscription_ends_at
-       )
-       VALUES (
-         $1, 
-         $2, 
-         $3, 
-         TRUE, 
-         $4,
-         $5,
-         CURRENT_TIMESTAMP, 
-         (CURRENT_TIMESTAMP + ($6)::interval)
-       )
-       RETURNING *;`,
+  name,
+  slug,
+  phone_number,
+  subdomain,
+  is_active,
+  subscription_plan,
+  subscription_status,
+  subscription_starts_at,
+  subscription_ends_at
+)
+VALUES (
+  $1,
+  $2,
+  $3,
+  $4,
+  TRUE,
+  $5,
+  $6,
+  CURRENT_TIMESTAMP,
+  (CURRENT_TIMESTAMP + ($7)::interval)
+)
+RETURNING *;`,
       [
         name.trim(),
+        generatedSlug,
         phone_number?.trim() || null,
         subdomain?.trim() || null,
         subscription_plan,
         subStatus,
         planInterval,
-      ]
+      ],
     );
 
     const newClinic = clinicResult.rows[0];
@@ -78,7 +94,7 @@ const createClinic = async (req, res) => {
 
       const existingUser = await client.query(
         "SELECT id FROM users WHERE email = $1",
-        [cleanEmail]
+        [cleanEmail],
       );
 
       if (existingUser.rows.length > 0) {
@@ -100,7 +116,7 @@ const createClinic = async (req, res) => {
           admin_name?.trim() || "مدير العيادة",
           cleanEmail,
           hashedPassword,
-        ]
+        ],
       );
 
       createdAdmin = userResult.rows[0];
@@ -114,6 +130,7 @@ const createClinic = async (req, res) => {
       admin: createdAdmin,
     });
   } catch (err) {
+    captureError(err, req);
     await client.query("ROLLBACK");
     console.error("Error creating clinic:", err.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء إنشاء العيادة" });
@@ -153,11 +170,15 @@ const getClinics = async (req, res) => {
       return res.status(200).json({ clinics: result.rows });
     }
 
-    const result = await pool.query("SELECT * FROM clinics WHERE id = $1", [
-      req.user.clinic_id,
-    ]);
+    const result = await pool.query(
+      `SELECT id, name, phone_number, address, bio, slug
+   FROM clinics
+   WHERE id = $1`,
+      [req.user.clinic_id],
+    );
     res.status(200).json({ clinics: result.rows });
   } catch (err) {
+    captureError(err, req);
     console.error("Error fetching clinics:", err.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء جلب العيادات" });
   }
@@ -205,7 +226,7 @@ const renewSubscription = async (req, res) => {
            updated_at = CURRENT_TIMESTAMP
        WHERE id = $4
        RETURNING *;`,
-      [plan, statusStr, intervalStr, id]
+      [plan, statusStr, intervalStr, id],
     );
 
     if (result.rows.length === 0) {
@@ -217,6 +238,7 @@ const renewSubscription = async (req, res) => {
       clinic: result.rows[0],
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error renewing subscription:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء تجديد الاشتراك" });
   }
@@ -265,15 +287,20 @@ const updateClinic = async (req, res) => {
       values.push(bio ? bio.trim() : null);
     }
     if (slug !== undefined) {
+      let generatedSlug = (slug || name || "")
+        .toString()
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+
+      if (!generatedSlug || generatedSlug.length < 3) {
+        const randomSuffix = Math.random().toString(36).substring(2, 8);
+        generatedSlug = `clinic-${randomSuffix}`;
+      }
+
       updates.push(`slug = $${pCount++}`);
-      const cleanSlug = slug
-        ? slug
-            .trim()
-            .toLowerCase()
-            .replace(/\s+/g, "-")
-            .replace(/[^a-z0-9_-]/g, "")
-        : null;
-      values.push(cleanSlug);
+      values.push(generatedSlug);
     }
     if (req.user.role === "SuperAdmin" && typeof is_active === "boolean") {
       updates.push(`is_active = $${pCount++}`);
@@ -333,6 +360,7 @@ const updateClinic = async (req, res) => {
           "اسم الرابط (Slug) مستخدم بالفعل لعيادة أخرى، يرجى اختيار اسم فريد",
       });
     }
+    captureError(error, req);
     console.error("Error updating clinic:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء تعديل العيادة" });
   }
@@ -353,7 +381,7 @@ const deleteClinic = async (req, res) => {
 
     const result = await pool.query(
       "UPDATE clinics SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *",
-      [id]
+      [id],
     );
 
     if (result.rows.length === 0) {
@@ -364,6 +392,7 @@ const deleteClinic = async (req, res) => {
       .status(200)
       .json({ message: "تم تعطيل العيادة بنجاح", clinic: result.rows[0] });
   } catch (error) {
+    captureError(error, req);
     console.error("Error deleting clinic:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر" });
   }

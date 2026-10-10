@@ -1,6 +1,7 @@
 const pool = require("../db");
 const { logActivity } = require("../utils/auditLogger");
 const { isValidUuid } = require("../middleware/validateUuid");
+const { captureError } = require("../utils/errorTracker");
 
 const createLabOrder = async (req, res) => {
   try {
@@ -112,6 +113,7 @@ const createLabOrder = async (req, res) => {
         error: "تاريخ الاستلام المتوقع يجب أن يكون بعد تاريخ الإرسال",
       });
     }
+    captureError(error, req);
     console.error("Error creating lab order:", error);
     res.status(500).json({ error: "خطأ في السيرفر أثناء إنشاء طلب المعمل" });
   }
@@ -205,6 +207,7 @@ const getLabOrders = async (req, res) => {
     const lab_orders = result.rows.map(({ full_count, ...order }) => order);
     res.status(200).json({ lab_orders });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching lab orders:", error);
     res.status(500).json({ error: "حدث خطأ أثناء جلب طلبات المعمل" });
   }
@@ -260,6 +263,7 @@ const updateLabOrderStatus = async (req, res) => {
       lab_order: result.rows[0],
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error updating lab order status:", error);
     res.status(500).json({ error: "حدث خطأ أثناء تحديث حالة طلب المعمل" });
   }
@@ -330,7 +334,7 @@ const updateLabOrder = async (req, res) => {
         error: "رقم الحالة مسجل بالفعل في هذه العيادة",
       });
     }
-
+    captureError(error, req);
     console.error("Error updating lab order:", error.message);
     res.status(500).json({
       error: "حدث خطأ أثناء تعديل طلب المعمل",
@@ -348,6 +352,7 @@ const getDistinctLabs = async (req, res) => {
     );
     res.status(200).json({ labs: result.rows.map((r) => r.lab_name) });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching distinct labs:", error.message);
     res.status(500).json({ error: "فشل جلب قائمة المعامل" });
   }

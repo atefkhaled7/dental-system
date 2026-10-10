@@ -1,5 +1,6 @@
 const pool = require("../db");
 const jwt = require("jsonwebtoken");
+const { captureError } = require("../utils/errorTracker");
 
 const authMiddleware = async (req, res, next) => {
   let token = req.header("Authorization");
@@ -52,7 +53,7 @@ const authMiddleware = async (req, res, next) => {
       LEFT JOIN clinics c ON u.clinic_id = c.id
       WHERE u.id = $1
       `,
-      [verified.id]
+      [verified.id],
     );
     if (userCheck.rows.length === 0) {
       return res.status(401).json({
@@ -80,25 +81,38 @@ const authMiddleware = async (req, res, next) => {
       });
     }
 
-    // ④ فحص العيادة والاشتراك لغير الـ SuperAdmin
+    // ⑤ فحص العيادة والاشتراك لغير الـ SuperAdmin
     if (currentUser.role !== "SuperAdmin") {
-      // العيادة غير موجودة أو متوقفة
+      // 1. العيادة متوقفة يدويًا من إدارة المنصة
       if (!currentUser.clinic_id || !currentUser.clinic_active) {
         return res.status(403).json({
+          code: "CLINIC_DEACTIVATED",
           error:
-            "تم إيقاف اشتراك هذه العيادة مؤقتاً. يرجى مراجعة إدارة المنصة.",
+            "تم إيقاف هذه العيادة من قبل إدارة المنصة. يرجى التواصل مع الدعم.",
         });
       }
 
-      // الاشتراك منتهي
-      if (
+      // 2. التحقق من انتهاء الاشتراك
+      const isExpired = Boolean(
         currentUser.subscription_ends_at &&
-        new Date(currentUser.subscription_ends_at) < new Date()
-      ) {
-        return res.status(403).json({
-          error: "انتهت فترة اشتراك العيادة، يرجى التجديد.",
+        new Date(currentUser.subscription_ends_at) < new Date(),
+      );
+
+      // الاشتراك منتهي: منع عمليات الكتابة والتعديل
+      const isMutation = ["POST", "PUT", "PATCH", "DELETE"].includes(
+        req.method,
+      );
+
+      if (isExpired && isMutation) {
+        return res.status(402).json({
+          code: "SUBSCRIPTION_EXPIRED",
+          error:
+            "انتهت الفترة التجريبية/الاشتراك. النظام في وضع القراءة فقط، يرجى التجديد لمتابعة الإضافة والتعديل.",
         });
       }
+
+      // إتاحة القراءة مع تمرير حالة الاشتراك للـ Frontend
+      req.isSubscriptionExpired = isExpired;
     }
 
     req.user = {
@@ -110,8 +124,17 @@ const authMiddleware = async (req, res, next) => {
       role: currentUser.role,
     };
 
+    if (currentUser.clinic_id) {
+      req.clinic = {
+        id: currentUser.clinic_id,
+        is_active: currentUser.clinic_active,
+        subscription_ends_at: currentUser.subscription_ends_at,
+      };
+    }
+
     return next();
   } catch (dbError) {
+    captureError(dbError, req);
     console.error("Error in authMiddleware:", dbError.message);
 
     return res.status(500).json({

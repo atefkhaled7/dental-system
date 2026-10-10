@@ -1,5 +1,8 @@
 const pool = require("../db");
 const { isValidUuid } = require("../middleware/validateUuid");
+const { captureError } = require("../utils/errorTracker");
+
+
 
 const cairoLocalTimeToDate = (dateStr, timeStr) => {
   const [year, month, day] = dateStr.split("-").map(Number);
@@ -77,6 +80,7 @@ const getDoctorSchedule = async (req, res) => {
       leaves: leavesRes.rows,
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching doctor schedule:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء جلب جدول الطبيب" });
   }
@@ -94,6 +98,15 @@ const setDoctorShifts = async (req, res) => {
 
   if (!Array.isArray(shifts)) {
     return res.status(400).json({ error: "يجب إرسال مصفوفة الشفتات" });
+  }
+
+  const targetDoctorId = req.params.doctorId || req.body.doctor_id;
+
+  // لو المستخدم دكتور، نمنعه يعدل لأي دكتور تاني غير نفسه
+  if (req.user.role === "Doctor" && req.user.id !== targetDoctorId) {
+    return res.status(403).json({
+      error: "غير مصرح لك بتعديل مواعيد أو إجازات أطباء آخرين",
+    });
   }
 
   // التحقق من صحة مدخلات الشفتات
@@ -149,6 +162,7 @@ const setDoctorShifts = async (req, res) => {
     await client.query("COMMIT");
     res.status(200).json({ message: "تم حفظ جدول شفتات الطبيب بنجاح" });
   } catch (error) {
+    captureError(error, req);
     await client.query("ROLLBACK");
     console.error("Error setting doctor shifts:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء حفظ شفتات الطبيب" });
@@ -173,6 +187,15 @@ const addDoctorLeave = async (req, res) => {
       .json({ error: "صيغة تاريخ الإجازة يجب أن تكون YYYY-MM-DD" });
   }
 
+  const targetDoctorId = req.params.doctorId || req.body.doctor_id;
+
+  // لو المستخدم دكتور، نمنعه يعدل لأي دكتور تاني غير نفسه
+  if (req.user.role === "Doctor" && req.user.id !== targetDoctorId) {
+    return res.status(403).json({
+      error: "غير مصرح لك بتعديل مواعيد أو إجازات أطباء آخرين",
+    });
+  }
+
   try {
     const result = await pool.query(
       `INSERT INTO doctor_leaves (clinic_id, doctor_id, leave_date, notes)
@@ -190,6 +213,7 @@ const addDoctorLeave = async (req, res) => {
         .status(400)
         .json({ error: "تاريخ الإجازة مسجل بالفعل لهذا الطبيب" });
     }
+    captureError(error, req);
     console.error("Error adding doctor leave:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء إضافة إجازة الطبيب" });
   }
@@ -204,6 +228,15 @@ const deleteDoctorLeave = async (req, res) => {
     return res.status(400).json({ error: "معرّف غير صالح" });
   }
 
+  const targetDoctorId = req.params.doctorId || req.body.doctor_id;
+
+  // لو المستخدم دكتور، نمنعه يعدل لأي دكتور تاني غير نفسه
+  if (req.user.role === "Doctor" && req.user.id !== targetDoctorId) {
+    return res.status(403).json({
+      error: "غير مصرح لك بتعديل مواعيد أو إجازات أطباء آخرين",
+    });
+  }
+
   try {
     const result = await pool.query(
       "DELETE FROM doctor_leaves WHERE id = $1 AND doctor_id = $2 AND clinic_id = $3 RETURNING id;",
@@ -214,6 +247,7 @@ const deleteDoctorLeave = async (req, res) => {
     }
     res.status(200).json({ message: "تم إلغاء الإجازة بنجاح" });
   } catch (error) {
+    captureError(error, req);
     console.error("Error deleting doctor leave:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء حذف الإجازة" });
   }
@@ -379,6 +413,7 @@ const getAvailableSlots = async (req, res) => {
       slots: availableSlots,
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error calculating available slots:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء حساب الأوقات المتاحة" });
   }

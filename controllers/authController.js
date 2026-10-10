@@ -2,6 +2,7 @@ const pool = require("../db");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { logActivity } = require("../utils/auditLogger");
+const { captureError } = require("../utils/errorTracker");
 
 const registerUser = async (req, res) => {
   try {
@@ -42,6 +43,7 @@ const registerUser = async (req, res) => {
     if (error.code === "23505") {
       return res.status(400).json({ error: "البريد الإلكتروني مسجل بالفعل" });
     }
+    captureError(error, req);
     console.error("Error registering user:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر" });
   }
@@ -137,6 +139,7 @@ const loginUser = async (req, res) => {
       },
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Login error:", error.message);
 
     return res.status(500).json({
@@ -251,7 +254,7 @@ const registerClinic = async (req, res) => {
     }
 
     console.error("Transaction error:", error.message);
-
+    captureError(error, req);
     return res.status(500).json({
       error: "فشل التسجيل",
     });
@@ -280,6 +283,7 @@ const getDoctors = async (req, res) => {
       doctors: result.rows,
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching doctors:", error.message);
 
     return res.status(500).json({
@@ -310,6 +314,7 @@ const updateProfile = async (req, res) => {
       user: result.rows[0],
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error updating profile:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء تعديل الاسم" });
   }
@@ -382,6 +387,7 @@ const changePassword = async (req, res) => {
       message: "تم تغيير كلمة المرور بنجاح، تم إنهاء الجلسات السابقة",
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error changing password:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء تغيير كلمة المرور" });
   }

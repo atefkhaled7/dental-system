@@ -3,7 +3,7 @@ const path = require("path");
 const crypto = require("crypto");
 const { logActivity } = require("../utils/auditLogger");
 const storageService = require("../utils/storageService");
-
+const { captureError } = require("../utils/errorTracker");
 const VALID_CATEGORIES = [
   "xray_periapical",
   "xray_panoramic",
@@ -164,6 +164,7 @@ const uploadPatientImage = async (req, res) => {
       image: result.rows[0],
     });
   } catch (error) {
+    captureError(error, req);
     if (uploadedKey) {
       await storageService.deleteFile(uploadedKey);
     }
@@ -232,6 +233,7 @@ const getPatientImages = async (req, res) => {
     const images = result.rows.map(({ full_count, ...img }) => img);
     res.status(200).json({ images });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching patient images:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء جلب الصور الطبية" });
   }
@@ -272,9 +274,11 @@ const getProtectedImageFile = async (req, res) => {
     } else if (fileData.filePath) {
       res.sendFile(fileData.filePath);
     } else {
+      captureError(error, req);
       res.status(500).json({ error: "تعذر قراءة بيانات الملف" });
     }
   } catch (error) {
+    captureError(error, req);
     console.error("Error streaming image file:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء فتح الصورة" });
   }
@@ -331,6 +335,7 @@ const archivePatientImage = async (req, res) => {
       image: result.rows[0],
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error archiving patient image:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء أرشفة الصورة" });
   }

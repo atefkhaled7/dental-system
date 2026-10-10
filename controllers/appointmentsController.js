@@ -2,6 +2,7 @@ const pool = require("../db");
 const { logActivity } = require("../utils/auditLogger");
 const { normalizeEgyptianPhone } = require("../utils/phoneNormalizer");
 const { isValidUuid } = require("../middleware/validateUuid");
+const { captureError } = require("../utils/errorTracker");
 // ==========================================
 // 1. جلب المواعيد مع الفلاتر (بتوقيت Africa/Cairo)
 // ==========================================
@@ -126,6 +127,7 @@ const getAppointments = async (req, res) => {
     const appointments = result.rows.map(({ full_count, ...appt }) => appt);
     return res.status(200).json({ appointments });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching appointments:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء جلب المواعيد" });
   }
@@ -173,6 +175,7 @@ const getAppointmentById = async (req, res) => {
 
     res.status(200).json({ appointment: result.rows[0] });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching appointment details:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء جلب تفاصيل الموعد" });
   }
@@ -488,6 +491,7 @@ const createAppointment = async (req, res) => {
           "يوجد تعارض في المواعيد: تم حجز هذا الموعد بالفعل من قبل مستخدم آخر",
       });
     }
+    captureError(error, req);
     console.error("Error creating appointment:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء حجز الموعد" });
   } finally {
@@ -642,6 +646,7 @@ const updateAppointmentStatus = async (req, res) => {
         error: "تعارض: الطبيب لديه كشف آخر مسجل في نفس الفترة",
       });
     }
+    captureError(error, req);
     console.error("Error updating appointment status:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء تحديث حالة الموعد" });
   } finally {
@@ -811,6 +816,7 @@ const rescheduleAppointment = async (req, res) => {
         error: "تعارض: تم حجز هذا الموعد بالفعل من قبل مستخدم آخر",
       });
     }
+    captureError(error, req);
     console.error("Error rescheduling appointment:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء تعديل الموعد" });
   } finally {
@@ -918,6 +924,7 @@ const deleteAppointment = async (req, res) => {
 
     res.status(200).json({ message: "تم حذف الموعد بنجاح" });
   } catch (error) {
+    captureError(error, req);
     await client.query("ROLLBACK");
     console.error("Error deleting appointment:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء حذف الموعد" });
@@ -946,6 +953,7 @@ const getClinicDurationSettings = async (req, res) => {
         result.rows[0].default_appointment_duration || 30,
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching clinic duration settings:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء جلب إعدادات العيادة" });
   }
@@ -988,6 +996,7 @@ const updateClinicDurationSettings = async (req, res) => {
       clinic: result.rows[0],
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error updating clinic duration settings:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء تحديث إعدادات العيادة" });
   }

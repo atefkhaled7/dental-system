@@ -1,5 +1,8 @@
 const pool = require("../db");
 const { logActivity } = require("../utils/auditLogger");
+const { captureError } = require("../utils/errorTracker");
+const { isValidUuid } = require("../middleware/validateUuid");
+
 // 🦷 القائمة البيضاء لأرقام الأسنان الـ 32 بنظام FDI الدولي
 const VALID_FDI_TEETH = new Set([
   11, 12, 13, 14, 15, 16, 17, 18, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33,
@@ -15,7 +18,7 @@ const getPatientTreatmentPlans = async (req, res) => {
     // التحقق من أن المريض مسجل ونشط في هذه العيادة
     const patientCheck = await pool.query(
       "SELECT id FROM patients WHERE id = $1 AND clinic_id = $2",
-      [patientId, clinicId]
+      [patientId, clinicId],
     );
 
     if (patientCheck.rows.length === 0) {
@@ -45,6 +48,7 @@ const getPatientTreatmentPlans = async (req, res) => {
 
     res.status(200).json({ plans: plansWithItems });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching treatment plans:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء جلب خطط العلاج" });
   }
@@ -72,7 +76,7 @@ const createTreatmentPlan = async (req, res) => {
     // 🔒 التحقق الصارم من أن المريض موجود ونشط ويخص عيادة المستخدم
     const patientCheck = await pool.query(
       "SELECT id FROM patients WHERE id = $1 AND clinic_id = $2 AND is_active = TRUE",
-      [patientId, clinicId]
+      [patientId, clinicId],
     );
 
     if (patientCheck.rows.length === 0) {
@@ -96,6 +100,7 @@ const createTreatmentPlan = async (req, res) => {
 
     res.status(201).json({ plan: { ...result.rows[0], items: [] } });
   } catch (error) {
+    captureError(error, req);
     console.error("Error creating treatment plan:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء إنشاء خطة العلاج" });
   }
@@ -155,7 +160,7 @@ const addTreatmentPlanItem = async (req, res) => {
        WHERE tp.id = $1
          AND tp.clinic_id = $2
          AND p.clinic_id = $2`,
-      [planId, clinicId]
+      [planId, clinicId],
     );
 
     if (planCheck.rows.length === 0) {
@@ -198,6 +203,7 @@ const addTreatmentPlanItem = async (req, res) => {
 
     res.status(201).json({ item: result.rows[0] });
   } catch (error) {
+    captureError(error, req);
     console.error("Error adding treatment plan item:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء إضافة بند العلاج" });
   }
@@ -232,7 +238,7 @@ const updatePlanItemStatus = async (req, res) => {
        WHERE tpi.id = $1
          AND tpi.clinic_id = $2
          AND p.clinic_id = $2`,
-      [itemId, clinicId]
+      [itemId, clinicId],
     );
 
     if (itemCheck.rows.length === 0) {
@@ -263,22 +269,35 @@ const updatePlanItemStatus = async (req, res) => {
     }
 
     const query = `
-      UPDATE treatment_plan_items 
-      SET status = $1::varchar(50), 
-          completed_at = CASE WHEN $1::varchar(50) = 'completed' THEN CURRENT_TIMESTAMP ELSE NULL END
-      WHERE id = $2 AND clinic_id = $3
-      RETURNING *;
-    `;
+  UPDATE treatment_plan_items
+  SET status = $1::varchar(50),
+      completed_at = CASE
+        WHEN $1::varchar(50) = 'completed'
+        THEN CURRENT_TIMESTAMP
+        ELSE NULL
+      END
+  WHERE id = $2
+    AND clinic_id = $3
+    AND invoice_id IS NULL
+  RETURNING *;
+`;
 
     const result = await pool.query(query, [status, itemId, clinicId]);
+
+    if (result.rows.length === 0) {
+      return res.status(409).json({
+        error: "تعذر تحديث البند؛ ربما تمت فوترته أو لم يعد قابلاً للتعديل",
+      });
+    }
+
     res.status(200).json({ item: result.rows[0] });
   } catch (error) {
+    captureError(error, req);
     console.error("Error updating plan item status:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء تحديث حالة البند" });
   }
 };
-
-// 🌟 5. تحويل البنود المكتملة إلى فاتورة (حسابات بالقروش + قفل السجلات + منع الفواتير الصفرية)
+// 🌟 5. تحويل البنود المكتملة إلى فاتورة (حسابات بالقروش + قفل السجلات + فحص الـ UUIDs + سجل الرقابة)
 const convertPlanItemsToInvoice = async (req, res) => {
   const client = await pool.connect();
   try {
@@ -286,18 +305,31 @@ const convertPlanItemsToInvoice = async (req, res) => {
     const { patientId } = req.params;
     const { itemIds } = req.body;
 
+    // 🔒 1. فحص صحة الـ UUID للمريض ومصفوفة البنود
+    if (!isValidUuid(patientId)) {
+      return res.status(400).json({ error: "معرّف المريض غير صالح" });
+    }
+
     if (!Array.isArray(itemIds) || itemIds.length === 0) {
       return res.status(400).json({
         error: "يرجى تحديد بند علاج مكتمل واحد على الأقل لإصدار الفاتورة",
       });
     }
 
+    // فحص إن كل عنصر في المصفوفة هو UUID سليم لمنع كراش الداتابيز 500
+    const hasInvalidId = itemIds.some((id) => !isValidUuid(id));
+    if (hasInvalidId) {
+      return res.status(400).json({
+        error: "أحد معرّفات بنود العلاج المحددة غير صالح",
+      });
+    }
+
     await client.query("BEGIN");
 
-    // 1. التحقق من أن المريض موجود ونشط ويخص هذه العيادة
+    // 2. التحقق من أن المريض موجود ونشط ويخص هذه العيادة
     const patientCheck = await client.query(
       "SELECT id FROM patients WHERE id = $1 AND clinic_id = $2 AND is_active = TRUE",
-      [patientId, clinicId]
+      [patientId, clinicId],
     );
 
     if (patientCheck.rows.length === 0) {
@@ -307,7 +339,7 @@ const convertPlanItemsToInvoice = async (req, res) => {
         .json({ error: "المريض غير موجود في هذه العيادة أو تمت أرشفته" });
     }
 
-    // 2. 🔒 قفل البنود مع التحقق الصارم بأنها تخص هذا المريض المحدد، ومكتملة، ولم تفوتر من قبل
+    // 3. 🔒 قفل البنود مع التحقق الصارم بأنها تخص هذا المريض المحدد، ومكتملة، ولم تفوتر من قبل
     const lockQuery = `
       SELECT tpi.id, tpi.tooth_number, tpi.procedure_name, tpi.estimated_cost, tpi.invoice_id, tpi.status 
       FROM treatment_plan_items tpi
@@ -328,7 +360,6 @@ const convertPlanItemsToInvoice = async (req, res) => {
     ]);
     const itemsToInvoice = lockedItemsRes.rows;
 
-    // لو عدد البنود المقفولة لا يطابق المطلوب (معناه في بنود مش لنفس المريض أو غير مكتملة أو اتفوترت بالفعل)
     if (itemsToInvoice.length !== itemIds.length) {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -337,13 +368,13 @@ const convertPlanItemsToInvoice = async (req, res) => {
       });
     }
 
-    // 3. 💰 الحساب المالي بدون فواصل عائمة (Integer Cents Arithmetic)
+    // 4. 💰 الحساب المالي بدون فواصل عائمة (Integer Cents Arithmetic)
     const totalAmountInCents = itemsToInvoice.reduce((sum, it) => {
       const itemCostInCents = Math.round(parseFloat(it.estimated_cost) * 100);
       return sum + itemCostInCents;
     }, 0);
 
-    // 4. 🚫 منع الفواتير الصفرية (Zero Invoice Prevention)
+    // 5. 🚫 منع الفواتير الصفرية
     if (totalAmountInCents <= 0) {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -354,7 +385,7 @@ const convertPlanItemsToInvoice = async (req, res) => {
 
     const finalTotalAmount = (totalAmountInCents / 100).toFixed(2);
 
-    // 5. إنشاء الفاتورة
+    // 6. إنشاء الفاتورة
     const insertInvoiceQuery = `
       INSERT INTO invoices (clinic_id, patient_id, total_amount, status)
       VALUES ($1, $2, $3, 'unpaid')
@@ -367,7 +398,7 @@ const convertPlanItemsToInvoice = async (req, res) => {
     ]);
     const newInvoice = invoiceRes.rows[0];
 
-    // 6. إدخال البنود في جدول invoice_items
+    // 7. إدخال البنود في جدول invoice_items
     const insertInvoiceItemQuery = `
       INSERT INTO invoice_items (clinic_id, invoice_id, description, quantity, unit_price, total_price)
       VALUES ($1, $2, $3, 1, $4, $4);
@@ -387,7 +418,7 @@ const convertPlanItemsToInvoice = async (req, res) => {
       ]);
     }
 
-    // 7. قفل بنود خطة العلاج برقم الفاتورة الجديدة
+    // 8. قفل بنود خطة العلاج برقم الفاتورة الجديدة
     const updatePlanItemsQuery = `
       UPDATE treatment_plan_items 
       SET invoice_id = $1 
@@ -401,12 +432,38 @@ const convertPlanItemsToInvoice = async (req, res) => {
 
     await client.query("COMMIT");
 
+    // 🔒 تسجيل العملية في سجل الرقابة
+    try {
+      await logActivity({
+        clinic_id: clinicId,
+        user_id: req.user.id,
+        action: "CONVERT_PLAN_TO_INVOICE",
+        entity_type: "invoice",
+        entity_id: newInvoice.id,
+        description: `قام ${
+          req.user.name || "الموظف"
+        } بتحويل ${itemsToInvoice.length} بند من خطة العلاج لفاتورة جديدة بقيمة ${finalTotalAmount} ج.م للمريض #${patientId.slice(0, 8)}`,
+        metadata: {
+          invoice_id: newInvoice.id,
+          items_count: itemsToInvoice.length,
+          total_amount: finalTotalAmount,
+        },
+      });
+    } catch (auditErr) {
+      captureError(auditErr, req);
+      console.error(
+        "Audit log failed for convertPlanItemsToInvoice:",
+        auditErr.message,
+      );
+    }
+
     res.status(201).json({
       message: "تم إصدار الفاتورة وتأمين بنود خطة العلاج بنجاح",
       invoice: newInvoice,
     });
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (client) await client.query("ROLLBACK");
+    captureError(error, req);
     console.error("Error converting treatment plan to invoice:", error.message);
     res
       .status(500)
@@ -452,28 +509,37 @@ const updateTreatmentPlanStatus = async (req, res) => {
       status === "completed"
         ? "مكتملة"
         : status === "cancelled"
-        ? "ملغاة"
-        : "نشطة";
+          ? "ملغاة"
+          : "نشطة";
 
     // تسجيل العملية في سجل الرقابة قبل إرسال الرد
-    await logActivity({
-      clinic_id: clinicId,
-      user_id: req.user.id,
-      action: "UPDATE_TREATMENT_PLAN_STATUS",
-      entity_type: "treatment_plan",
-      entity_id: planId,
-      description: `تم تغيير حالة خطة العلاج (${updatedPlan.title}) إلى ${statusArabic}`,
-      metadata: {
-        title: updatedPlan.title,
-        new_status: status,
-      },
-    });
+    try {
+      await logActivity({
+        clinic_id: clinicId,
+        user_id: req.user.id,
+        action: "UPDATE_TREATMENT_PLAN_STATUS",
+        entity_type: "treatment_plan",
+        entity_id: planId,
+        description: `تم تغيير حالة خطة العلاج (${updatedPlan.title}) إلى ${statusArabic}`,
+        metadata: {
+          title: updatedPlan.title,
+          new_status: status,
+        },
+      });
+    } catch (auditErr) {
+      captureError(auditErr, req);
+      console.error(
+        "Audit log failed for updateTreatmentPlanStatus:",
+        auditErr.message,
+      );
+    }
 
     res.status(200).json({
       message: "تم تحديث حالة خطة العلاج بنجاح",
       plan: updatedPlan,
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error updating treatment plan status:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء تحديث حالة الخطة" });
   }
@@ -512,29 +578,38 @@ const deleteTreatmentPlanItem = async (req, res) => {
     // 2. حذف البند
     await pool.query(
       "DELETE FROM treatment_plan_items WHERE id = $1 AND clinic_id = $2;",
-      [itemId, clinicId]
+      [itemId, clinicId],
     );
 
     const toothDesc = item.tooth_number ? `للسن #${item.tooth_number}` : "";
 
     // تسجيل العملية في سجل الرقابة قبل إرسال الرد
-    await logActivity({
-      clinic_id: clinicId,
-      user_id: req.user.id,
-      action: "DELETE_TREATMENT_PLAN_ITEM",
-      entity_type: "treatment_plan_item",
-      entity_id: itemId,
-      description: `تم حذف بند (${item.procedure_name}) ${toothDesc} من خطة (${item.plan_title})`,
-      metadata: {
-        procedure_name: item.procedure_name,
-        tooth_number: item.tooth_number,
-      },
-    });
+    try {
+      await logActivity({
+        clinic_id: clinicId,
+        user_id: req.user.id,
+        action: "DELETE_TREATMENT_PLAN_ITEM",
+        entity_type: "treatment_plan_item",
+        entity_id: itemId,
+        description: `تم حذف بند (${item.procedure_name}) ${toothDesc} من خطة (${item.plan_title})`,
+        metadata: {
+          procedure_name: item.procedure_name,
+          tooth_number: item.tooth_number,
+        },
+      });
+    } catch (auditErr) {
+      captureError(auditErr, req);
+      console.error(
+        "Audit log failed for deleteTreatmentPlanItem:",
+        auditErr.message,
+      );
+    }
 
     res.status(200).json({
       message: "تم حذف بند العلاج بنجاح",
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error deleting treatment plan item:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء حذف بند العلاج" });
   }

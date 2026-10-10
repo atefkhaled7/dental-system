@@ -1,6 +1,7 @@
 const pool = require("../db");
 const { isValidUuid } = require("../middleware/validateUuid");
 const { logActivity } = require("../utils/auditLogger");
+const { captureError } = require("../utils/errorTracker");
 
 // 1. جلب طلبات الحجز للعيادة مع الفلترة والـ Pagination
 const getBookingRequests = async (req, res) => {
@@ -13,7 +14,7 @@ const getBookingRequests = async (req, res) => {
       `UPDATE booking_requests 
        SET status = 'expired', updated_at = CURRENT_TIMESTAMP
        WHERE clinic_id = $1 AND status = 'pending' AND expires_at < CURRENT_TIMESTAMP;`,
-      [clinic_id]
+      [clinic_id],
     );
 
     let query = `
@@ -68,6 +69,7 @@ const getBookingRequests = async (req, res) => {
       },
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching booking requests:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء جلب طلبات الحجز" });
   }
@@ -81,17 +83,17 @@ const approveBookingRequest = async (req, res) => {
   if (!isValidUuid(id)) {
     return res.status(400).json({ error: "معرّف الطلب غير صالح" });
   }
-
-  const client = await pool.connect();
+  let client;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
 
-    // قفل سطر الطلب
+    // 🔒 1. قفل سطر الطلب
     const reqRes = await client.query(
       `SELECT * FROM booking_requests 
        WHERE id = $1 AND clinic_id = $2 
        FOR UPDATE;`,
-      [id, clinic_id]
+      [id, clinic_id],
     );
 
     if (reqRes.rows.length === 0) {
@@ -111,12 +113,13 @@ const approveBookingRequest = async (req, res) => {
     if (new Date(booking.expires_at) < new Date()) {
       await client.query(
         "UPDATE booking_requests SET status = 'expired', updated_at = CURRENT_TIMESTAMP WHERE id = $1;",
-        [id]
+        [id],
       );
       await client.query("COMMIT");
       return res.status(400).json({ error: "عذراً، انتهت صلاحية هذا الطلب" });
     }
 
+    // 🔒 2. قفل سطر الطبيب والتأكد من وجوده ونشاطه
     const doctorLockRes = await client.query(
       `SELECT id
        FROM users
@@ -125,7 +128,7 @@ const approveBookingRequest = async (req, res) => {
          AND role = 'Doctor'
          AND is_active = TRUE
        FOR UPDATE;`,
-      [booking.doctor_id, clinic_id]
+      [booking.doctor_id, clinic_id],
     );
 
     if (doctorLockRes.rows.length === 0) {
@@ -135,30 +138,30 @@ const approveBookingRequest = async (req, res) => {
       });
     }
 
-    // أ) فحص هل المريض مسجل مسبقاً بنفس رقم الهاتف في العيادة؟
-    let patientId;
-    const patientCheck = await client.query(
-      "SELECT id FROM patients WHERE clinic_id = $1 AND phone_number = $2;",
-      [clinic_id, booking.patient_phone]
+    // 🔒 3. فحص إجازات الطبيب المسجلة في هذا اليوم بتوقيت القاهرة
+    const leaveCheck = await client.query(
+      `SELECT id FROM doctor_leaves
+       WHERE clinic_id = $1 
+         AND doctor_id = $2
+         AND leave_date = DATE($3::timestamptz AT TIME ZONE 'Africa/Cairo')
+       LIMIT 1;`,
+      [clinic_id, booking.doctor_id, booking.requested_date],
     );
 
-    if (patientCheck.rows.length > 0) {
-      patientId = patientCheck.rows[0].id;
-    } else {
-      // تسجيل مريض جديد تلقائياً
-      const createPatientRes = await client.query(
-        `INSERT INTO patients (clinic_id, name, phone_number, is_active)
-         VALUES ($1, $2, $3, TRUE)
-         RETURNING id;`,
-        [clinic_id, booking.patient_name, booking.patient_phone]
-      );
-      patientId = createPatientRes.rows[0].id;
+    if (leaveCheck.rows.length > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        error:
+          "لا يمكن قبول الحجز: الطبيب لديه إجازة رسمية مسجلة في هذا التاريخ",
+      });
     }
 
-    // ب) فحص تعارض المواعيد للطبيب
+    // 🔒 4. فحص تعارض المواعيد الشامل للطبيب (أي موعد غير ملغي)
     const conflictCheck = await client.query(
       `SELECT id FROM appointments
-       WHERE clinic_id = $1 AND doctor_id = $2 AND status = 'scheduled'
+       WHERE clinic_id = $1 
+         AND doctor_id = $2 
+         AND status NOT IN ('cancelled', 'no_show')
          AND appointment_date < ($3::timestamptz + ($4 * INTERVAL '1 minute'))
          AND (appointment_date + (duration_minutes * INTERVAL '1 minute')) > $3::timestamptz
        LIMIT 1;`,
@@ -167,7 +170,7 @@ const approveBookingRequest = async (req, res) => {
         booking.doctor_id,
         booking.requested_date,
         booking.duration_minutes,
-      ]
+      ],
     );
 
     if (conflictCheck.rows.length > 0) {
@@ -177,7 +180,34 @@ const approveBookingRequest = async (req, res) => {
       });
     }
 
-    // جـ) إنشاء الموعد الرسمي
+    // 🔒 5. فحص المريض (مع إعادة تنشيطه إذا كان مؤرشفاً)
+    let patientId;
+    const patientCheck = await client.query(
+      "SELECT id, is_active FROM patients WHERE clinic_id = $1 AND phone_number = $2;",
+      [clinic_id, booking.patient_phone],
+    );
+
+    if (patientCheck.rows.length > 0) {
+      patientId = patientCheck.rows[0].id;
+      // لو المريض كان مؤرشف، نرجعه نشط تلقائياً
+      if (!patientCheck.rows[0].is_active) {
+        await client.query(
+          "UPDATE patients SET is_active = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $1;",
+          [patientId],
+        );
+      }
+    } else {
+      // تسجيل مريض جديد تلقائياً
+      const createPatientRes = await client.query(
+        `INSERT INTO patients (clinic_id, name, phone_number, is_active)
+         VALUES ($1, $2, $3, TRUE)
+         RETURNING id;`,
+        [clinic_id, booking.patient_name, booking.patient_phone],
+      );
+      patientId = createPatientRes.rows[0].id;
+    }
+
+    // 6. إنشاء الموعد الرسمي
     const apptRes = await client.query(
       `INSERT INTO appointments (
         clinic_id, patient_id, doctor_id, appointment_date, 
@@ -192,20 +222,20 @@ const approveBookingRequest = async (req, res) => {
         booking.requested_date,
         booking.duration_minutes,
         `حجز مؤكد من الموقع العام: ${booking.notes || "لا توجد ملاحظات"}`,
-      ]
+      ],
     );
 
-    // د) تحديث حالة طلب الحجز إلى approved
+    // 7. تحديث حالة طلب الحجز إلى approved
     await client.query(
       `UPDATE booking_requests 
        SET status = 'approved', updated_at = CURRENT_TIMESTAMP 
        WHERE id = $1;`,
-      [id]
+      [id],
     );
 
     await client.query("COMMIT");
 
-    // تسجيل العملية في سجل الرقابة بدون التأثير على نجاح العملية الأساسية
+    // تسجيل العملية في سجل الرقابة
     try {
       await logActivity({
         clinic_id,
@@ -230,14 +260,14 @@ const approveBookingRequest = async (req, res) => {
       appointment: apptRes.rows[0],
     });
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (client) await client.query("ROLLBACK");
+    captureError(error, req);
     console.error("Error approving booking request:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء تأكيد طلب الحجز" });
   } finally {
     client.release();
   }
 };
-
 // 3. رفض طلب الحجز
 const rejectBookingRequest = async (req, res) => {
   const clinic_id = req.user.clinic_id;
@@ -253,7 +283,7 @@ const rejectBookingRequest = async (req, res) => {
        SET status = 'rejected', updated_at = CURRENT_TIMESTAMP 
        WHERE id = $1 AND clinic_id = $2 AND status = 'pending'
        RETURNING *;`,
-      [id, clinic_id]
+      [id, clinic_id],
     );
 
     if (result.rows.length === 0) {
@@ -284,6 +314,7 @@ const rejectBookingRequest = async (req, res) => {
       booking_request: result.rows[0],
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error rejecting booking request:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء رفض طلب الحجز" });
   }

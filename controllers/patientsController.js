@@ -1,6 +1,7 @@
 const pool = require("../db");
 const { logActivity } = require("../utils/auditLogger");
 const { normalizeEgyptianPhone } = require("../utils/phoneNormalizer");
+const { captureError } = require("../utils/errorTracker");
 
 const normalizeAndValidatePhone = (phone_number) => {
   if (!phone_number || typeof phone_number !== "string") {
@@ -10,7 +11,102 @@ const normalizeAndValidatePhone = (phone_number) => {
   return normalizeEgyptianPhone(phone_number.trim());
 };
 
-// دالة التحقق الموحدة
+const getTodayCairoISODate = () => {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Africa/Cairo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+
+  const values = Object.fromEntries(
+    parts.map(({ type, value }) => [type, value]),
+  );
+
+  return `${values.year}-${values.month}-${values.day}`;
+};
+
+// 🌟 دالة ذكية لتحليل تواريخ الميلاد المصرية (تدعم DD/MM/YYYY و YYYY-MM-DD والشرطات)
+const parseEgyptianDate = (rawDate) => {
+  if (!rawDate || typeof rawDate !== "string") return null;
+  const cleaned = rawDate.trim();
+
+  // لو الخانة فاضية أو فيها شرطة تصدير
+  if (
+    !cleaned ||
+    ["-", "--", "null", "undefined", "لا يوجد", "لا توجد"].includes(
+      cleaned.toLowerCase(),
+    )
+  ) {
+    return null;
+  }
+
+  // 1. صيغة اليوم/الشهر/السنة (المعتادة في مصر: DD/MM/YYYY أو DD-MM-YYYY)
+  const dmyMatch = cleaned.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})$/);
+  if (dmyMatch) {
+    const day = parseInt(dmyMatch[1], 10);
+    const month = parseInt(dmyMatch[2], 10);
+    const year = parseInt(dmyMatch[3], 10);
+
+    // لو القيم منطقية نكمل، لو لأ مش هنعمل return "INVALID" هنسيبها تنزل للـ Fallback
+    if (
+      month >= 1 &&
+      month <= 12 &&
+      day >= 1 &&
+      day <= 31 &&
+      year >= 1900 &&
+      year <= new Date().getFullYear()
+    ) {
+      const dateObj = new Date(Date.UTC(year, month - 1, day));
+      if (dateObj.getUTCDate() === day && dateObj.getUTCMonth() === month - 1) {
+        if (dateObj.toISOString().slice(0, 10) >= getTodayCairoISODate()) {
+          return "FUTURE";
+        }
+        return dateObj.toISOString().split("T")[0];
+      }
+    }
+  }
+
+  // 2. صيغة السنة/الشهر/اليوم القياسية (YYYY-MM-DD)
+  const ymdMatch = cleaned.match(/^(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})$/);
+  if (ymdMatch) {
+    const year = parseInt(ymdMatch[1], 10);
+    const month = parseInt(ymdMatch[2], 10);
+    const day = parseInt(ymdMatch[3], 10);
+
+    if (
+      month >= 1 &&
+      month <= 12 &&
+      day >= 1 &&
+      day <= 31 &&
+      year >= 1900 &&
+      year <= new Date().getFullYear()
+    ) {
+      const dateObj = new Date(Date.UTC(year, month - 1, day));
+      if (dateObj.getUTCDate() === day && dateObj.getUTCMonth() === month - 1) {
+        if (dateObj.toISOString().slice(0, 10) >= getTodayCairoISODate()) {
+          return "FUTURE";
+        }
+        return dateObj.toISOString().split("T")[0];
+      }
+    }
+  }
+
+  // 3. Fallback للتواريخ القياسية والأمريكية (MM/DD/YYYY)
+  const d = new Date(cleaned);
+  if (isNaN(d.getTime())) return "INVALID";
+
+  // استخراج اليوم والشهر والسنة بالـ Local عشان نتجنب فرق توقيت مصر في الـ toISOString
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const fallbackDay = String(d.getDate()).padStart(2, "0");
+  const formattedFallback = `${y}-${m}-${fallbackDay}`;
+
+  if (formattedFallback >= getTodayCairoISODate()) return "FUTURE";
+
+  return formattedFallback;
+};
+
 // دالة التحقق الموحدة
 const validatePatientInput = ({ name, gender, date_of_birth }) => {
   // الاسم
@@ -45,8 +141,8 @@ const validatePatientInput = ({ name, gender, date_of_birth }) => {
       return "تاريخ الميلاد غير صالح";
     }
 
-    if (dob > new Date()) {
-      return "تاريخ الميلاد لا يمكن أن يكون في المستقبل";
+    if (dob.toISOString().slice(0, 10) >= getTodayCairoISODate()) {
+      return "تاريخ الميلاد لا يمكن أن يكون اليوم أو في المستقبل";
     }
   }
 
@@ -116,14 +212,18 @@ const addPatient = async (req, res) => {
 
     const result = await pool.query(query, values);
 
-    await logActivity({
-      clinic_id,
-      user_id: req.user.id,
-      action: "CREATE_PATIENT",
-      entity_type: "patient",
-      entity_id: result.rows[0].id,
-      description: `تمت إضافة مريض جديد (${result.rows[0].name})`,
-    });
+    try {
+      await logActivity({
+        clinic_id,
+        user_id: req.user.id,
+        action: "CREATE_PATIENT",
+        entity_type: "patient",
+        entity_id: result.rows[0].id,
+        description: `تمت إضافة مريض جديد (${result.rows[0].name})`,
+      });
+    } catch (auditErr) {
+      console.error("Audit log failed for addPatient:", auditErr.message);
+    }
 
     return res.status(201).json({
       message: "تم إضافة المريض بنجاح",
@@ -135,7 +235,7 @@ const addPatient = async (req, res) => {
         error: "رقم الهاتف موجود بالفعل لمريض آخر",
       });
     }
-
+    captureError(err, req);
     console.error("Error adding patient:", err.message);
 
     return res.status(500).json({
@@ -211,6 +311,7 @@ const getPatients = async (req, res) => {
       },
     });
   } catch (err) {
+    captureError(err, req);
     console.error("Error fetching patients:", err.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء جلب قائمة المرضى" });
   }
@@ -224,7 +325,7 @@ const getPatientById = async (req, res) => {
 
     const result = await pool.query(
       "SELECT * FROM patients WHERE id = $1 AND clinic_id = $2",
-      [patientId, clinicId]
+      [patientId, clinicId],
     );
 
     if (result.rows.length === 0) {
@@ -233,6 +334,7 @@ const getPatientById = async (req, res) => {
 
     res.status(200).json({ patient: result.rows[0] });
   } catch (err) {
+    captureError(err, req);
     console.error("Error fetching patient by ID:", err.message);
     res.status(500).json({ error: "خطأ في السيرفر" });
   }
@@ -308,14 +410,18 @@ const updatePatient = async (req, res) => {
       });
     }
 
-    await logActivity({
-      clinic_id: clinicId,
-      user_id: req.user.id,
-      action: "UPDATE_PATIENT",
-      entity_type: "patient",
-      entity_id: patientId,
-      description: `تم تعديل بيانات المريض (${result.rows[0].name})`,
-    });
+    try {
+      await logActivity({
+        clinic_id: clinicId,
+        user_id: req.user.id,
+        action: "UPDATE_PATIENT",
+        entity_type: "patient",
+        entity_id: patientId,
+        description: `تم تعديل بيانات المريض (${result.rows[0].name})`,
+      });
+    } catch (auditErr) {
+      console.error("Audit log failed for updatePatient:", auditErr.message);
+    }
 
     return res.status(200).json({
       message: "تم تحديث بيانات المريض بنجاح",
@@ -327,7 +433,7 @@ const updatePatient = async (req, res) => {
         error: "رقم الهاتف موجود بالفعل لمريض آخر في العيادة",
       });
     }
-
+    captureError(err, req);
     console.error("Error updating patient:", err.message);
 
     return res.status(500).json({
@@ -352,7 +458,7 @@ const deletePatient = async (req, res) => {
 
     const result = await pool.query(
       "UPDATE patients SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND clinic_id = $2 AND is_active = TRUE RETURNING id, name",
-      [patientId, clinicId]
+      [patientId, clinicId],
     );
 
     if (result.rows.length === 0) {
@@ -360,18 +466,23 @@ const deletePatient = async (req, res) => {
         .status(404)
         .json({ error: "المريض غير موجود أو تمت أرشفته بالفعل" });
     }
-    await logActivity({
-      clinic_id: clinicId,
-      user_id: req.user.id,
-      action: "ARCHIVE_PATIENT",
-      entity_type: "patient",
-      entity_id: patientId,
-      description: `تمت ارشفة ملف المريض (${result.rows[0].name})`,
-    });
+    try {
+      await logActivity({
+        clinic_id: clinicId,
+        user_id: req.user.id,
+        action: "ARCHIVE_PATIENT",
+        entity_type: "patient",
+        entity_id: patientId,
+        description: `تمت أرشفة ملف المريض (${result.rows[0].name})`,
+      });
+    } catch (auditErr) {
+      console.error("Audit log failed for deletePatient:", auditErr.message);
+    }
     res
       .status(200)
       .json({ message: "تم أرشفة المريض بنجاح", patient: result.rows[0] });
   } catch (err) {
+    captureError(err, req);
     console.error("Error deleting/archiving patient:", err.message);
     res.status(500).json({ error: "خطأ في السيرفر" });
   }
@@ -384,27 +495,32 @@ const restorePatient = async (req, res) => {
 
     const result = await pool.query(
       "UPDATE patients SET is_active = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND clinic_id = $2 AND is_active = FALSE RETURNING id, name",
-      [patientId, clinicId]
+      [patientId, clinicId],
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "المريض غير موجود في الأرشيف" });
     }
 
-    await logActivity({
-      clinic_id: clinicId,
-      user_id: req.user.id,
-      action: "RESTORE_PATIENT",
-      entity_type: "patient",
-      entity_id: patientId,
-      description: `تمت استعادت ملف المريض (${result.rows[0].name}) من الأرشيف`,
-    });
+    try {
+      await logActivity({
+        clinic_id: clinicId,
+        user_id: req.user.id,
+        action: "RESTORE_PATIENT",
+        entity_type: "patient",
+        entity_id: patientId,
+        description: `تمت استعادة ملف المريض (${result.rows[0].name}) من الأرشيف`,
+      });
+    } catch (auditErr) {
+      console.error("Audit log failed for restorePatient:", auditErr.message);
+    }
 
     res.status(200).json({
       message: "تمت استعادة المريض بنجاح إلى القائمة النشطة",
       patient: result.rows[0],
     });
   } catch (err) {
+    captureError(err, req);
     console.error("Error restoring patient:", err.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء استعادة المريض" });
   }
@@ -489,11 +605,12 @@ const exportPatients = async (req, res) => {
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename=patients_${Date.now()}.csv`
+      `attachment; filename=patients_${Date.now()}.csv`,
     );
 
     return res.status(200).send(csv);
   } catch (err) {
+    captureError(err, req);
     console.error("Error exporting patients:", err.message);
 
     return res.status(500).json({
@@ -529,7 +646,7 @@ const parseCsvBuffer = (buffer) => {
   const splitLine = (line) => {
     const regex = new RegExp(
       `(?:^|${delimiter})(?:"([^"]*(?:""[^"]*)*)"|([^"${delimiter}]*))`,
-      "g"
+      "g",
     );
     const values = [];
     let match;
@@ -619,10 +736,10 @@ const importPatientsFromCsv = async (req, res) => {
   // جلب كل أرقام الهواتف الحالية في العيادة لتفادي التكرار بسرعة
   const existingPhonesRes = await pool.query(
     "SELECT phone_number FROM patients WHERE clinic_id = $1;",
-    [clinic_id]
+    [clinic_id],
   );
   const existingPhones = new Set(
-    existingPhonesRes.rows.map((r) => r.phone_number)
+    existingPhonesRes.rows.map((r) => r.phone_number),
   );
 
   for (const row of rows) {
@@ -672,45 +789,43 @@ const importPatientsFromCsv = async (req, res) => {
       continue;
     }
 
-    // 5. فحص النوع
+    // 5. فحص وتوحيد النوع (مع تجاهل الشرطات والخانة الفاضية)
     let normalizedGender = null;
-
     if (row.gender && row.gender.trim() !== "") {
       const g = row.gender.trim().toLowerCase();
 
-      if (g === "أنثى" || g === "انثى" || g === "female" || g === "f") {
+      if (["-", "--", "غير محدد", "none", "null"].includes(g)) {
+        normalizedGender = null;
+      } else if (["أنثى", "انثى", "female", "f", "ست", "سيدة"].includes(g)) {
         normalizedGender = "Female";
-      } else if (g === "ذكر" || g === "male" || g === "m") {
+      } else if (["ذكر", "male", "m", "رجل"].includes(g)) {
         normalizedGender = "Male";
       } else {
         errors.push({
           row: row.rowNumber,
           name: cleanName,
           phone: row.phone,
-          reason: "نوع المريض غير صحيح، يجب أن يكون Male أو Female",
+          reason: "نوع المريض غير صحيح، يجب أن يكون ذكر أو أنثى أو تركه فارغاً",
         });
         continue;
       }
     }
 
-    // 6. فحص تاريخ الميلاد
+    // 6. فحص تاريخ الميلاد الذكي (دعم الصيغة المصرية DD/MM/YYYY)
     let validDob = null;
-
     if (row.dob && row.dob.trim() !== "") {
-      const dobValue = row.dob.trim();
-      const d = new Date(dobValue);
+      const parsedDate = parseEgyptianDate(row.dob);
 
-      if (isNaN(d.getTime())) {
+      if (parsedDate === "INVALID") {
         errors.push({
           row: row.rowNumber,
           name: cleanName,
           phone: row.phone,
-          reason: "تاريخ الميلاد غير صحيح",
+          reason:
+            "تاريخ الميلاد غير صحيح، الصيغة المقبولة: يوم/شهر/سنة (مثال: 15/05/1995)",
         });
         continue;
-      }
-
-      if (d >= new Date()) {
+      } else if (parsedDate === "FUTURE") {
         errors.push({
           row: row.rowNumber,
           name: cleanName,
@@ -720,7 +835,7 @@ const importPatientsFromCsv = async (req, res) => {
         continue;
       }
 
-      validDob = d.toISOString().split("T")[0];
+      validDob = parsedDate;
     }
 
     const alerts = (row.alerts || "").trim();

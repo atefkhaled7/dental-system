@@ -1,4 +1,5 @@
 const pool = require("../db");
+const { captureError } = require("../utils/errorTracker");
 
 const getAuditLogs = async (req, res) => {
   try {
@@ -75,6 +76,7 @@ const getAuditLogs = async (req, res) => {
       },
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching audit logs:", error.message);
 
     return res.status(500).json({

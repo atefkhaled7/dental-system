@@ -1,6 +1,7 @@
 const pool = require("../db");
 const { logActivity } = require("../utils/auditLogger");
 const { isValidUuid } = require("../middleware/validateUuid");
+const { captureError } = require("../utils/errorTracker");
 
 const createInvoice = async (req, res) => {
   const {
@@ -97,14 +98,15 @@ const createInvoice = async (req, res) => {
     return res.status(400).json({ error: "طريقة الدفع غير صالحة" });
   }
 
-  const client = await pool.connect();
+  let client;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
 
     // 🔒 1. فحص عزل المريض أولاً (Tenant Isolation Check)
     const patientCheck = await client.query(
       `SELECT id FROM patients WHERE id = $1 AND clinic_id = $2`,
-      [patient_id, clinic_id]
+      [patient_id, clinic_id],
     );
 
     if (patientCheck.rows.length === 0) {
@@ -123,7 +125,7 @@ const createInvoice = async (req, res) => {
            AND clinic_id = $2
            AND patient_id = $3
          FOR UPDATE`,
-        [finalAppointmentId, clinic_id, patient_id]
+        [finalAppointmentId, clinic_id, patient_id],
       );
 
       if (apptCheck.rows.length === 0) {
@@ -141,7 +143,7 @@ const createInvoice = async (req, res) => {
            AND is_archived = FALSE
            AND status <> 'cancelled'
          LIMIT 1`,
-        [clinic_id, finalAppointmentId]
+        [clinic_id, finalAppointmentId],
       );
 
       if (existingInvoiceCheck.rows.length > 0) {
@@ -157,7 +159,7 @@ const createInvoice = async (req, res) => {
       // قفل صف الطبيب النشط لحماية التزامن
       const doctorCheck = await client.query(
         "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor' AND is_active = TRUE FOR UPDATE",
-        [doctor_id, clinic_id]
+        [doctor_id, clinic_id],
       );
       if (doctorCheck.rows.length === 0) {
         await client.query("ROLLBACK");
@@ -181,7 +183,7 @@ const createInvoice = async (req, res) => {
       // جلب مدة الكشف الافتراضية للعيادة
       const clinicRes = await client.query(
         "SELECT default_appointment_duration FROM clinics WHERE id = $1",
-        [clinic_id]
+        [clinic_id],
       );
       const apptDuration =
         Number(clinicRes.rows[0]?.default_appointment_duration) || 30;
@@ -199,7 +201,7 @@ const createInvoice = async (req, res) => {
          AND appointment_date < ($3::timestamptz + ($4 * INTERVAL '1 minute'))
          AND (appointment_date + (duration_minutes * INTERVAL '1 minute')) > $3::timestamptz
        LIMIT 1`,
-          [clinic_id, doctor_id, appDate.toISOString(), apptDuration]
+          [clinic_id, doctor_id, appDate.toISOString(), apptDuration],
         );
 
         if (conflictCheck.rows.length > 0) {
@@ -221,7 +223,7 @@ const createInvoice = async (req, res) => {
           appDate.toISOString(),
           apptDuration,
           appStatus,
-        ]
+        ],
       );
       finalAppointmentId = autoAppt.rows[0].id;
     }
@@ -277,7 +279,7 @@ const createInvoice = async (req, res) => {
           paymentMethod,
           initial_payment?.notes || "دفعة فورية عند إصدار الفاتورة",
           req.user.id,
-        ]
+        ],
       );
     }
 
@@ -293,7 +295,7 @@ const createInvoice = async (req, res) => {
         description: `قام ${
           req.user.name || "الموظف"
         } بإنشاء فاتورة جديدة بقيمة ${totalAmount} ج.م للمريض #${String(
-          patient_id
+          patient_id,
         ).slice(0, 8)}`,
         metadata: {
           total_amount: totalAmount,
@@ -313,7 +315,7 @@ const createInvoice = async (req, res) => {
             req.user.name || "الموظف"
           } بتحصيل دفعة بقيمة ${paidNow} ج.م للفاتورة #${invoiceId.slice(
             0,
-            8
+            8,
           )}`,
           metadata: {
             amount: paidNow,
@@ -330,16 +332,28 @@ const createInvoice = async (req, res) => {
       invoice: newInvoice,
     });
   } catch (error) {
-    await client.query("ROLLBACK");
-    if (error.code === "23503") {
-      return res
-        .status(400)
-        .json({ error: "بيانات غير صحيحة (مريض أو دكتور أو بند غير موجود)" });
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Rollback failed:", rollbackError.message);
+      }
     }
+
+    if (error.code === "23503") {
+      return res.status(400).json({
+        error: "بيانات غير صحيحة (مريض أو دكتور أو بند غير موجود)",
+      });
+    }
+
     console.error("Error creating invoice:", error.message);
-    res.status(500).json({ error: "خطأ في السيرفر أثناء إنشاء الفاتورة" });
+    captureError(error, req);
+
+    return res.status(500).json({
+      error: "خطأ في السيرفر أثناء إنشاء الفاتورة",
+    });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 };
 
@@ -349,6 +363,10 @@ const createInvoice = async (req, res) => {
 const getInvoices = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const { search, status, patient_id, archived, page, limit } = req.query;
+
+  if (patient_id && !isValidUuid(patient_id)) {
+    return res.status(400).json({ error: "معرّف المريض غير صالح" });
+  }
 
   try {
     // 1. حساب الـ Pagination
@@ -429,7 +447,7 @@ const getInvoices = async (req, res) => {
 
     // تنظيف الحقل full_count من كائنات الفواتير
     const invoices = invoicesResult.rows.map(
-      ({ full_count, ...invoice }) => invoice
+      ({ full_count, ...invoice }) => invoice,
     );
     const totalPages = Math.ceil(total / limitNum) || 1;
 
@@ -443,6 +461,7 @@ const getInvoices = async (req, res) => {
       },
     });
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching invoices:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء جلب الفواتير" });
   }
@@ -451,6 +470,10 @@ const getInvoices = async (req, res) => {
 const getInvoiceById = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const invoiceId = req.params.id;
+
+  if (!isValidUuid(req.params.id)) {
+    return res.status(400).json({ error: "معرّف الفاتورة غير صالح" });
+  }
 
   try {
     // جلب الفاتورة مع المريض والدكتور وميعاد الكشف
@@ -482,14 +505,14 @@ const getInvoiceById = async (req, res) => {
     // جلب البنود
     const itemsResult = await pool.query(
       "SELECT procedure_code_id, description, quantity, unit_price, total_price FROM invoice_items WHERE clinic_id = $1 AND invoice_id = $2",
-      [clinic_id, invoiceId]
+      [clinic_id, invoiceId],
     );
     invoice.items = itemsResult.rows;
 
     // جلب سجل المدفوعات بالتفصيل (دفع إيه وإمتى وطريقة الدفع)
     const paymentsResult = await pool.query(
       "SELECT id, amount, payment_method, CASE WHEN status = 'pending' AND expires_at < NOW() THEN 'expired' ELSE status END AS status, notes, paid_at, created_at FROM payments WHERE clinic_id = $1 AND invoice_id = $2 ORDER BY paid_at DESC",
-      [clinic_id, invoiceId]
+      [clinic_id, invoiceId],
     );
     invoice.payments = paymentsResult.rows;
 
@@ -503,6 +526,7 @@ const getInvoiceById = async (req, res) => {
 
     res.status(200).json(invoice);
   } catch (error) {
+    captureError(error, req);
     console.error("Error fetching invoice by ID:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء جلب الفاتورة" });
   }
@@ -512,8 +536,13 @@ const cancelInvoice = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const invoiceId = req.params.id;
 
-  const client = await pool.connect();
+  if (!isValidUuid(req.params.id)) {
+    return res.status(400).json({ error: "معرّف الفاتورة غير صالح" });
+  }
+
+  let client;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
 
     // إلغاء الفاتورة فقط إذا كانت غير مدفوعة وتتبع نفس العيادة
@@ -522,7 +551,7 @@ const cancelInvoice = async (req, res) => {
        SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP 
        WHERE clinic_id = $1 AND id = $2 AND status = 'unpaid' 
        RETURNING *`,
-      [clinic_id, invoiceId]
+      [clinic_id, invoiceId],
     );
 
     if (result.rows.length === 0) {
@@ -537,7 +566,7 @@ const cancelInvoice = async (req, res) => {
       `UPDATE treatment_plan_items 
    SET invoice_id = NULL
    WHERE clinic_id = $1 AND invoice_id = $2`,
-      [clinic_id, invoiceId]
+      [clinic_id, invoiceId],
     );
 
     // إلغاء أي روابط دفع إلكتروني معلقة (pending) تابعة لهذه الفاتورة
@@ -546,33 +575,49 @@ const cancelInvoice = async (req, res) => {
    SET status = 'cancelled', 
        notes = COALESCE(notes, '') || ' [ملغى: تم إلغاء الفاتورة الأصلية]'
    WHERE clinic_id = $1 AND invoice_id = $2 AND status = 'pending'`,
-      [clinic_id, invoiceId]
+      [clinic_id, invoiceId],
     );
 
     await client.query("COMMIT");
 
     // تسجيل العملية في الرقابة
-    await logActivity({
-      clinic_id,
-      user_id: req.user.id,
-      action: "CANCEL_INVOICE",
-      entity_type: "invoice",
-      entity_id: invoiceId,
-      description: `قام ${
-        req.user.name || "المستخدم"
-      } بإلغاء الفاتورة #${invoiceId.slice(0, 8)}`,
-    });
+    try {
+      await logActivity({
+        clinic_id,
+        user_id: req.user.id,
+        action: "CANCEL_INVOICE",
+        entity_type: "invoice",
+        entity_id: invoiceId,
+        description: `قام ${
+          req.user.name || "المستخدم"
+        } بإلغاء الفاتورة #${invoiceId.slice(0, 8)}`,
+      });
+    } catch (auditErr) {
+      console.error("Audit log failed for cancelInvoice:", auditErr.message);
+    }
 
     res.status(200).json({
       message: "تم إلغاء الفاتورة وفك بنود العلاج المرتبطة بنجاح",
       invoice: result.rows[0],
     });
   } catch (error) {
-    await client.query("ROLLBACK");
+    captureError(error, req);
+
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Rollback failed:", rollbackError.message);
+      }
+    }
+
     console.error("Error canceling invoice:", error.message);
-    res.status(500).json({ error: "خطأ في السيرفر أثناء إلغاء الفاتورة" });
+
+    return res.status(500).json({
+      error: "خطأ في السيرفر أثناء إلغاء الفاتورة",
+    });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 };
 
@@ -582,8 +627,12 @@ const archiveInvoice = async (req, res) => {
     const clinic_id = req.user.clinic_id;
     const userRole = req.user.role;
 
+    if (!isValidUuid(id)) {
+      return res.status(400).json({ error: "معرّف الفاتورة غير صالح" });
+    }
+
     // منع الريسبشن من أرشفة الفواتير
-    if (userRole === "Receptionist") {
+    if (userRole !== "ClinicAdmin") {
       return res.status(403).json({
         error: "غير مصرح لك بأرشفة الفواتير، هذه الصلاحية لمدير العيادة فقط",
       });
@@ -608,19 +657,26 @@ const archiveInvoice = async (req, res) => {
       });
     }
 
+    // 🔒 تسجيل العملية في الرقابة أولاً قبل إرسال الرد لضمان عدم ضياعها على Vercel
+    try {
+      await logActivity({
+        clinic_id,
+        user_id: req.user.id,
+        action: "ARCHIVE_INVOICE",
+        entity_type: "invoice",
+        entity_id: id,
+        description: `تمت أرشفة الفاتورة #${id.slice(0, 8)}`,
+      });
+    } catch (auditErr) {
+      console.error("Audit log failed for archiveInvoice:", auditErr.message);
+    }
+
     res.status(200).json({
       message: "تم أرشفة الفاتورة بنجاح",
       invoice: result.rows[0],
     });
-    await logActivity({
-      clinic_id,
-      user_id: req.user.id,
-      action: "ARCHIVE_INVOICE",
-      entity_type: "invoice",
-      entity_id: id,
-      description: `تم ارشفة الفاتورة #${id.slice(0, 8)}`,
-    });
   } catch (error) {
+    captureError(error, req);
     console.error("Error archiving invoice:", error.message);
     res.status(500).json({
       error: "خطأ في السيرفر أثناء أرشفة الفاتورة",
@@ -736,7 +792,7 @@ const exportInvoices = async (req, res) => {
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename=invoices_report_${Date.now()}.csv`
+      `attachment; filename=invoices_report_${Date.now()}.csv`,
     );
 
     try {
@@ -758,6 +814,7 @@ const exportInvoices = async (req, res) => {
 
     return res.status(200).send(csv);
   } catch (err) {
+    captureError(err, req);
     console.error("Error exporting invoices:", err.message);
 
     return res.status(500).json({

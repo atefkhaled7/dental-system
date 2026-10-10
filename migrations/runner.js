@@ -19,7 +19,9 @@ const colors = {
 };
 
 async function runMigrations() {
-  console.log(`\n${colors.bold}${colors.cyan}🚀 CUROSTA Migration Runner Starting...${colors.reset}\n`);
+  console.log(
+    `\n${colors.bold}${colors.cyan}🚀 CUROSTA Migration Runner Starting...${colors.reset}\n`,
+  );
 
   const client = await pool.connect();
 
@@ -44,10 +46,12 @@ async function runMigrations() {
       `);
       if (tableCheck.rows[0].users_table) {
         await client.query(
-          "INSERT INTO schema_migrations (name) VALUES ('001_baseline.sql') ON CONFLICT DO NOTHING;"
+          "INSERT INTO schema_migrations (name) VALUES ('001_baseline.sql') ON CONFLICT DO NOTHING;",
         );
         appliedMigrations.add("001_baseline.sql");
-        console.log(`${colors.yellow}  ℹ Baseline schema (001_baseline.sql) marked as already applied.${colors.reset}`);
+        console.log(
+          `${colors.yellow}  ℹ Baseline schema (001_baseline.sql) marked as already applied.${colors.reset}`,
+        );
       }
     }
 
@@ -74,25 +78,38 @@ async function runMigrations() {
         // تشغيل كود المايجريشن
         await client.query(sql);
         // تسجيل اسم الملف في جدول المايجريشنز
-        await client.query("INSERT INTO schema_migrations (name) VALUES ($1)", [file]);
+        await client.query("INSERT INTO schema_migrations (name) VALUES ($1)", [
+          file,
+        ]);
         await client.query("COMMIT");
 
-        console.log(`${colors.green}  ✔ [SUCCESS] ${file} applied successfully.${colors.reset}`);
+        console.log(
+          `${colors.green}  ✔ [SUCCESS] ${file} applied successfully.${colors.reset}`,
+        );
         executedCount++;
       } catch (err) {
         await client.query("ROLLBACK");
-        console.error(`${colors.red}  ✖ [FAILED] Migration ${file} failed: ${err.message}${colors.reset}\n`);
+        console.error(
+          `${colors.red}  ✖ [FAILED] Migration ${file} failed: ${err.message}${colors.reset}\n`,
+        );
         throw err;
       }
     }
 
     if (executedCount === 0) {
-      console.log(`${colors.green}✨ Database is already up to date! No pending migrations.${colors.reset}\n`);
+      console.log(
+        `${colors.green}✨ Database is already up to date! No pending migrations.${colors.reset}\n`,
+      );
     } else {
-      console.log(`\n${colors.bold}${colors.green}🎉 Successfully applied ${executedCount} migration(s).${colors.reset}\n`);
+      console.log(
+        `\n${colors.bold}${colors.green}🎉 Successfully applied ${executedCount} migration(s).${colors.reset}\n`,
+      );
     }
   } catch (error) {
-    console.error(`${colors.red}Migration runner aborted:${colors.reset}`, error.message);
+    console.error(
+      `${colors.red}Migration runner aborted:${colors.reset}`,
+      error.message,
+    );
     process.exitCode = 1;
   } finally {
     client.release();

@@ -17,22 +17,27 @@ router.post("/", authMiddleware, authorizeRole("SuperAdmin"), createClinic);
 router.get(
   "/",
   authMiddleware,
-  authorizeRole("SuperAdmin", "ClinicAdmin"),
-  getClinics
+  authorizeRole("SuperAdmin", "ClinicAdmin", "Receptionist", "Doctor"),
+  getClinics,
 );
 router.put(
   "/:id",
   authMiddleware,
   authorizeRole("SuperAdmin", "ClinicAdmin"),
-  updateClinic
+  updateClinic,
 );
 router.delete(
   "/:id",
   authMiddleware,
   authorizeRole("SuperAdmin"),
-  deleteClinic
+  deleteClinic,
 );
 
-router.put("/:id/subscription", authMiddleware,authorizeRole("SuperAdmin") , renewSubscription);
+router.put(
+  "/:id/subscription",
+  authMiddleware,
+  authorizeRole("SuperAdmin"),
+  renewSubscription,
+);
 
 module.exports = router;
