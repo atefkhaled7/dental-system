@@ -48,7 +48,8 @@ const authMiddleware = async (req, res, next) => {
         u.is_active,
         u.token_version,
         c.is_active AS clinic_active,
-        c.subscription_ends_at
+        c.subscription_ends_at,
+        c.slug AS clinic_slug
       FROM users u
       LEFT JOIN clinics c ON u.clinic_id = c.id
       WHERE u.id = $1
@@ -98,12 +99,17 @@ const authMiddleware = async (req, res, next) => {
         new Date(currentUser.subscription_ends_at) < new Date(),
       );
 
-      // الاشتراك منتهي: منع عمليات الكتابة والتعديل
+      // الاشتراك منتهي: منع الكتابة والتعديل، باستثناء إنشاء تذكرة دعم
       const isMutation = ["POST", "PUT", "PATCH", "DELETE"].includes(
         req.method,
       );
 
-      if (isExpired && isMutation) {
+      // السماح للعميل بإرسال تذكرة دعم حتى لو اشتراكه منتهي
+      const isSupportTicketCreation =
+        req.method === "POST" &&
+        /(?:^|\/)support\/tickets\/?$/.test(req.originalUrl.split("?")[0]);
+
+      if (isExpired && isMutation && !isSupportTicketCreation) {
         return res.status(402).json({
           code: "SUBSCRIPTION_EXPIRED",
           error:
@@ -127,6 +133,7 @@ const authMiddleware = async (req, res, next) => {
     if (currentUser.clinic_id) {
       req.clinic = {
         id: currentUser.clinic_id,
+        slug: currentUser.clinic_slug,
         is_active: currentUser.clinic_active,
         subscription_ends_at: currentUser.subscription_ends_at,
       };

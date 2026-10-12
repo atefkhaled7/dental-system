@@ -15,10 +15,10 @@ const bookingLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// ميدلوير فخ البوتات (Honeypot)
+// ميدلوير فخ البوتات (Honeypot) - ✅ محمي ضد req.body = undefined
 const checkHoneypot = (req, res, next) => {
   // لو الحقل المخفي جه مليان من الفورم، يبقى ده بوت
-  if (req.body.fax_number) {
+  if (req.body && req.body.fax_number) {
     return res.status(400).json({ error: "تم رفض الطلب." });
   }
   next();

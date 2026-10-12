@@ -364,5 +364,5 @@ module.exports = {
   getLabOrders,
   updateLabOrderStatus,
   updateLabOrder,
-  getDistinctLabs, // 👈
+  getDistinctLabs, 
 };

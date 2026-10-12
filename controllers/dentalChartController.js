@@ -1,5 +1,6 @@
 const pool = require("../db");
 const { captureError } = require("../utils/errorTracker");
+const { isValidUuid } = require("../middleware/validateUuid");
 
 // الحالات المعتمدة لحالة السن
 const VALID_CONDITIONS = [
@@ -16,13 +17,10 @@ const VALID_CONDITIONS = [
 const VALID_ADULT_TEETH = new Set([
   // الربع الأول - علوي يمين
   11, 12, 13, 14, 15, 16, 17, 18,
-
   // الربع الثاني - علوي شمال
   21, 22, 23, 24, 25, 26, 27, 28,
-
   // الربع الثالث - سفلي شمال
   31, 32, 33, 34, 35, 36, 37, 38,
-
   // الربع الرابع - سفلي يمين
   41, 42, 43, 44, 45, 46, 47, 48,
 ]);
@@ -35,13 +33,17 @@ const getPatientTeeth = async (req, res) => {
     const clinicId = req.user.clinic_id;
     const { patientId } = req.params;
 
+    if (!isValidUuid(patientId)) {
+      return res.status(400).json({ error: "معرّف المريض غير صالح" });
+    }
+
     const patientCheck = await pool.query(
       `SELECT id
        FROM patients
        WHERE id = $1
          AND clinic_id = $2
          AND is_active = TRUE`,
-      [patientId, clinicId]
+      [patientId, clinicId],
     );
 
     if (patientCheck.rows.length === 0) {
@@ -62,7 +64,6 @@ const getPatientTeeth = async (req, res) => {
         AND patient_id = $2
       ORDER BY tooth_number ASC;
     `;
-
     const result = await pool.query(query, [clinicId, patientId]);
 
     return res.status(200).json({
@@ -71,7 +72,6 @@ const getPatientTeeth = async (req, res) => {
   } catch (error) {
     captureError(error, req);
     console.error("Error fetching patient teeth:", error.message);
-
     return res.status(500).json({
       error: "خطأ في السيرفر أثناء جلب مخطط الأسنان",
     });
@@ -82,18 +82,19 @@ const getPatientTeeth = async (req, res) => {
 // 2. تحديث حالة سن معين + تسجيل الحركة في tooth_history
 // ============================================================
 const updateToothCondition = async (req, res) => {
-  const client = await pool.connect();
-
+  let client;
   try {
     const clinicId = req.user.clinic_id;
     const userId = req.user.id;
-
     const { patientId, toothNumber } = req.params;
-    const { condition, notes, procedure_name } = req.body;
+    const { condition, notes, procedure_name } = req.body || {};
+
+    if (!isValidUuid(patientId)) {
+      return res.status(400).json({ error: "معرّف المريض غير صالح" });
+    }
 
     // التحقق من رقم السن حسب FDI
     const toothNum = Number(toothNumber);
-
     if (!Number.isInteger(toothNum) || !VALID_ADULT_TEETH.has(toothNum)) {
       return res.status(400).json({
         error: "رقم السن غير صحيح طبقاً للترقيم الطبي المعتمد (FDI)",
@@ -104,12 +105,15 @@ const updateToothCondition = async (req, res) => {
     if (!condition || !VALID_CONDITIONS.includes(condition.toLowerCase())) {
       return res.status(400).json({
         error: `حالة السن غير صالحة. الحالات المسموحة: ${VALID_CONDITIONS.join(
-          ", "
+          ", ",
         )}`,
       });
     }
 
     const normalizedCondition = condition.toLowerCase();
+    const cleanNotes = typeof notes === "string" ? notes.trim() : null;
+
+    client = await pool.connect();
 
     // التحقق من المريض ونطاق العيادة
     const patientCheck = await client.query(
@@ -118,7 +122,7 @@ const updateToothCondition = async (req, res) => {
        WHERE id = $1
          AND clinic_id = $2
          AND is_active = TRUE`,
-      [patientId, clinicId]
+      [patientId, clinicId],
     );
 
     if (patientCheck.rows.length === 0) {
@@ -130,7 +134,7 @@ const updateToothCondition = async (req, res) => {
     await client.query("BEGIN");
 
     // --------------------------------------------------------
-    // A) تحديث أو إدخال السن الحالي (UPSERT)
+    // A) تحديث أو إدخال السن الحالي (UPSERT مع حماية الملاحظات القديمة)
     // --------------------------------------------------------
     const upsertQuery = `
       INSERT INTO patient_teeth (
@@ -152,7 +156,10 @@ const updateToothCondition = async (req, res) => {
       ON CONFLICT (clinic_id, patient_id, tooth_number)
       DO UPDATE SET
         condition = EXCLUDED.condition,
-        notes = EXCLUDED.notes,
+        notes = CASE 
+          WHEN EXCLUDED.notes IS NOT NULL AND EXCLUDED.notes <> '' THEN EXCLUDED.notes 
+          ELSE patient_teeth.notes 
+        END,
         updated_at = CURRENT_TIMESTAMP
       RETURNING *;
     `;
@@ -162,7 +169,7 @@ const updateToothCondition = async (req, res) => {
       patientId,
       toothNum,
       normalizedCondition,
-      notes || null,
+      cleanNotes,
     ]);
 
     // --------------------------------------------------------
@@ -190,13 +197,16 @@ const updateToothCondition = async (req, res) => {
       RETURNING *;
     `;
 
+    const cleanProcedureName =
+      typeof procedure_name === "string" ? procedure_name.trim() || null : null;
+
     await client.query(historyQuery, [
       clinicId,
       patientId,
       toothNum,
       normalizedCondition,
-      procedure_name || null,
-      notes || null,
+      cleanProcedureName,
+      cleanNotes || null,
       userId,
     ]);
 
@@ -207,20 +217,20 @@ const updateToothCondition = async (req, res) => {
       tooth: toothRes.rows[0],
     });
   } catch (error) {
-    captureError(error, req);
-    try {
-      await client.query("ROLLBACK");
-    } catch (rollbackError) {
-      console.error("Rollback error:", rollbackError.message);
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Rollback error:", rollbackError.message);
+      }
     }
-
+    captureError(error, req);
     console.error("Error updating tooth condition:", error.message);
-
     return res.status(500).json({
       error: "خطأ في السيرفر أثناء تحديث السن",
     });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 };
 
@@ -232,9 +242,12 @@ const getToothHistory = async (req, res) => {
     const clinicId = req.user.clinic_id;
     const { patientId, toothNumber } = req.params;
 
+    if (!isValidUuid(patientId)) {
+      return res.status(400).json({ error: "معرّف المريض غير صالح" });
+    }
+
     // التحقق من رقم السن حسب FDI
     const toothNum = Number(toothNumber);
-
     if (!Number.isInteger(toothNum) || !VALID_ADULT_TEETH.has(toothNum)) {
       return res.status(400).json({
         error: "رقم السن غير صحيح طبقاً للترقيم الطبي المعتمد (FDI)",
@@ -248,7 +261,7 @@ const getToothHistory = async (req, res) => {
        WHERE id = $1
          AND clinic_id = $2
          AND is_active = TRUE`,
-      [patientId, clinicId]
+      [patientId, clinicId],
     );
 
     if (patientCheck.rows.length === 0) {
@@ -284,7 +297,6 @@ const getToothHistory = async (req, res) => {
   } catch (error) {
     captureError(error, req);
     console.error("Error fetching tooth history:", error.message);
-
     return res.status(500).json({
       error: "خطأ في السيرفر أثناء جلب تاريخ السن",
     });

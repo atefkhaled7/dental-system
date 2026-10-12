@@ -49,7 +49,7 @@ const cairoLocalTimeToDate = (dateStr, timeStr) => {
 // دالة مساعدة لجلب العيادة عبر الـ slug أو الـ UUID
 const resolveClinic = async (identifier) => {
   let query =
-    "SELECT id, name, phone_number, address, bio, slug, is_active FROM clinics WHERE ";
+    "SELECT id, name, phone_number, address, bio, slug, is_active, subscription_ends_at FROM clinics WHERE ";
   let params = [identifier];
 
   if (isValidUuid(identifier)) {
@@ -71,30 +71,38 @@ const getPublicClinicProfile = async (req, res) => {
 
   try {
     const clinic = await resolveClinic(slug);
+
     if (!clinic) {
       return res
         .status(404)
         .json({ error: "العيادة غير موجودة أو غير متاحة حالياً" });
     }
 
+    const isSubscriptionExpired =
+      clinic.subscription_ends_at &&
+      new Date(clinic.subscription_ends_at) < new Date();
+
     // جلب الأطباء النشطين في العيادة
     const doctorsRes = await pool.query(
-      `SELECT id, name FROM users 
-       WHERE clinic_id = $1 AND role = 'Doctor' AND is_active = TRUE 
+      `SELECT id, name FROM users
+       WHERE clinic_id = $1
+         AND role = 'Doctor'
+         AND is_active = TRUE
        ORDER BY name ASC;`,
       [clinic.id],
     );
 
-    // جلب الخدمات وأكواد العلاج النشطة مع مدة كل خدمة وأسعارها
+    // جلب الخدمات النشطة
     const servicesRes = await pool.query(
-      `SELECT id, code, description, default_price, duration_minutes 
-       FROM procedure_codes 
-       WHERE clinic_id = $1 AND is_active = TRUE 
+      `SELECT id, code, description, default_price, duration_minutes
+       FROM procedure_codes
+       WHERE clinic_id = $1
+         AND is_active = TRUE
        ORDER BY description ASC;`,
       [clinic.id],
     );
 
-    res.status(200).json({
+    return res.status(200).json({
       clinic: {
         id: clinic.id,
         name: clinic.name,
@@ -102,6 +110,7 @@ const getPublicClinicProfile = async (req, res) => {
         address: clinic.address || "العنوان متاح بالعيادة",
         bio: clinic.bio || "عيادة أسنان متخصصة تقدم أفضل رعاية طبية لأسنانك.",
         slug: clinic.slug,
+        is_booking_enabled: !isSubscriptionExpired,
       },
       doctors: doctorsRes.rows,
       services: servicesRes.rows,
@@ -109,7 +118,10 @@ const getPublicClinicProfile = async (req, res) => {
   } catch (error) {
     captureError(error, req);
     console.error("Error fetching public clinic profile:", error.message);
-    res.status(500).json({ error: "حدث خطأ أثناء تحميل بيانات العيادة" });
+
+    return res.status(500).json({
+      error: "حدث خطأ أثناء تحميل بيانات العيادة",
+    });
   }
 };
 
@@ -122,6 +134,19 @@ const getPublicAvailableSlots = async (req, res) => {
     const clinic = await resolveClinic(slug);
     if (!clinic) {
       return res.status(404).json({ error: "العيادة غير موجودة" });
+    }
+
+    const isSubscriptionExpired =
+      clinic.subscription_ends_at &&
+      new Date(clinic.subscription_ends_at) < new Date();
+
+    if (isSubscriptionExpired) {
+      return res.status(200).json({
+        available: false,
+        reason:
+          "الحجز الإلكتروني غير متاح لهذه العيادة حالياً، يرجى التواصل هاتفياً.",
+        slots: [],
+      });
     }
 
     if (!doctor_id || !isValidUuid(doctor_id)) {
@@ -326,6 +351,16 @@ const createPublicBookingRequest = async (req, res) => {
     if (!clinic) {
       return res.status(404).json({
         error: "العيادة غير موجودة أو معطلة",
+      });
+    }
+    const isSubscriptionExpired =
+      clinic.subscription_ends_at &&
+      new Date(clinic.subscription_ends_at) < new Date();
+
+    if (isSubscriptionExpired) {
+      return res.status(403).json({
+        error:
+          "نعتذر، الحجز الإلكتروني غير متاح حالياً لهذه العيادة، يرجى الاتصال بالعيادة هاتفياً.",
       });
     }
 

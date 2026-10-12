@@ -5,6 +5,7 @@ const {
   getProcedureCodes,
   updateProcedureCode,
   deleteProcedureCode,
+  restoreProcedureCode,
 } = require("../controllers/procedureCodesController");
 const authMiddleware = require("../middleware/authMiddleware");
 const authorizeRole = require("../middleware/roleMiddleware");
@@ -14,8 +15,17 @@ applyUuidParams(router, ["id"]);
 router.use(authMiddleware);
 
 router.post("/", authorizeRole("ClinicAdmin"), createProcedureCode);
-router.get("/", authorizeRole("ClinicAdmin", "Doctor", "Receptionist"), getProcedureCodes);
+router.get(
+  "/",
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  getProcedureCodes,
+);
 router.put("/:id", authorizeRole("ClinicAdmin"), updateProcedureCode);
 router.delete("/:id", authorizeRole("ClinicAdmin"), deleteProcedureCode);
+router.patch(
+  "/:id/restore",
+  authorizeRole("ClinicAdmin"),
+  restoreProcedureCode,
+);
 
 module.exports = router;

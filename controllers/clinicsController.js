@@ -149,6 +149,7 @@ const getClinics = async (req, res) => {
         SELECT 
           c.id,
           c.name,
+          c.slug,
           c.phone_number,
           c.subdomain,
           c.is_active,
@@ -161,6 +162,8 @@ const getClinics = async (req, res) => {
           (SELECT COUNT(*) FROM users u WHERE u.clinic_id = c.id) AS staff_count,
           (SELECT COUNT(*) FROM patients p WHERE p.clinic_id = c.id AND p.is_active = TRUE) AS patients_count,
           (SELECT COUNT(*) FROM appointments a WHERE a.clinic_id = c.id) AS appointments_count,
+          (SELECT COUNT(*) FROM booking_requests br WHERE br.clinic_id = c.id) AS bookings_count,
+          (SELECT MAX(a.appointment_date) FROM appointments a WHERE a.clinic_id = c.id AND a.appointment_date <= NOW()) AS last_appointment_date,
           (SELECT u.name FROM users u WHERE u.clinic_id = c.id AND u.role = 'ClinicAdmin' LIMIT 1) AS admin_name,
           (SELECT u.email FROM users u WHERE u.clinic_id = c.id AND u.role = 'ClinicAdmin' LIMIT 1) AS admin_email
         FROM clinics c
@@ -398,10 +401,101 @@ const deleteClinic = async (req, res) => {
   }
 };
 
+const getOnboardingStatus = async (req, res) => {
+  const clinicId = req.user?.clinic_id;
+
+  // لو سوبر أدمن ومش مرتبط بعيادة معينة
+  if (!clinicId) {
+    return res.status(200).json({ is_completed: true, steps: [] });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        c.slug,
+        (
+  EXISTS(SELECT 1 FROM users WHERE clinic_id = $1 AND role = 'Doctor' AND is_active = TRUE)
+  AND
+  EXISTS(SELECT 1 FROM doctor_availability WHERE clinic_id = $1 AND is_active = TRUE)
+) AS has_doctors,
+        EXISTS(SELECT 1 FROM procedure_codes WHERE clinic_id = $1 AND is_active = TRUE) AS has_services,
+        EXISTS (
+  SELECT 1
+  FROM clinics
+  WHERE id = $1
+    AND slug IS NOT NULL
+    AND NULLIF(BTRIM(address), '') IS NOT NULL
+    AND NULLIF(BTRIM(phone_number), '') IS NOT NULL
+) AS has_profile,
+        EXISTS(SELECT 1 FROM patients WHERE clinic_id = $1 AND is_active = TRUE) AS has_patients,
+        EXISTS(SELECT 1 FROM appointments WHERE clinic_id = $1) AS has_appointments
+      FROM clinics c
+      WHERE c.id = $1;
+      `,
+      [clinicId],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "العيادة غير موجودة" });
+    }
+
+    const row = result.rows[0];
+
+    const steps = [
+      {
+        key: "has_doctors",
+        label: "إضافة أطباء العيادة ومواعيد العمل",
+        link: "/staff",
+        completed: row.has_doctors,
+      },
+      {
+        key: "has_services",
+        label: "تحديد قائمة الخدمات والأسعار",
+        link: "/services",
+        completed: row.has_services,
+      },
+      {
+        key: "has_patients",
+        label: "إضافة أو استيراد أول مريض",
+        link: "/patients",
+        completed: row.has_patients,
+      },
+      {
+        key: "has_appointments",
+        label: "تسجيل أول موعد في جدول المواعيد",
+        link: "/appointments",
+        completed: row.has_appointments,
+      },
+      {
+        key: "has_profile",
+        label: "تجهيز بروفايل العيادة ورابط الحجز العام",
+        link: `/c/${row.slug}`,
+        completed: row.has_profile,
+      },
+    ];
+
+    const completedCount = steps.filter((s) => s.completed).length;
+    const progressPercent = Math.round((completedCount / steps.length) * 100);
+
+    res.status(200).json({
+      is_completed: completedCount === steps.length,
+      progress_percent: progressPercent,
+      completed_count: completedCount,
+      total_steps: steps.length,
+      steps,
+    });
+  } catch (error) {
+    console.error("Error fetching onboarding status:", error.message);
+    res.status(500).json({ error: "حدث خطأ أثناء جلب حالة إعداد العيادة" });
+  }
+};
+
 module.exports = {
   createClinic,
   getClinics,
   renewSubscription,
   updateClinic,
   deleteClinic,
+  getOnboardingStatus,
 };

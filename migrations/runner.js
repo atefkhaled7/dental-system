@@ -75,12 +75,22 @@ async function runMigrations() {
 
       try {
         await client.query("BEGIN");
+
+        // ضبط مسار البحث قبل تشغيل ملف المايجريشن
+        await client.query("SET search_path TO pg_catalog, public;");
+
         // تشغيل كود المايجريشن
         await client.query(sql);
-        // تسجيل اسم الملف في جدول المايجريشنز
-        await client.query("INSERT INTO schema_migrations (name) VALUES ($1)", [
-          file,
-        ]);
+
+        // إعادة ضبط المسار بعد الملف أيضًا
+        await client.query("SET search_path TO pg_catalog, public;");
+
+        // تسجيل الملف بعد نجاح تنفيذه
+        await client.query(
+          "INSERT INTO public.schema_migrations (name) VALUES ($1)",
+          [file],
+        );
+
         await client.query("COMMIT");
 
         console.log(

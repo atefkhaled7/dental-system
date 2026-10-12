@@ -4,6 +4,8 @@ const crypto = require("crypto");
 const { logActivity } = require("../utils/auditLogger");
 const storageService = require("../utils/storageService");
 const { captureError } = require("../utils/errorTracker");
+const { isValidUuid } = require("../middleware/validateUuid");
+
 const VALID_CATEGORIES = [
   "xray_periapical",
   "xray_panoramic",
@@ -57,6 +59,10 @@ const uploadPatientImage = async (req, res) => {
     const { patientId } = req.params;
     const { tooth_number, category, description } = req.body;
 
+    if (!patientId || !isValidUuid(patientId)) {
+      return res.status(400).json({ error: "معرّف المريض غير صالح" });
+    }
+
     if (!req.file) {
       return res.status(400).json({ error: "يرجى اختيار ملف الصورة لرفعه" });
     }
@@ -73,7 +79,7 @@ const uploadPatientImage = async (req, res) => {
     // 🔒 2. فحص المريض وعزل العيادة
     const patientCheck = await pool.query(
       "SELECT id FROM patients WHERE id = $1 AND clinic_id = $2 AND is_active = TRUE",
-      [patientId, clinicId]
+      [patientId, clinicId],
     );
 
     if (patientCheck.rows.length === 0) {
@@ -147,7 +153,7 @@ const uploadPatientImage = async (req, res) => {
           req.user.name || "الطبيب"
         } برفع صورة طبية (${normalizedCategory}) للمريض #${patientId.slice(
           0,
-          8
+          8,
         )}`,
         metadata: {
           category: normalizedCategory,
@@ -166,7 +172,9 @@ const uploadPatientImage = async (req, res) => {
   } catch (error) {
     captureError(error, req);
     if (uploadedKey) {
-      await storageService.deleteFile(uploadedKey);
+      await storageService.deleteFile(uploadedKey).catch((delErr) => {
+        console.error("Error cleaning up orphaned file:", delErr);
+      });
     }
     console.error("Error uploading patient image:", error.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء رفع الصورة" });
@@ -177,6 +185,11 @@ const getPatientImages = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
     const { patientId } = req.params;
+
+    if (!patientId || !isValidUuid(patientId)) {
+      return res.status(400).json({ error: "معرّف المريض غير صالح" });
+    }
+
     const { tooth_number, category, archived, page, limit } = req.query;
     const isArchived = archived === "true";
 
@@ -245,6 +258,10 @@ const getProtectedImageFile = async (req, res) => {
     const clinicId = req.user.clinic_id;
     const { id } = req.params;
 
+    if (!id || !isValidUuid(id)) {
+      return res.status(400).json({ error: "معرّف الصورة غير صالح" });
+    }
+
     const imageQuery = `
       SELECT file_url, file_name, mime_type 
       FROM patient_images 
@@ -268,13 +285,31 @@ const getProtectedImageFile = async (req, res) => {
     res.setHeader("Content-Type", mime_type);
     res.setHeader("Cache-Control", "private, max-age=86400"); // كاش آمن لمدة يوم للمستخدم المصرح له
 
-    // لو الـ stream متاح (سواء من R2 أو FileStream)
+    // لو الـ stream متاح (سواء من Cloudinary أو S3 أو FileStream)
     if (fileData.stream?.pipe) {
+      fileData.stream.on("error", (streamErr) => {
+        captureError(streamErr, req);
+
+        if (!res.headersSent) {
+          res.status(500).json({
+            error: "خطأ أثناء قراءة بيانات الملف من التخزين",
+          });
+        } else {
+          // الاستجابة بدأت بالفعل؛ لا يمكن إرسال JSON جديد بأمان
+          res.destroy(streamErr);
+        }
+      });
       fileData.stream.pipe(res);
     } else if (fileData.filePath) {
       res.sendFile(fileData.filePath);
     } else {
-      captureError(error, req);
+      // ✅ تصليح ReferenceError: كائن Error صريح
+      captureError(
+        new Error(
+          `تعذر قراءة بيانات الملف للصورة ${id}: لا يتوفر stream أو filePath`,
+        ),
+        req,
+      );
       res.status(500).json({ error: "تعذر قراءة بيانات الملف" });
     }
   } catch (error) {
@@ -290,6 +325,10 @@ const archivePatientImage = async (req, res) => {
     const clinicId = req.user.clinic_id;
     const userRole = req.user.role;
     const { id } = req.params;
+
+    if (!id || !isValidUuid(id)) {
+      return res.status(400).json({ error: "معرّف الصورة غير صالح" });
+    }
 
     if (!["ClinicAdmin", "Doctor"].includes(userRole)) {
       return res

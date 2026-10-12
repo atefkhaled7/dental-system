@@ -3,10 +3,11 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { logActivity } = require("../utils/auditLogger");
 const { captureError } = require("../utils/errorTracker");
+const { randomBytes } = require("crypto");
 
 const registerUser = async (req, res) => {
   try {
-    const { name, email, password, role } = req.body;
+    const { name, email, password, role } = req.body || {};
 
     if (!name || !email || !password || !role) {
       return res.status(400).json({ error: "جميع الحقول مطلوبة" });
@@ -15,7 +16,7 @@ const registerUser = async (req, res) => {
     let targetClinicId = req.user.clinic_id;
 
     if (req.user.role === "SuperAdmin") {
-      targetClinicId = req.body.clinic_id || null;
+      targetClinicId = req.body?.clinic_id || null;
     } else if (req.user.role === "ClinicAdmin") {
       if (!["Doctor", "Receptionist"].includes(role)) {
         return res.status(403).json({
@@ -32,7 +33,7 @@ const registerUser = async (req, res) => {
       `INSERT INTO users (clinic_id, name, email, password, role) 
        VALUES ($1, $2, $3, $4, $5) 
        RETURNING id, name, email, role, clinic_id;`,
-      [targetClinicId, name, email.trim().toLowerCase(), hashedPassword, role]
+      [targetClinicId, name, email.trim().toLowerCase(), hashedPassword, role],
     );
 
     res.status(201).json({
@@ -51,11 +52,11 @@ const registerUser = async (req, res) => {
 
 const loginUser = async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password } = req.body || {};
 
     if (!email || !password) {
       return res.status(400).json({
-        error: "Missing required fields",
+        error: "يرجى إدخال البريد الإلكتروني وكلمة المرور",
       });
     }
 
@@ -71,7 +72,7 @@ const loginUser = async (req, res) => {
       LEFT JOIN clinics ON users.clinic_id = clinics.id
       WHERE users.email = $1
       `,
-      [normalizedEmail]
+      [normalizedEmail],
     );
     if (result.rows.length === 0) {
       return res.status(401).json({
@@ -102,15 +103,6 @@ const loginUser = async (req, res) => {
           error: "تم تجميد حساب هذه العيادة. يرجى التواصل مع إدارة CUROSTA.",
         });
       }
-      if (
-        user.subscription_ends_at &&
-        new Date(user.subscription_ends_at) < new Date()
-      ) {
-        return res.status(403).json({
-          error:
-            "انتهت فترة اشتراك العيادة. يرجى التواصل مع إدارة CUROSTA لتجديد الاشتراك.",
-        });
-      }
     }
 
     // تضمين token_version في التوكن لدعم الـ Token Invalidation
@@ -124,7 +116,7 @@ const loginUser = async (req, res) => {
       process.env.JWT_SECRET,
       {
         expiresIn: "12h",
-      }
+      },
     );
 
     return res.status(200).json({
@@ -136,6 +128,7 @@ const loginUser = async (req, res) => {
         email: user.email,
         role: user.role,
         clinic_id: user.clinic_id,
+        subscription_ends_at: user.subscription_ends_at,
       },
     });
   } catch (error) {
@@ -152,7 +145,8 @@ const registerClinic = async (req, res) => {
   let client;
 
   try {
-    const { clinic_name, phone_number, admin_name, email, password } = req.body;
+    const { clinic_name, phone_number, admin_name, email, password } =
+      req.body || {};
 
     if (!clinic_name || !clinic_name.trim()) {
       return res.status(400).json({
@@ -196,13 +190,43 @@ const registerClinic = async (req, res) => {
 
     await client.query("BEGIN");
 
+    // إنشاء Slug مميز للعيادة
+    const slugBase = clinic_name
+      .trim()
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+
+    const clinicSlug = `${slugBase || "clinic"}-${randomBytes(4).toString("hex")}`;
+
+    // إنشاء العيادة مع تفعيل فترة تجريبية لمدة 14 يومًا
     const clinicResult = await client.query(
       `
-      INSERT INTO clinics (name, phone_number)
-      VALUES ($1, $2)
-      RETURNING id, name, phone_number
-      `,
-      [clinic_name.trim(), phone_number?.trim() || null]
+  INSERT INTO clinics (
+    name,
+    phone_number,
+    slug,
+    is_active,
+    subscription_ends_at
+  )
+  VALUES (
+    $1,
+    $2,
+    $3,
+    TRUE,
+    CURRENT_TIMESTAMP + INTERVAL '14 days'
+  )
+  RETURNING
+    id,
+    name,
+    phone_number,
+    slug,
+    is_active,
+    subscription_ends_at;
+  `,
+      [clinic_name.trim(), phone_number?.trim() || null, clinicSlug],
     );
 
     const newClinic = clinicResult.rows[0];
@@ -228,7 +252,7 @@ const registerClinic = async (req, res) => {
         email.trim().toLowerCase(),
         hashedPassword,
         "ClinicAdmin",
-      ]
+      ],
     );
 
     await client.query("COMMIT");
@@ -276,7 +300,7 @@ const getDoctors = async (req, res) => {
         AND is_active = TRUE
       ORDER BY name ASC
       `,
-      [req.user.clinic_id]
+      [req.user.clinic_id],
     );
 
     return res.status(200).json({
@@ -296,7 +320,7 @@ const getDoctors = async (req, res) => {
 const updateProfile = async (req, res) => {
   try {
     const userId = req.user.id;
-    const { name } = req.body;
+    const { name } = req.body || {};
 
     if (!name || name.trim().length < 2) {
       return res
@@ -304,9 +328,19 @@ const updateProfile = async (req, res) => {
         .json({ error: "الاسم مطلوب ويجب أن يحتوي على حرفين على الأقل" });
     }
 
+    if (
+      ["demo@curosta.com", "doctor.demo@curosta.com"].includes(
+        req.user.email?.toLowerCase(),
+      )
+    ) {
+      return res.status(403).json({
+        error: "هذا الحساب تجريبي للعرض فقط، لا يمكن تعديل بياناته الشخصية.",
+      });
+    }
+
     const result = await pool.query(
       `UPDATE users SET name = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING id, name, email, role;`,
-      [name.trim(), userId]
+      [name.trim(), userId],
     );
 
     res.status(200).json({
@@ -324,12 +358,23 @@ const updateProfile = async (req, res) => {
 const changePassword = async (req, res) => {
   try {
     const userId = req.user.id;
-    const { current_password, new_password } = req.body;
+    const { current_password, new_password } = req.body || {};
 
     if (!current_password || !new_password) {
       return res
         .status(400)
         .json({ error: "يرجى إدخال كلمة المرور الحالية والجديدة" });
+    }
+
+    if (
+      ["demo@curosta.com", "doctor.demo@curosta.com"].includes(
+        req.user.email?.toLowerCase(),
+      )
+    ) {
+      return res.status(403).json({
+        error:
+          "هذا الحساب تجريبي للعرض فقط، لا يمكن تغيير كلمة المرور الخاصة به.",
+      });
     }
 
     if (new_password.length < 8) {
@@ -341,7 +386,7 @@ const changePassword = async (req, res) => {
     // جلب الباسورد الحالي من الداتابيز للتحقق منه
     const userRes = await pool.query(
       "SELECT password FROM users WHERE id = $1",
-      [userId]
+      [userId],
     );
     if (userRes.rows.length === 0) {
       return res.status(404).json({ error: "المستخدم غير موجود" });
@@ -349,7 +394,7 @@ const changePassword = async (req, res) => {
 
     const isMatch = await bcrypt.compare(
       current_password,
-      userRes.rows[0].password
+      userRes.rows[0].password,
     );
     if (!isMatch) {
       return res.status(400).json({ error: "كلمة المرور الحالية غير صحيحة" });
@@ -365,7 +410,7 @@ const changePassword = async (req, res) => {
            token_version = COALESCE(token_version, 1) + 1, 
            updated_at = CURRENT_TIMESTAMP 
        WHERE id = $2`,
-      [hashedPassword, userId]
+      [hashedPassword, userId],
     );
 
     try {
@@ -393,6 +438,31 @@ const changePassword = async (req, res) => {
   }
 };
 
+// جلب بيانات الجلسة الحالية والاشتراك
+const getMe = async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT users.id, users.name, users.email, users.role, users.clinic_id,
+              clinics.name AS clinic_name, clinics.is_active AS clinic_is_active,
+              clinics.subscription_ends_at
+       FROM users
+       LEFT JOIN clinics ON users.clinic_id = clinics.id
+       WHERE users.id = $1`,
+      [req.user.id],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "المستخدم غير موجود" });
+    }
+
+    res.status(200).json({ user: result.rows[0] });
+  } catch (error) {
+    captureError(error, req);
+    console.error("Error in getMe:", error.message);
+    res.status(500).json({ error: "خطأ في السيرفر" });
+  }
+};
+
 module.exports = {
   registerUser,
   loginUser,
@@ -400,4 +470,5 @@ module.exports = {
   getDoctors,
   updateProfile,
   changePassword,
+  getMe,
 };

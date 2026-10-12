@@ -2,8 +2,6 @@ const pool = require("../db");
 const { isValidUuid } = require("../middleware/validateUuid");
 const { captureError } = require("../utils/errorTracker");
 
-
-
 const cairoLocalTimeToDate = (dateStr, timeStr) => {
   const [year, month, day] = dateStr.split("-").map(Number);
   const [hour, minute] = timeStr.split(":").map(Number);
@@ -37,7 +35,7 @@ const cairoLocalTimeToDate = (dateStr, timeStr) => {
       Number(values.day),
       Number(values.hour),
       Number(values.minute),
-      Number(values.second)
+      Number(values.second),
     );
 
     const offsetMs = cairoAsUtcMs - utcMs;
@@ -57,13 +55,22 @@ const getDoctorSchedule = async (req, res) => {
   }
 
   try {
+    // 🔒 التأكد من أن الطبيب تابع لنفس العيادة
+    const docCheck = await pool.query(
+      "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor';",
+      [doctorId, clinic_id],
+    );
+    if (docCheck.rows.length === 0) {
+      return res.status(404).json({ error: "الطبيب غير موجود في هذه العيادة" });
+    }
+
     // جلب الشفتات الأسبوعية
     const shiftsRes = await pool.query(
       `SELECT id, day_of_week, start_time, end_time, is_active
        FROM doctor_availability
        WHERE clinic_id = $1 AND doctor_id = $2
        ORDER BY day_of_week ASC, start_time ASC;`,
-      [clinic_id, doctorId]
+      [clinic_id, doctorId],
     );
 
     // جلب الإجازات القادمة (من بداية اليوم الحالي)
@@ -72,7 +79,7 @@ const getDoctorSchedule = async (req, res) => {
        FROM doctor_leaves
        WHERE clinic_id = $1 AND doctor_id = $2 AND leave_date >= CURRENT_DATE
        ORDER BY leave_date ASC;`,
-      [clinic_id, doctorId]
+      [clinic_id, doctorId],
     );
 
     res.status(200).json({
@@ -90,7 +97,7 @@ const getDoctorSchedule = async (req, res) => {
 const setDoctorShifts = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const { doctorId } = req.params;
-  const { shifts } = req.body; // مصفوفة من { day_of_week, start_time, end_time }
+  const { shifts } = req.body || {}; // مصفوفة من { day_of_week, start_time, end_time }
 
   if (!isValidUuid(doctorId)) {
     return res.status(400).json({ error: "معرّف الطبيب غير صالح" });
@@ -100,7 +107,7 @@ const setDoctorShifts = async (req, res) => {
     return res.status(400).json({ error: "يجب إرسال مصفوفة الشفتات" });
   }
 
-  const targetDoctorId = req.params.doctorId || req.body.doctor_id;
+  const targetDoctorId = req.params.doctorId || req.body?.doctor_id;
 
   // لو المستخدم دكتور، نمنعه يعدل لأي دكتور تاني غير نفسه
   if (req.user.role === "Doctor" && req.user.id !== targetDoctorId) {
@@ -109,7 +116,16 @@ const setDoctorShifts = async (req, res) => {
     });
   }
 
-  // التحقق من صحة مدخلات الشفتات
+  // صيغة الوقت المقبولة (سواء 9:00 أو 09:00)
+  const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
+
+  // دالة مساعدة لتحويل الوقت إلى دقائق لضمان المقارنة الرياضية الدقيقة
+  const toMinutes = (timeStr) => {
+    const [h, m] = (timeStr || "").split(":").map(Number);
+    return (h || 0) * 60 + (m || 0);
+  };
+
+  // التحقق من صحة مدخلات الشفتات رياضياً
   for (const s of shifts) {
     const day = Number(s.day_of_week);
     if (!Number.isInteger(day) || day < 0 || day > 6) {
@@ -117,21 +133,37 @@ const setDoctorShifts = async (req, res) => {
         .status(400)
         .json({ error: "يوم الأسبوع يجب أن يكون بين 0 و 6" });
     }
-    if (!s.start_time || !s.end_time || s.start_time >= s.end_time) {
+
+    if (
+      !s.start_time ||
+      !s.end_time ||
+      !timeRegex.test(s.start_time) ||
+      !timeRegex.test(s.end_time)
+    ) {
       return res.status(400).json({
-        error: "وقت بداية الشفت يجب أن يكون قبل وقت النهاية",
+        error: "صيغة وقت الشفت غير صالحة، يجب أن تكون HH:MM",
+      });
+    }
+
+    const startMinutes = toMinutes(s.start_time);
+    const endMinutes = toMinutes(s.end_time);
+
+    if (startMinutes >= endMinutes) {
+      return res.status(400).json({
+        error: `وقت بداية الشفت (${s.start_time}) يجب أن يكون قبل وقت النهاية (${s.end_time})`,
       });
     }
   }
 
-  const client = await pool.connect();
+  let client;
   try {
+    client = await pool.connect();
     await client.query("BEGIN");
 
-    // التأكد من أن الطبيب تابع لنفس العيادة
+    // 🔒 التأكد من أن الطبيب تابع لنفس العيادة
     const docCheck = await client.query(
       "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor';",
-      [doctorId, clinic_id]
+      [doctorId, clinic_id],
     );
     if (docCheck.rows.length === 0) {
       await client.query("ROLLBACK");
@@ -141,7 +173,7 @@ const setDoctorShifts = async (req, res) => {
     // حذف الشفتات القديمة للطبيب
     await client.query(
       "DELETE FROM doctor_availability WHERE clinic_id = $1 AND doctor_id = $2;",
-      [clinic_id, doctorId]
+      [clinic_id, doctorId],
     );
 
     // إدخال الشفتات الجديدة
@@ -162,12 +194,12 @@ const setDoctorShifts = async (req, res) => {
     await client.query("COMMIT");
     res.status(200).json({ message: "تم حفظ جدول شفتات الطبيب بنجاح" });
   } catch (error) {
+    if (client) await client.query("ROLLBACK");
     captureError(error, req);
-    await client.query("ROLLBACK");
     console.error("Error setting doctor shifts:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء حفظ شفتات الطبيب" });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 };
 
@@ -175,7 +207,7 @@ const setDoctorShifts = async (req, res) => {
 const addDoctorLeave = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const { doctorId } = req.params;
-  const { leave_date, notes } = req.body;
+  const { leave_date, notes } = req.body || {};
 
   if (!isValidUuid(doctorId)) {
     return res.status(400).json({ error: "معرّف الطبيب غير صالح" });
@@ -187,7 +219,7 @@ const addDoctorLeave = async (req, res) => {
       .json({ error: "صيغة تاريخ الإجازة يجب أن تكون YYYY-MM-DD" });
   }
 
-  const targetDoctorId = req.params.doctorId || req.body.doctor_id;
+  const targetDoctorId = req.params.doctorId || req.body?.doctor_id;
 
   // لو المستخدم دكتور، نمنعه يعدل لأي دكتور تاني غير نفسه
   if (req.user.role === "Doctor" && req.user.id !== targetDoctorId) {
@@ -197,11 +229,20 @@ const addDoctorLeave = async (req, res) => {
   }
 
   try {
+    // 🔒 إحكام عزل العيادات: التأكد من وجود الطبيب في نفس العيادة
+    const docCheck = await pool.query(
+      "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor';",
+      [doctorId, clinic_id],
+    );
+    if (docCheck.rows.length === 0) {
+      return res.status(404).json({ error: "الطبيب غير موجود في هذه العيادة" });
+    }
+
     const result = await pool.query(
       `INSERT INTO doctor_leaves (clinic_id, doctor_id, leave_date, notes)
        VALUES ($1, $2, $3, $4)
        RETURNING id, TO_CHAR(leave_date, 'YYYY-MM-DD') AS leave_date, notes;`,
-      [clinic_id, doctorId, leave_date, notes?.trim() || null]
+      [clinic_id, doctorId, leave_date, notes?.trim() || null],
     );
     res.status(201).json({
       message: "تم تسجيل إجازة الطبيب بنجاح",
@@ -228,7 +269,7 @@ const deleteDoctorLeave = async (req, res) => {
     return res.status(400).json({ error: "معرّف غير صالح" });
   }
 
-  const targetDoctorId = req.params.doctorId || req.body.doctor_id;
+  const targetDoctorId = req.params.doctorId || req.body?.doctor_id;
 
   // لو المستخدم دكتور، نمنعه يعدل لأي دكتور تاني غير نفسه
   if (req.user.role === "Doctor" && req.user.id !== targetDoctorId) {
@@ -240,7 +281,7 @@ const deleteDoctorLeave = async (req, res) => {
   try {
     const result = await pool.query(
       "DELETE FROM doctor_leaves WHERE id = $1 AND doctor_id = $2 AND clinic_id = $3 RETURNING id;",
-      [leaveId, doctorId, clinic_id]
+      [leaveId, doctorId, clinic_id],
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "الإجازة غير موجودة" });
@@ -270,10 +311,21 @@ const getAvailableSlots = async (req, res) => {
   }
 
   try {
+    // 🔒 التأكد من أن الطبيب يتبع نفس العيادة ونشط
+    const docCheck = await pool.query(
+      "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor' AND is_active = TRUE;",
+      [doctorId, clinic_id],
+    );
+    if (docCheck.rows.length === 0) {
+      return res
+        .status(404)
+        .json({ error: "الطبيب غير متاح أو لا ينتمي لهذه العيادة" });
+    }
+
     // أ) التحقق هل الطبيب في إجازة في هذا التاريخ؟
     const leaveCheck = await pool.query(
       "SELECT id, notes FROM doctor_leaves WHERE clinic_id = $1 AND doctor_id = $2 AND leave_date = $3::date;",
-      [clinic_id, doctorId, date]
+      [clinic_id, doctorId, date],
     );
     if (leaveCheck.rows.length > 0) {
       return res.status(200).json({
@@ -293,7 +345,7 @@ const getAvailableSlots = async (req, res) => {
        FROM doctor_availability
        WHERE clinic_id = $1 AND doctor_id = $2 AND day_of_week = $3 AND is_active = TRUE
        ORDER BY start_time ASC;`,
-      [clinic_id, doctorId, dayOfWeek]
+      [clinic_id, doctorId, dayOfWeek],
     );
 
     if (shiftsRes.rows.length === 0) {
@@ -309,14 +361,14 @@ const getAvailableSlots = async (req, res) => {
     if (procedure_code_id && isValidUuid(procedure_code_id)) {
       const procRes = await pool.query(
         "SELECT duration_minutes FROM procedure_codes WHERE id = $1 AND clinic_id = $2 AND is_active = TRUE;",
-        [procedure_code_id, clinic_id]
+        [procedure_code_id, clinic_id],
       );
       if (procRes.rows[0]?.duration_minutes) {
         slotDuration = Number(procRes.rows[0].duration_minutes);
       } else {
         const clinicRes = await pool.query(
           "SELECT default_appointment_duration FROM clinics WHERE id = $1;",
-          [clinic_id]
+          [clinic_id],
         );
         slotDuration =
           Number(clinicRes.rows[0]?.default_appointment_duration) || 30;
@@ -324,7 +376,7 @@ const getAvailableSlots = async (req, res) => {
     } else {
       const clinicRes = await pool.query(
         "SELECT default_appointment_duration FROM clinics WHERE id = $1;",
-        [clinic_id]
+        [clinic_id],
       );
       slotDuration =
         Number(clinicRes.rows[0]?.default_appointment_duration) || 30;
@@ -341,7 +393,7 @@ const getAvailableSlots = async (req, res) => {
          AND doctor_id = $2 
          AND status <> 'cancelled'
          AND DATE(appointment_date AT TIME ZONE 'Africa/Cairo') = $3::date;`,
-      [clinic_id, doctorId, date]
+      [clinic_id, doctorId, date],
     );
 
     const bookedIntervals = apptsRes.rows.map((row) => ({
@@ -354,7 +406,6 @@ const getAvailableSlots = async (req, res) => {
     const availableSlots = [];
 
     for (const shift of shiftsRes.rows) {
-      // تحويل start_time و end_time إلى تواريخ كاملة بتوقيت القاهرة
       const [startHour, startMin] = shift.start_time.split(":").map(Number);
       const [endHour, endMin] = shift.end_time.split(":").map(Number);
 
@@ -362,13 +413,13 @@ const getAvailableSlots = async (req, res) => {
         date,
         `${String(startHour).padStart(2, "0")}:${String(startMin).padStart(
           2,
-          "0"
-        )}`
+          "0",
+        )}`,
       ).getTime();
 
       const shiftEndTime = cairoLocalTimeToDate(
         date,
-        `${String(endHour).padStart(2, "0")}:${String(endMin).padStart(2, "0")}`
+        `${String(endHour).padStart(2, "0")}:${String(endMin).padStart(2, "0")}`,
       ).getTime();
 
       const slotDurationMs = slotDuration * 60 * 1000;
@@ -382,7 +433,7 @@ const getAvailableSlots = async (req, res) => {
 
         // 2. فحص التداخل مع أي موعد محجوز
         const hasOverlap = bookedIntervals.some(
-          (b) => slotStart < b.end && slotEnd > b.start
+          (b) => slotStart < b.end && slotEnd > b.start,
         );
 
         if (!isPast && !hasOverlap) {
@@ -400,7 +451,6 @@ const getAvailableSlots = async (req, res) => {
           });
         }
 
-        // الانتقال للـ Slot التالي
         currentSlotTime += slotDurationMs;
       }
     }

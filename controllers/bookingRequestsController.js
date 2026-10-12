@@ -83,6 +83,7 @@ const approveBookingRequest = async (req, res) => {
   if (!isValidUuid(id)) {
     return res.status(400).json({ error: "معرّف الطلب غير صالح" });
   }
+
   let client;
   try {
     client = await pool.connect();
@@ -182,19 +183,33 @@ const approveBookingRequest = async (req, res) => {
 
     // 🔒 5. فحص المريض (مع إعادة تنشيطه إذا كان مؤرشفاً)
     let patientId;
+    let nameMismatchNote = "";
+
     const patientCheck = await client.query(
-      "SELECT id, is_active FROM patients WHERE clinic_id = $1 AND phone_number = $2;",
+      "SELECT id, name, is_active FROM patients WHERE clinic_id = $1 AND phone_number = $2;",
       [clinic_id, booking.patient_phone],
     );
 
     if (patientCheck.rows.length > 0) {
-      patientId = patientCheck.rows[0].id;
+      const existingPatient = patientCheck.rows[0];
+      patientId = existingPatient.id;
+
       // لو المريض كان مؤرشف، نرجعه نشط تلقائياً
-      if (!patientCheck.rows[0].is_active) {
+      if (!existingPatient.is_active) {
         await client.query(
           "UPDATE patients SET is_active = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $1;",
           [patientId],
         );
+      }
+
+      // توثيق لو اسم طالب الحجز مختلف عن الاسم المسجل لنفس رقم الهاتف (مثال: حجز عائلي)
+      if (
+        booking.patient_name &&
+        existingPatient.name &&
+        booking.patient_name.trim().toLowerCase() !==
+          existingPatient.name.trim().toLowerCase()
+      ) {
+        nameMismatchNote = ` [طالب الحجز: ${booking.patient_name.trim()} (الرقم مسجل باسم: ${existingPatient.name})]`;
       }
     } else {
       // تسجيل مريض جديد تلقائياً
@@ -208,6 +223,8 @@ const approveBookingRequest = async (req, res) => {
     }
 
     // 6. إنشاء الموعد الرسمي
+    const appointmentNote = `حجز مؤكد من الموقع العام: ${booking.notes || "لا توجد ملاحظات"}${nameMismatchNote}`;
+
     const apptRes = await client.query(
       `INSERT INTO appointments (
         clinic_id, patient_id, doctor_id, appointment_date, 
@@ -221,7 +238,7 @@ const approveBookingRequest = async (req, res) => {
         booking.doctor_id,
         booking.requested_date,
         booking.duration_minutes,
-        `حجز مؤكد من الموقع العام: ${booking.notes || "لا توجد ملاحظات"}`,
+        appointmentNote,
       ],
     );
 
@@ -265,9 +282,13 @@ const approveBookingRequest = async (req, res) => {
     console.error("Error approving booking request:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء تأكيد طلب الحجز" });
   } finally {
-    client.release();
+    // ✅ الحماية من الكراش عند فشل pool.connect()
+    if (client) {
+      client.release();
+    }
   }
 };
+
 // 3. رفض طلب الحجز
 const rejectBookingRequest = async (req, res) => {
   const clinic_id = req.user.clinic_id;
@@ -291,6 +312,7 @@ const rejectBookingRequest = async (req, res) => {
         .status(404)
         .json({ error: "الطلب غير موجود أو تمت معالجته بالفعل" });
     }
+
     try {
       await logActivity({
         clinic_id,

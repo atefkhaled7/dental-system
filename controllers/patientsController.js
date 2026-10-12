@@ -2,6 +2,7 @@ const pool = require("../db");
 const { logActivity } = require("../utils/auditLogger");
 const { normalizeEgyptianPhone } = require("../utils/phoneNormalizer");
 const { captureError } = require("../utils/errorTracker");
+const { isValidUuid } = require("../middleware/validateUuid");
 
 const normalizeAndValidatePhone = (phone_number) => {
   if (!phone_number || typeof phone_number !== "string") {
@@ -48,7 +49,6 @@ const parseEgyptianDate = (rawDate) => {
     const month = parseInt(dmyMatch[2], 10);
     const year = parseInt(dmyMatch[3], 10);
 
-    // لو القيم منطقية نكمل، لو لأ مش هنعمل return "INVALID" هنسيبها تنزل للـ Fallback
     if (
       month >= 1 &&
       month <= 12 &&
@@ -96,7 +96,6 @@ const parseEgyptianDate = (rawDate) => {
   const d = new Date(cleaned);
   if (isNaN(d.getTime())) return "INVALID";
 
-  // استخراج اليوم والشهر والسنة بالـ Local عشان نتجنب فرق توقيت مصر في الـ toISOString
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const fallbackDay = String(d.getDate()).padStart(2, "0");
@@ -114,7 +113,7 @@ const validatePatientInput = ({ name, gender, date_of_birth }) => {
     return "اسم المريض مطلوب ويجب أن يحتوي على حرفين على الأقل";
   }
 
-  // النوع (دعم الأحرف الصغيرة والكبيرة)
+  // النوع
   if (gender) {
     if (typeof gender !== "string") {
       return "النوع يجب أن يكون Male أو Female";
@@ -154,9 +153,8 @@ const addPatient = async (req, res) => {
   try {
     const clinic_id = req.user.clinic_id;
     const { name, phone_number, gender, date_of_birth, medical_alerts } =
-      req.body;
+      req.body || {};
 
-    // التحقق من رقم الهاتف وتوحيد صيغته
     const normalizedPhone = normalizeAndValidatePhone(phone_number);
 
     if (!normalizedPhone) {
@@ -165,7 +163,6 @@ const addPatient = async (req, res) => {
       });
     }
 
-    // التحقق من باقي المدخلات
     const validationError = validatePatientInput({
       name,
       gender,
@@ -181,7 +178,6 @@ const addPatient = async (req, res) => {
         ? date_of_birth
         : null;
 
-    // توحيد صيغة النوع إلى Male / Female
     let normalizedGender = null;
     if (gender) {
       normalizedGender =
@@ -245,18 +241,15 @@ const addPatient = async (req, res) => {
 };
 
 // 2. جلب قائمة المرضى مع الـ Pagination والبحث
-// 2. جلب قائمة المرضى مع الـ Pagination والبحث
 const getPatients = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
     const { search, archived, page, limit } = req.query;
 
-    // 1. حساب الـ Pagination
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
     const offset = (pageNum - 1) * limitNum;
 
-    // 2. تحديد حالة الأرشفة (الافتراضي: المرضى النشطين فقط)
     const isActive = archived === "true" ? false : true;
 
     let query = `
@@ -279,14 +272,12 @@ const getPatients = async (req, res) => {
     const params = [clinicId, isActive];
     let paramCounter = 3;
 
-    // 3. فلترة البحث (الاسم أو رقم الهاتف)
     if (search && search.trim() !== "") {
       query += ` AND (name ILIKE $${paramCounter} OR phone_number ILIKE $${paramCounter})`;
       params.push(`%${search.trim()}%`);
       paramCounter++;
     }
 
-    // 4. الترتيب والتقسيم
     query += ` ORDER BY created_at DESC LIMIT $${paramCounter} OFFSET $${
       paramCounter + 1
     };`;
@@ -294,11 +285,9 @@ const getPatients = async (req, res) => {
 
     const result = await pool.query(query, params);
 
-    // استخراج العدد الإجمالي من أول صف (إن وُجد)
     const total =
       result.rows.length > 0 ? Number(result.rows[0].full_count) : 0;
 
-    // إزالة full_count من بيانات المرضى لتبقى نظيفة
     const patients = result.rows.map(({ full_count, ...patient }) => patient);
     const totalPages = Math.ceil(total / limitNum) || 1;
     res.status(200).json({
@@ -323,6 +312,10 @@ const getPatientById = async (req, res) => {
     const clinicId = req.user.clinic_id;
     const patientId = req.params.id;
 
+    if (!isValidUuid(patientId)) {
+      return res.status(400).json({ error: "معرّف المريض غير صالح" });
+    }
+
     const result = await pool.query(
       "SELECT * FROM patients WHERE id = $1 AND clinic_id = $2",
       [patientId, clinicId],
@@ -346,10 +339,13 @@ const updatePatient = async (req, res) => {
     const clinicId = req.user.clinic_id;
     const patientId = req.params.id;
 
-    const { name, phone_number, gender, medical_alerts, date_of_birth } =
-      req.body;
+    if (!isValidUuid(patientId)) {
+      return res.status(400).json({ error: "معرّف المريض غير صالح" });
+    }
 
-    // توحيد والتحقق من رقم الهاتف
+    const { name, phone_number, gender, medical_alerts, date_of_birth } =
+      req.body || {};
+
     const normalizedPhone = normalizeAndValidatePhone(phone_number);
 
     if (!normalizedPhone) {
@@ -358,7 +354,6 @@ const updatePatient = async (req, res) => {
       });
     }
 
-    // التحقق من باقي المدخلات
     const validationError = validatePatientInput({
       name,
       gender,
@@ -449,7 +444,10 @@ const deletePatient = async (req, res) => {
     const patientId = req.params.id;
     const userRole = req.user.role;
 
-    // حماية: منع موظف الاستقبال من الأرشفة
+    if (!isValidUuid(patientId)) {
+      return res.status(400).json({ error: "معرّف المريض غير صالح" });
+    }
+
     if (userRole !== "ClinicAdmin") {
       return res
         .status(403)
@@ -488,10 +486,15 @@ const deletePatient = async (req, res) => {
   }
 };
 
+// 6. استعادة مريض من الأرشيف
 const restorePatient = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
     const patientId = req.params.id;
+
+    if (!isValidUuid(patientId)) {
+      return res.status(400).json({ error: "معرّف المريض غير صالح" });
+    }
 
     const result = await pool.query(
       "UPDATE patients SET is_active = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND clinic_id = $2 AND is_active = FALSE RETURNING id, name",
@@ -527,7 +530,7 @@ const restorePatient = async (req, res) => {
 };
 
 // ==========================================
-// 7. تصدير قائمة المرضى لملف Excel / CSV (معالجة التواريخ بدقة)
+// 7. تصدير قائمة المرضى لملف Excel / CSV
 // ==========================================
 const exportPatients = async (req, res) => {
   try {
@@ -618,48 +621,70 @@ const exportPatients = async (req, res) => {
     });
   }
 };
+
 // ==========================================
-// 8. استيراد المرضى من ملف CSV مع فحص البيانات والتكرارات
-// ClinicAdmin فقط
+// 8. محلل CSV القياسي المتوافق مع RFC 4180 (يدعم النصوص متعددة الأسطر داخل علامات التنصيص)
 // ==========================================
 const parseCsvBuffer = (buffer) => {
-  // إزالة UTF-8 BOM إن وُجد
   let text = buffer.toString("utf-8");
+  // إزالة UTF-8 BOM إن وُجد
   if (text.charCodeAt(0) === 0xfeff) {
     text = text.slice(1);
   }
 
-  const lines = text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean);
+  // اكتشاف الفاصلة (فاصلة عادية , أو منقوطة ;) من أول سطر
+  const firstLineEnd = text.search(/\r?\n/);
+  const sampleHeader = firstLineEnd !== -1 ? text.slice(0, firstLineEnd) : text;
+  const delimiter =
+    sampleHeader.includes(";") && !sampleHeader.includes(",") ? ";" : ",";
 
-  if (lines.length < 2) {
+  // تجزئة الـ CSV كـ State Machine لاحترام الأسطر الجديدة داخل علامات التنصيص
+  const rowsRaw = [];
+  let currentRow = [];
+  let currentField = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    const nextChar = text[i + 1];
+
+    if (char === '"') {
+      if (inQuotes && nextChar === '"') {
+        currentField += '"';
+        i++; // تجاوز علامة التنصيص المهربة ""
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === delimiter && !inQuotes) {
+      currentRow.push(currentField.trim());
+      currentField = "";
+    } else if ((char === "\r" || char === "\n") && !inQuotes) {
+      if (char === "\r" && nextChar === "\n") {
+        i++;
+      }
+      currentRow.push(currentField.trim());
+      if (currentRow.some((val) => val.length > 0)) {
+        rowsRaw.push(currentRow);
+      }
+      currentRow = [];
+      currentField = "";
+    } else {
+      currentField += char;
+    }
+  }
+
+  if (currentField.length > 0 || currentRow.length > 0) {
+    currentRow.push(currentField.trim());
+    if (currentRow.some((val) => val.length > 0)) {
+      rowsRaw.push(currentRow);
+    }
+  }
+
+  if (rowsRaw.length < 2) {
     return { error: "الملف فارغ أو لا يحتوي على صفوف بيانات" };
   }
 
-  // اكتشاف الفاصلة (فاصلة عادية , أو منقوطة ;)
-  const delimiter =
-    lines[0].includes(";") && !lines[0].includes(",") ? ";" : ",";
-
-  // دالة تقسيم السطر مع احترام علامات التنصيص
-  const splitLine = (line) => {
-    const regex = new RegExp(
-      `(?:^|${delimiter})(?:"([^"]*(?:""[^"]*)*)"|([^"${delimiter}]*))`,
-      "g",
-    );
-    const values = [];
-    let match;
-    while ((match = regex.exec(line)) !== null) {
-      if (match.index === regex.lastIndex) regex.lastIndex++;
-      const val =
-        match[1] !== undefined ? match[1].replace(/""/g, '"') : match[2];
-      values.push(val ? val.trim() : "");
-    }
-    return values;
-  };
-
-  const rawHeaders = splitLine(lines[0]).map((h) => h.toLowerCase().trim());
+  const rawHeaders = rowsRaw[0].map((h) => h.toLowerCase().trim());
 
   // توحيد مسميات الأعمدة عربي وإنجليزي
   const headerMap = {};
@@ -699,12 +724,12 @@ const parseCsvBuffer = (buffer) => {
   }
 
   const rows = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cols = splitLine(lines[i]);
-    if (cols.length === 0 || cols.every((c) => !c)) continue; // تخطي السطور الفارغة
+  for (let i = 1; i < rowsRaw.length; i++) {
+    const cols = rowsRaw[i];
+    if (cols.length === 0 || cols.every((c) => !c)) continue;
 
     rows.push({
-      rowNumber: i + 1, // رقم الصف الحقيقي في الملف
+      rowNumber: i + 1,
       name: cols[headerMap.name] || "",
       phone: cols[headerMap.phone] || "",
       gender: headerMap.gender !== undefined ? cols[headerMap.gender] : "",
@@ -733,192 +758,215 @@ const importPatientsFromCsv = async (req, res) => {
   const errors = [];
   const seenPhonesInFile = new Set();
 
-  // جلب كل أرقام الهواتف الحالية في العيادة لتفادي التكرار بسرعة
-  const existingPhonesRes = await pool.query(
-    "SELECT phone_number FROM patients WHERE clinic_id = $1;",
-    [clinic_id],
-  );
-  const existingPhones = new Set(
-    existingPhonesRes.rows.map((r) => r.phone_number),
-  );
+  try {
+    // جلب كل أرقام الهواتف الحالية في العيادة لتفادي التكرار بسرعة
+    const existingPhonesRes = await pool.query(
+      "SELECT phone_number FROM patients WHERE clinic_id = $1;",
+      [clinic_id],
+    );
+    const existingPhones = new Set(
+      existingPhonesRes.rows.map((r) => r.phone_number),
+    );
 
-  for (const row of rows) {
-    // 1. فحص الاسم
-    const cleanName = (row.name || "").trim();
-    if (cleanName.length < 2) {
-      errors.push({
-        row: row.rowNumber,
-        name: cleanName || "غير محدد",
-        phone: row.phone,
-        reason: "اسم المريض يجب أن يكون حرفين على الأقل",
-      });
-      continue;
-    }
-
-    // 2. تطبيع وفحص رقم الهاتف
-    const normalizedPhone = normalizeEgyptianPhone(row.phone);
-    if (!normalizedPhone) {
-      errors.push({
-        row: row.rowNumber,
-        name: cleanName,
-        phone: row.phone,
-        reason: "رقم هاتف مصري غير صحيح",
-      });
-      continue;
-    }
-
-    // 3. فحص التكرار داخل نفس الملف
-    if (seenPhonesInFile.has(normalizedPhone)) {
-      errors.push({
-        row: row.rowNumber,
-        name: cleanName,
-        phone: row.phone,
-        reason: "رقم الهاتف مكرر داخل نفس الملف المرفوع",
-      });
-      continue;
-    }
-
-    // 4. فحص التكرار مع قاعدة البيانات
-    if (existingPhones.has(normalizedPhone)) {
-      errors.push({
-        row: row.rowNumber,
-        name: cleanName,
-        phone: row.phone,
-        reason: "رقم الهاتف مسجل بالفعل في العيادة مسبقاً",
-      });
-      continue;
-    }
-
-    // 5. فحص وتوحيد النوع (مع تجاهل الشرطات والخانة الفاضية)
-    let normalizedGender = null;
-    if (row.gender && row.gender.trim() !== "") {
-      const g = row.gender.trim().toLowerCase();
-
-      if (["-", "--", "غير محدد", "none", "null"].includes(g)) {
-        normalizedGender = null;
-      } else if (["أنثى", "انثى", "female", "f", "ست", "سيدة"].includes(g)) {
-        normalizedGender = "Female";
-      } else if (["ذكر", "male", "m", "رجل"].includes(g)) {
-        normalizedGender = "Male";
-      } else {
+    for (const row of rows) {
+      // 1. فحص الاسم
+      const cleanName = (row.name || "").trim();
+      if (cleanName.length < 2) {
         errors.push({
           row: row.rowNumber,
-          name: cleanName,
+          name: cleanName || "غير محدد",
           phone: row.phone,
-          reason: "نوع المريض غير صحيح، يجب أن يكون ذكر أو أنثى أو تركه فارغاً",
-        });
-        continue;
-      }
-    }
-
-    // 6. فحص تاريخ الميلاد الذكي (دعم الصيغة المصرية DD/MM/YYYY)
-    let validDob = null;
-    if (row.dob && row.dob.trim() !== "") {
-      const parsedDate = parseEgyptianDate(row.dob);
-
-      if (parsedDate === "INVALID") {
-        errors.push({
-          row: row.rowNumber,
-          name: cleanName,
-          phone: row.phone,
-          reason:
-            "تاريخ الميلاد غير صحيح، الصيغة المقبولة: يوم/شهر/سنة (مثال: 15/05/1995)",
-        });
-        continue;
-      } else if (parsedDate === "FUTURE") {
-        errors.push({
-          row: row.rowNumber,
-          name: cleanName,
-          phone: row.phone,
-          reason: "تاريخ الميلاد لا يمكن أن يكون اليوم أو في المستقبل",
+          reason: "اسم المريض يجب أن يكون حرفين على الأقل",
         });
         continue;
       }
 
-      validDob = parsedDate;
-    }
-
-    const alerts = (row.alerts || "").trim();
-
-    const cleanAlerts =
-      !alerts || ["-", "لا يوجد", "لا توجد"].includes(alerts.toLowerCase())
-        ? null
-        : alerts;
-
-    seenPhonesInFile.add(normalizedPhone);
-
-    importedPatients.push({
-      name: cleanName,
-      phone_number: normalizedPhone,
-      gender: normalizedGender,
-      date_of_birth: validDob,
-      medical_alerts: cleanAlerts,
-    });
-  }
-
-  // إدخال المرضى الصالحين في الداتابيز
-  if (importedPatients.length > 0) {
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-
-      const insertQuery = `
-        INSERT INTO patients (clinic_id, name, phone_number, gender, date_of_birth, medical_alerts, is_active)
-        VALUES ($1, $2, $3, $4, $5, $6, TRUE);
-      `;
-
-      for (const p of importedPatients) {
-        await client.query(insertQuery, [
-          clinic_id,
-          p.name,
-          p.phone_number,
-          p.gender,
-          p.date_of_birth,
-          p.medical_alerts,
-        ]);
+      // 2. تطبيع وفحص رقم الهاتف
+      const normalizedPhone = normalizeEgyptianPhone(row.phone);
+      if (!normalizedPhone) {
+        errors.push({
+          row: row.rowNumber,
+          name: cleanName,
+          phone: row.phone,
+          reason: "رقم هاتف مصري غير صحيح",
+        });
+        continue;
       }
 
-      await client.query("COMMIT");
+      // 3. فحص التكرار داخل نفس الملف
+      if (seenPhonesInFile.has(normalizedPhone)) {
+        errors.push({
+          row: row.rowNumber,
+          name: cleanName,
+          phone: row.phone,
+          reason: "رقم الهاتف مكرر داخل نفس الملف المرفوع",
+        });
+        continue;
+      }
 
-      // تسجيل العملية في سجل الرقابة
+      // 4. فحص التكرار مع قاعدة البيانات
+      if (existingPhones.has(normalizedPhone)) {
+        errors.push({
+          row: row.rowNumber,
+          name: cleanName,
+          phone: row.phone,
+          reason: "رقم الهاتف مسجل بالفعل في العيادة مسبقاً",
+        });
+        continue;
+      }
+
+      // 5. فحص وتوحيد النوع
+      let normalizedGender = null;
+      if (row.gender && row.gender.trim() !== "") {
+        const g = row.gender.trim().toLowerCase();
+
+        if (["-", "--", "غير محدد", "none", "null"].includes(g)) {
+          normalizedGender = null;
+        } else if (["أنثى", "انثى", "female", "f", "ست", "سيدة"].includes(g)) {
+          normalizedGender = "Female";
+        } else if (["ذكر", "male", "m", "رجل"].includes(g)) {
+          normalizedGender = "Male";
+        } else {
+          errors.push({
+            row: row.rowNumber,
+            name: cleanName,
+            phone: row.phone,
+            reason:
+              "نوع المريض غير صحيح، يجب أن يكون ذكر أو أنثى أو تركه فارغاً",
+          });
+          continue;
+        }
+      }
+
+      // 6. فحص تاريخ الميلاد الذكي
+      let validDob = null;
+      if (row.dob && row.dob.trim() !== "") {
+        const parsedDate = parseEgyptianDate(row.dob);
+
+        if (parsedDate === "INVALID") {
+          errors.push({
+            row: row.rowNumber,
+            name: cleanName,
+            phone: row.phone,
+            reason:
+              "تاريخ الميلاد غير صحيح، الصيغة المقبولة: يوم/شهر/سنة (مثال: 15/05/1995)",
+          });
+          continue;
+        } else if (parsedDate === "FUTURE") {
+          errors.push({
+            row: row.rowNumber,
+            name: cleanName,
+            phone: row.phone,
+            reason: "تاريخ الميلاد لا يمكن أن يكون اليوم أو في المستقبل",
+          });
+          continue;
+        }
+
+        validDob = parsedDate;
+      }
+
+      const alerts = (row.alerts || "").trim();
+      const cleanAlerts =
+        !alerts || ["-", "لا يوجد", "لا توجد"].includes(alerts.toLowerCase())
+          ? null
+          : alerts;
+
+      seenPhonesInFile.add(normalizedPhone);
+
+      importedPatients.push({
+        name: cleanName,
+        phone_number: normalizedPhone,
+        gender: normalizedGender,
+        date_of_birth: validDob,
+        medical_alerts: cleanAlerts,
+      });
+    }
+
+    // 🚀 7. إدخال المرضى بتقنية الـ Bulk Batch Insert (حزم كل 100 مريض) لتفادي الـ Timeout
+    if (importedPatients.length > 0) {
+      let client;
       try {
-        await logActivity({
-          clinic_id,
-          user_id: req.user.id,
-          action: "IMPORT_PATIENTS",
-          entity_type: "patient",
-          description: `قام ${req.user.name || "المدير"} باستيراد ${
-            importedPatients.length
-          } مريض بنجاح من ملف CSV`,
-          metadata: {
-            imported_count: importedPatients.length,
-            skipped_count: errors.length,
-            total_file_rows: rows.length,
-          },
-        });
-      } catch (auditErr) {
-        console.error("Audit log failed:", auditErr.message);
-      }
-    } catch (dbErr) {
-      await client.query("ROLLBACK");
-      console.error("Error bulk inserting patients:", dbErr.message);
-      return res
-        .status(500)
-        .json({ error: "فشل حفظ المرضى في قاعدة البيانات" });
-    } finally {
-      client.release();
-    }
-  }
+        client = await pool.connect();
+        await client.query("BEGIN");
 
-  return res.status(200).json({
-    message: `تم استيراد ${importedPatients.length} مريض بنجاح`,
-    summary: {
-      total_rows: rows.length,
-      imported_count: importedPatients.length,
-      skipped_count: errors.length,
-    },
-    errors,
-  });
+        const BATCH_SIZE = 100;
+        for (let i = 0; i < importedPatients.length; i += BATCH_SIZE) {
+          const batch = importedPatients.slice(i, i + BATCH_SIZE);
+          const valueClauses = [];
+          const queryParams = [];
+
+          batch.forEach((p, idx) => {
+            const offset = idx * 6;
+            valueClauses.push(
+              `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, TRUE)`,
+            );
+            queryParams.push(
+              clinic_id,
+              p.name,
+              p.phone_number,
+              p.gender,
+              p.date_of_birth,
+              p.medical_alerts,
+            );
+          });
+
+          const batchQuery = `
+            INSERT INTO patients (clinic_id, name, phone_number, gender, date_of_birth, medical_alerts, is_active)
+            VALUES ${valueClauses.join(", ")};
+          `;
+
+          await client.query(batchQuery, queryParams);
+        }
+
+        await client.query("COMMIT");
+
+        // تسجيل العملية في سجل الرقابة
+        try {
+          await logActivity({
+            clinic_id,
+            user_id: req.user.id,
+            action: "IMPORT_PATIENTS",
+            entity_type: "patient",
+            description: `قام ${req.user.name || "المدير"} باستيراد ${
+              importedPatients.length
+            } مريض بنجاح من ملف CSV`,
+            metadata: {
+              imported_count: importedPatients.length,
+              skipped_count: errors.length,
+              total_file_rows: rows.length,
+            },
+          });
+        } catch (auditErr) {
+          console.error("Audit log failed:", auditErr.message);
+        }
+      } catch (dbErr) {
+        if (client) await client.query("ROLLBACK");
+        captureError(dbErr, req);
+        console.error("Error bulk inserting patients:", dbErr.message);
+        return res
+          .status(500)
+          .json({ error: "فشل حفظ المرضى في قاعدة البيانات" });
+      } finally {
+        if (client) client.release();
+      }
+    }
+
+    return res.status(200).json({
+      message: `تم استيراد ${importedPatients.length} مريض بنجاح`,
+      summary: {
+        total_rows: rows.length,
+        imported_count: importedPatients.length,
+        skipped_count: errors.length,
+      },
+      errors,
+    });
+  } catch (error) {
+    captureError(error, req);
+    console.error("Unexpected error in importPatientsFromCsv:", error.message);
+    return res
+      .status(500)
+      .json({ error: "حدث خطأ غير متوقع أثناء استيراد الملف" });
+  }
 };
 
 module.exports = {

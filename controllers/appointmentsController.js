@@ -3,9 +3,17 @@ const { logActivity } = require("../utils/auditLogger");
 const { normalizeEgyptianPhone } = require("../utils/phoneNormalizer");
 const { isValidUuid } = require("../middleware/validateUuid");
 const { captureError } = require("../utils/errorTracker");
-// ==========================================
-// 1. جلب المواعيد مع الفلاتر (بتوقيت Africa/Cairo)
-// ==========================================
+
+// دوال مساعدة لتطبيع الأسماء العربية للمقارنة العادلة
+const normalizeArabicName = (n) =>
+  (n || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[أإآ]/g, "ا")
+    .replace(/ة/g, "ه")
+    .replace(/ى/g, "ي")
+    .replace(/\s+/g, " ");
+
 // ==========================================
 // 1. جلب المواعيد مع الفلاتر والـ Pagination (بتوقيت Africa/Cairo)
 // ==========================================
@@ -141,6 +149,10 @@ const getAppointmentById = async (req, res) => {
     const { clinic_id } = req.user;
     const { id } = req.params;
 
+    if (!isValidUuid(id)) {
+      return res.status(400).json({ error: "معرّف الموعد غير صالح" });
+    }
+
     const result = await pool.query(
       `
       SELECT 
@@ -164,7 +176,7 @@ const getAppointmentById = async (req, res) => {
       JOIN users u ON a.doctor_id = u.id AND a.clinic_id = u.clinic_id
       WHERE a.id = $1 AND a.clinic_id = $2;
       `,
-      [id, clinic_id]
+      [id, clinic_id],
     );
 
     if (result.rows.length === 0) {
@@ -231,8 +243,9 @@ const createAppointment = async (req, res) => {
     });
   }
 
-  const client = await pool.connect();
+  let client;
   try {
+    client = await pool.connect();
     const { clinic_id } = req.user;
 
     await client.query("BEGIN");
@@ -240,7 +253,7 @@ const createAppointment = async (req, res) => {
     // 2. قفل صف الطبيب النشط (is_active = TRUE) لحل مشكلة التزامن (Concurrency)
     const doctorLock = await client.query(
       `SELECT id, name FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor' AND is_active = TRUE FOR UPDATE`,
-      [doctor_id, clinic_id]
+      [doctor_id, clinic_id],
     );
 
     if (doctorLock.rows.length === 0) {
@@ -251,7 +264,7 @@ const createAppointment = async (req, res) => {
       });
     }
 
-    // 3. التحقق من مدة الكشف (من 5 إلى 240 دقيقة) أو القيمة الافتراضية
+    // 3. التحقق من مدة الكشف (من 5 إلى 480 دقيقة) أو القيمة الافتراضية
     let appointmentDuration;
     if (
       duration_minutes !== undefined &&
@@ -262,26 +275,26 @@ const createAppointment = async (req, res) => {
       if (
         !Number.isInteger(parsedDuration) ||
         parsedDuration < 5 ||
-        parsedDuration > 240
+        parsedDuration > 480
       ) {
         await client.query("ROLLBACK");
         return res.status(400).json({
-          error: "مدة الكشف يجب أن تكون رقماً صحيحاً بين 5 و 240 دقيقة",
+          error: "مدة الكشف يجب أن تكون رقماً صحيحاً بين 5 و 480 دقيقة",
         });
       }
       appointmentDuration = parsedDuration;
     } else {
       const clinicRes = await client.query(
         "SELECT default_appointment_duration FROM clinics WHERE id = $1",
-        [clinic_id]
+        [clinic_id],
       );
       const storedDuration = Number(
-        clinicRes.rows[0]?.default_appointment_duration
+        clinicRes.rows[0]?.default_appointment_duration,
       );
       appointmentDuration =
         Number.isInteger(storedDuration) &&
         storedDuration >= 5 &&
-        storedDuration <= 240
+        storedDuration <= 480
           ? storedDuration
           : 30;
     }
@@ -343,7 +356,7 @@ const createAppointment = async (req, res) => {
       // فحص وجود مريض مسجل بنفس الرقم
       const existingPatientCheck = await client.query(
         "SELECT id, name, is_active FROM patients WHERE clinic_id = $1 AND phone_number = $2",
-        [clinic_id, cleanPhone]
+        [clinic_id, cleanPhone],
       );
 
       if (existingPatientCheck.rows.length > 0) {
@@ -353,6 +366,17 @@ const createAppointment = async (req, res) => {
           await client.query("ROLLBACK");
           return res.status(400).json({
             error: `رقم الهاتف مسجل للمريض (${foundPatient.name}) وهو مؤرشف حالياً. يرجى إلغاء أرشفة المريض أولاً من قائمة المرضى.`,
+          });
+        }
+
+        // 🔒 حماية السجلات الطبية: التحقق من تطابق الاسم لتفادي تسجيل الموعد لمريض آخر بسبب تشابه الهاتف (مثل أفراد العائلة)
+        const enteredNameNorm = normalizeArabicName(cleanName);
+        const existingNameNorm = normalizeArabicName(foundPatient.name);
+
+        if (enteredNameNorm !== existingNameNorm) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error: `رقم الهاتف (${cleanPhone}) مسجل بالفعل في العيادة باسم مريض آخر (${foundPatient.name}). لمنع تداخل السجلات والملفات الطبية، يرجى اختيار المريض من القائمة أو استخدام رقم هاتف مخصص للمريض الجديد.`,
           });
         }
 
@@ -376,7 +400,7 @@ const createAppointment = async (req, res) => {
             normalizedGender,
             date_of_birth || null,
             cleanMedicalAlerts,
-          ]
+          ],
         );
         finalPatientId = createdPatient.rows[0].id;
       }
@@ -384,7 +408,7 @@ const createAppointment = async (req, res) => {
       // التأكد من أن المريض المختار نشط
       const patientCheck = await client.query(
         "SELECT id, is_active FROM patients WHERE id = $1 AND clinic_id = $2",
-        [finalPatientId, clinic_id]
+        [finalPatientId, clinic_id],
       );
 
       if (patientCheck.rows.length === 0) {
@@ -418,7 +442,7 @@ const createAppointment = async (req, res) => {
         AND (a.appointment_date + (a.duration_minutes * INTERVAL '1 minute')) > $3::timestamptz
       LIMIT 1;
       `,
-      [clinic_id, doctor_id, parsedDateForDB, appointmentDuration]
+      [clinic_id, doctor_id, parsedDateForDB, appointmentDuration],
     );
 
     if (conflictCheck.rows.length > 0) {
@@ -450,7 +474,7 @@ const createAppointment = async (req, res) => {
         parsedDateForDB,
         appointmentDuration,
         cleanNotes,
-      ]
+      ],
     );
 
     await client.query("COMMIT");
@@ -476,7 +500,7 @@ const createAppointment = async (req, res) => {
       appointment: insertResult.rows[0],
     });
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (client) await client.query("ROLLBACK");
     if (error.code === "23505") {
       if (
         error.detail?.includes("phone_number") ||
@@ -495,7 +519,7 @@ const createAppointment = async (req, res) => {
     console.error("Error creating appointment:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء حجز الموعد" });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 };
 
@@ -503,11 +527,15 @@ const createAppointment = async (req, res) => {
 // 4. تحديث حالة الموعد (مع فحص التعارض عند تفعيله إلى scheduled)
 // ==========================================
 const updateAppointmentStatus = async (req, res) => {
-  const client = await pool.connect();
+  let client;
   try {
     const { clinic_id } = req.user;
     const { id } = req.params;
-    const { status } = req.body;
+    const { status } = req.body || {};
+
+    if (!isValidUuid(id)) {
+      return res.status(400).json({ error: "معرّف الموعد غير صالح" });
+    }
 
     const validStatuses = ["scheduled", "completed", "cancelled", "no_show"];
     if (!validStatuses.includes(status)) {
@@ -517,11 +545,12 @@ const updateAppointmentStatus = async (req, res) => {
       });
     }
 
+    client = await pool.connect();
     await client.query("BEGIN");
 
     const appCheck = await client.query(
       `SELECT * FROM appointments WHERE id = $1 AND clinic_id = $2 FOR UPDATE`,
-      [id, clinic_id]
+      [id, clinic_id],
     );
 
     if (appCheck.rows.length === 0) {
@@ -558,7 +587,7 @@ const updateAppointmentStatus = async (req, res) => {
       // قفل صف الطبيب
       const doctorLock = await client.query(
         `SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor' AND is_active = TRUE FOR UPDATE`,
-        [currentApp.doctor_id, clinic_id]
+        [currentApp.doctor_id, clinic_id],
       );
 
       if (doctorLock.rows.length === 0) {
@@ -589,7 +618,7 @@ const updateAppointmentStatus = async (req, res) => {
           id,
           currentApp.appointment_date,
           currentApp.duration_minutes || 30,
-        ]
+        ],
       );
 
       if (conflictCheck.rows.length > 0) {
@@ -609,7 +638,7 @@ const updateAppointmentStatus = async (req, res) => {
       WHERE id = $2 AND clinic_id = $3
       RETURNING *;
       `,
-      [status, id, clinic_id]
+      [status, id, clinic_id],
     );
 
     await client.query("COMMIT");
@@ -640,7 +669,7 @@ const updateAppointmentStatus = async (req, res) => {
       appointment: result.rows[0],
     });
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (client) await client.query("ROLLBACK");
     if (error.code === "23505") {
       return res.status(409).json({
         error: "تعارض: الطبيب لديه كشف آخر مسجل في نفس الفترة",
@@ -650,7 +679,7 @@ const updateAppointmentStatus = async (req, res) => {
     console.error("Error updating appointment status:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء تحديث حالة الموعد" });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 };
 
@@ -658,7 +687,12 @@ const updateAppointmentStatus = async (req, res) => {
 // 5. تعديل موعد الكشف (Reschedule)
 // ==========================================
 const rescheduleAppointment = async (req, res) => {
-  const { appointment_date, duration_minutes } = req.body;
+  const { appointment_date, duration_minutes } = req.body || {};
+  const { id } = req.params;
+
+  if (!isValidUuid(id)) {
+    return res.status(400).json({ error: "معرّف الموعد غير صالح" });
+  }
 
   if (!appointment_date) {
     return res.status(400).json({ error: "تاريخ ووقت الموعد الجديد مطلوب" });
@@ -684,16 +718,16 @@ const rescheduleAppointment = async (req, res) => {
     });
   }
 
-  const client = await pool.connect();
+  let client;
   try {
+    client = await pool.connect();
     const { clinic_id } = req.user;
-    const { id } = req.params;
 
     await client.query("BEGIN");
 
     const currentApp = await client.query(
       `SELECT * FROM appointments WHERE id = $1 AND clinic_id = $2 FOR UPDATE`,
-      [id, clinic_id]
+      [id, clinic_id],
     );
 
     if (currentApp.rows.length === 0) {
@@ -709,13 +743,12 @@ const rescheduleAppointment = async (req, res) => {
     }
 
     const doctor_id = currentApp.rows[0].doctor_id;
-
     const oldAppointmentDate = currentApp.rows[0].appointment_date;
 
     // قفل صف الطبيب والتأكد من أنه نشط
     const doctorLock = await client.query(
       `SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor' AND is_active = TRUE FOR UPDATE`,
-      [doctor_id, clinic_id]
+      [doctor_id, clinic_id],
     );
 
     if (doctorLock.rows.length === 0) {
@@ -725,7 +758,7 @@ const rescheduleAppointment = async (req, res) => {
       });
     }
 
-    // التحقق من المدة بين 5 و 240 دقيقة
+    // التحقق من المدة بين 5 و 480 دقيقة
     let duration = currentApp.rows[0].duration_minutes || 30;
     if (
       duration_minutes !== undefined &&
@@ -736,11 +769,11 @@ const rescheduleAppointment = async (req, res) => {
       if (
         !Number.isInteger(parsedDuration) ||
         parsedDuration < 5 ||
-        parsedDuration > 240
+        parsedDuration > 480
       ) {
         await client.query("ROLLBACK");
         return res.status(400).json({
-          error: "مدة الكشف يجب أن تكون رقماً صحيحاً بين 5 و 240 دقيقة",
+          error: "مدة الكشف يجب أن تكون رقماً صحيحاً بين 5 و 480 دقيقة",
         });
       }
       duration = parsedDuration;
@@ -764,7 +797,7 @@ const rescheduleAppointment = async (req, res) => {
         AND (a.appointment_date + (a.duration_minutes * INTERVAL '1 minute')) > $3::timestamptz
       LIMIT 1;
       `,
-      [clinic_id, doctor_id, parsedDateForDB, duration, id]
+      [clinic_id, doctor_id, parsedDateForDB, duration, id],
     );
 
     if (conflictCheck.rows.length > 0) {
@@ -785,7 +818,7 @@ const rescheduleAppointment = async (req, res) => {
       WHERE id = $3 AND clinic_id = $4
       RETURNING *;
       `,
-      [parsedDateForDB, duration, id, clinic_id]
+      [parsedDateForDB, duration, id, clinic_id],
     );
 
     await client.query("COMMIT");
@@ -810,7 +843,7 @@ const rescheduleAppointment = async (req, res) => {
       appointment: updateResult.rows[0],
     });
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (client) await client.query("ROLLBACK");
     if (error.code === "23505") {
       return res.status(409).json({
         error: "تعارض: تم حجز هذا الموعد بالفعل من قبل مستخدم آخر",
@@ -820,7 +853,7 @@ const rescheduleAppointment = async (req, res) => {
     console.error("Error rescheduling appointment:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء تعديل الموعد" });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 };
 
@@ -828,10 +861,14 @@ const rescheduleAppointment = async (req, res) => {
 // 6. حذف موعد نهائياً (ClinicAdmin فقط مع فك ارتباط الفواتير المؤرشفة وطلبات المعمل)
 // ==========================================
 const deleteAppointment = async (req, res) => {
-  const client = await pool.connect();
+  let client;
   try {
     const { clinic_id, role } = req.user;
     const { id } = req.params;
+
+    if (!isValidUuid(id)) {
+      return res.status(400).json({ error: "معرّف الموعد غير صالح" });
+    }
 
     if (role !== "ClinicAdmin") {
       return res.status(403).json({
@@ -839,6 +876,7 @@ const deleteAppointment = async (req, res) => {
       });
     }
 
+    client = await pool.connect();
     await client.query("BEGIN");
 
     // قفل سطر الموعد
@@ -849,7 +887,7 @@ const deleteAppointment = async (req, res) => {
       WHERE id = $1 AND clinic_id = $2
       FOR UPDATE;
       `,
-      [id, clinic_id]
+      [id, clinic_id],
     );
 
     if (appointmentCheck.rows.length === 0) {
@@ -869,7 +907,7 @@ const deleteAppointment = async (req, res) => {
     AND is_archived = false
     AND status <> 'cancelled';
   `,
-      [clinic_id, id]
+      [clinic_id, id],
     );
     if (activeInvoiceCheck.rows.length > 0) {
       await client.query("ROLLBACK");
@@ -885,7 +923,7 @@ const deleteAppointment = async (req, res) => {
   SET appointment_id = NULL, updated_at = CURRENT_TIMESTAMP
   WHERE clinic_id = $1 AND appointment_id = $2;
   `,
-      [clinic_id, id]
+      [clinic_id, id],
     );
     // فك ارتباط أي فواتير أخرى (سواء مؤرشفة أو ملغاة) لتفادي Foreign Key Error
     await client.query(
@@ -894,12 +932,12 @@ const deleteAppointment = async (req, res) => {
   SET appointment_id = NULL, updated_at = CURRENT_TIMESTAMP
   WHERE clinic_id = $1 AND appointment_id = $2;
   `,
-      [clinic_id, id]
+      [clinic_id, id],
     );
     // حذف الموعد
     await client.query(
       `DELETE FROM appointments WHERE id = $1 AND clinic_id = $2;`,
-      [id, clinic_id]
+      [id, clinic_id],
     );
     await client.query("COMMIT");
 
@@ -912,7 +950,7 @@ const deleteAppointment = async (req, res) => {
         entity_id: id,
         description: `قام ${req.user.name || "المدير"} بحذف الموعد #${id.slice(
           0,
-          8
+          8,
         )} نهائياً من السيستم`,
         metadata: {
           appointment_id: id,
@@ -924,12 +962,12 @@ const deleteAppointment = async (req, res) => {
 
     res.status(200).json({ message: "تم حذف الموعد بنجاح" });
   } catch (error) {
+    if (client) await client.query("ROLLBACK");
     captureError(error, req);
-    await client.query("ROLLBACK");
     console.error("Error deleting appointment:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء حذف الموعد" });
   } finally {
-    client.release();
+    if (client) client.release();
   }
 };
 
@@ -941,7 +979,7 @@ const getClinicDurationSettings = async (req, res) => {
     const { clinic_id } = req.user;
     const result = await pool.query(
       "SELECT default_appointment_duration FROM clinics WHERE id = $1",
-      [clinic_id]
+      [clinic_id],
     );
 
     if (result.rows.length === 0) {
@@ -965,13 +1003,13 @@ const getClinicDurationSettings = async (req, res) => {
 const updateClinicDurationSettings = async (req, res) => {
   try {
     const { clinic_id, role } = req.user;
-    const { default_appointment_duration } = req.body;
+    const { default_appointment_duration } = req.body || {};
 
     const duration = Number(default_appointment_duration);
-    if (!Number.isInteger(duration) || duration < 5 || duration > 240) {
+    if (!Number.isInteger(duration) || duration < 5 || duration > 480) {
       return res.status(400).json({
         error:
-          "مدة الكشف الافتراضية يجب أن تكون رقماً صحيحاً بين 5 و 240 دقيقة",
+          "مدة الكشف الافتراضية يجب أن تكون رقماً صحيحاً بين 5 و 480 دقيقة",
       });
     }
 
@@ -982,7 +1020,7 @@ const updateClinicDurationSettings = async (req, res) => {
       WHERE id = $2
       RETURNING id, name, default_appointment_duration;
       `,
-      [duration, clinic_id]
+      [duration, clinic_id],
     );
 
     if (result.rows.length === 0) {

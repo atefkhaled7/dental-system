@@ -1,5 +1,6 @@
 const pool = require("../db");
 const { captureError } = require("../utils/errorTracker");
+const { isValidUuid } = require("../middleware/validateUuid");
 
 const getAuditLogs = async (req, res) => {
   try {
@@ -9,6 +10,13 @@ const getAuditLogs = async (req, res) => {
     if (role !== "ClinicAdmin") {
       return res.status(403).json({
         error: "غير مصرح لك بعرض سجل نشاطات العيادة",
+      });
+    }
+
+    // 🔒 التحقق الصارم من صحة الـ UUID لو اتبعت في الفلتر لمنع خطأ 500 في الداتابيز
+    if (user_id && !isValidUuid(user_id)) {
+      return res.status(400).json({
+        error: "معرّف المستخدم المحدد في الفلتر غير صالح",
       });
     }
 
@@ -34,7 +42,6 @@ const getAuditLogs = async (req, res) => {
        AND u.clinic_id = l.clinic_id
       WHERE l.clinic_id = $1
     `;
-
     const params = [clinic_id];
     let paramCounter = 2;
 
@@ -55,14 +62,11 @@ const getAuditLogs = async (req, res) => {
       LIMIT $${paramCounter}
       OFFSET $${paramCounter + 1};
     `;
-
     params.push(limitNum, offset);
 
     const result = await pool.query(query, params);
-
     const total =
       result.rows.length > 0 ? Number(result.rows[0].full_count) : 0;
-
     const logs = result.rows.map(({ full_count, ...log }) => log);
     const totalPages = Math.ceil(total / limitNum) || 1;
 
@@ -78,7 +82,6 @@ const getAuditLogs = async (req, res) => {
   } catch (error) {
     captureError(error, req);
     console.error("Error fetching audit logs:", error.message);
-
     return res.status(500).json({
       error: "خطأ في السيرفر أثناء جلب سجل النشاطات",
     });

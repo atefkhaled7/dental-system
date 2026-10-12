@@ -30,7 +30,6 @@ if (process.env.NODE_ENV !== "production") {
 app.use(
   cors({
     origin: (origin, callback) => {
-      // السماح بطلبات السيرفر الداخلية / الأدوات (no origin) أو الدومينات المعتمدة
       if (!origin || allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
@@ -39,34 +38,42 @@ app.use(
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,
-  })
+  }),
 );
 
 // 4. Body Parsers (حماية من الـ DoS عبر تقييد حجم الـ Payload)
 app.use(express.json({ limit: "100kb" }));
 
-// 5. Rate Limiters (محطوطة بعد الـ CORS لضمان وصول رسائل الـ 429 بترويسات سليمة)
+// 5. Rate Limiters
 const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 دقيقة
-  max: 10, // 10 محاولات فاشلة
-  skipSuccessfulRequests: true, // المحاولات الناجحة لا تحسب
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  skipSuccessfulRequests: true,
   message: {
     error: "تم تجاوز عدد المحاولات المسموح بها، يرجى المحاولة بعد 15 دقيقة",
   },
   standardHeaders: true,
   legacyHeaders: false,
 });
-
-// تطبيق الـ Rate Limiter على تسجيل الدخول
 app.use("/api/auth/login", loginLimiter);
 
-// 6. Health Check Endpoint (لفحص جاهزية السيرفر والـ Database ومراقبة Uptime)
+const registerClinicLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  message: {
+    error: "تم تجاوز عدد محاولات التسجيل، يرجى المحاولة لاحقاً",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use("/api/auth/register-clinic", registerClinicLimiter);
+
+// 6. Health Check Endpoint
 app.get("/api/health", async (req, res) => {
   const startTime = Date.now();
   try {
     const dbRes = await pool.query("SELECT 1 AS alive");
     const latency = Date.now() - startTime;
-
     res.status(200).json({
       status: "healthy",
       uptime_seconds: Math.floor(process.uptime()),
@@ -79,7 +86,6 @@ app.get("/api/health", async (req, res) => {
   } catch (err) {
     captureError(err, req);
     console.error("Health Check Failed:", err.message);
-
     return res.status(503).json({
       status: "unhealthy",
       error: "فشل الاتصال بقاعدة البيانات",
@@ -87,18 +93,6 @@ app.get("/api/health", async (req, res) => {
     });
   }
 });
-
-const registerClinicLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,
-  max: 5,
-  message: {
-    error: "تم تجاوز عدد محاولات التسجيل، يرجى المحاولة لاحقاً",
-  },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-app.use("/api/auth/register-clinic", registerClinicLimiter);
 
 // 7. Routes التوجيه للموديولات
 app.use("/api/clinics", require("./routes/clinicsRoutes"));
@@ -118,12 +112,15 @@ app.use("/api/staff", require("./routes/staffRoutes"));
 app.use("/api/audit-logs", require("./routes/auditRoutes"));
 app.use(
   "/api/doctor-availability",
-  require("./routes/doctorAvailabilityRoutes")
+  require("./routes/doctorAvailabilityRoutes"),
 );
 app.use("/api/public", require("./routes/publicBookingRoutes"));
 app.use("/api/booking-requests", require("./routes/bookingRequestsRoutes"));
+app.use("/api/support", require("./routes/supportRoutes"));
+app.use("/api/reports", require("./routes/reportsRoutes"));
+app.use("/api", require("./routes/prescriptionsRoutes"));
 
-// 8. مسار 404
+// 8. مسار 404 (الآن سيعمل بدقة لأي مسار غير موجود دون اعتراض من الـ Auth)
 app.use((req, res) => {
   res.status(404).json({ error: "المسار غير موجود" });
 });
@@ -131,31 +128,25 @@ app.use((req, res) => {
 // 9. Global Error Handler المركزي
 app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
-
   if (err instanceof multer.MulterError) {
+    // ✅ رسالة عامة ودقيقة لكل أنواع الملفات (أشعة أو ملفات CSV)
     const message =
       err.code === "LIMIT_FILE_SIZE"
-        ? "حجم الصورة أكبر من الحد المسموح (4 ميجابايت)"
+        ? "حجم الملف المرفوع أكبر من الحد المسموح به (4 ميجابايت)"
         : "خطأ في رفع الملف";
     return res.status(400).json({ error: message });
   }
-
   if (err.type === "entity.parse.failed") {
     return res.status(400).json({ error: "صيغة JSON غير صالحة" });
   }
-
   if (err.type === "entity.too.large") {
     return res.status(413).json({ error: "حجم الطلب كبير جداً" });
   }
-
   const status = err.status || err.statusCode || 500;
   if (status < 500) {
     return res.status(status).json({ error: err.message });
   }
-
   console.error("Unhandled Server Error:", err);
-
-  // إرسال الخطأ إلى Sentry مع بيانات العيادة والمستخدم والمسار
   captureError(err, {
     method: req.method,
     url: req.originalUrl,
@@ -163,7 +154,6 @@ app.use((err, req, res, next) => {
     user_id: req.user?.id || null,
     ip: req.ip,
   });
-
   res.status(500).json({ error: "حدث خطأ غير متوقع في الخادم" });
 });
 
