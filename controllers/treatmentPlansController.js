@@ -131,7 +131,10 @@ const addTreatmentPlanItem = async (req, res) => {
     ) {
       return res
         .status(400)
-        .json({ error: "اسم الإجراء الطبي مطلوب ويجب ألا يقل عن حرفين" });
+        .json({
+          error:
+            "اسم الإجراء الطبي مطلوب ويجب ألا يقل عن حرفين ولا يتجاوز 255 حرفاً",
+        });
     }
 
     let validatedTooth = null;
@@ -156,6 +159,13 @@ const addTreatmentPlanItem = async (req, res) => {
         error: "التكلفة التقديرية يجب أن تكون رقماً صالحاً وغير سالب",
       });
     }
+
+    if (cost > 99999999.99) {
+      return res.status(400).json({
+        error: "التكلفة التقديرية تتجاوز الحد الأقصى المسموح به",
+      });
+    }
+
     const costFixed = (Math.round(cost * 100) / 100).toFixed(2);
 
     const planCheck = await pool.query(
@@ -304,41 +314,62 @@ const updatePlanItemStatus = async (req, res) => {
   }
 };
 
-// 🌟 5. تحويل البنود المكتملة إلى فاتورة (مع ربط doctor_id لحساب الإنتاجية)
+// 🌟 5. تحويل البنود المكتملة إلى فاتورة (مع حماية الـ Connection والـ Rollback الكامل)
 const convertPlanItemsToInvoice = async (req, res) => {
+  const clinicId = req.user.clinic_id;
+  const { patientId } = req.params;
+  const { itemIds, doctor_id } = req.body || {};
+
+  if (!isValidUuid(patientId)) {
+    return res.status(400).json({ error: "معرّف المريض غير صالح" });
+  }
+
+  if (!Array.isArray(itemIds) || itemIds.length === 0) {
+    return res.status(400).json({
+      error: "يرجى تحديد بند علاج مكتمل واحد على الأقل لإصدار الفاتورة",
+    });
+  }
+
+  const hasInvalidId = itemIds.some((id) => !isValidUuid(id));
+  if (hasInvalidId) {
+    return res.status(400).json({
+      error: "أحد معرّفات بنود العلاج المحددة غير صالح",
+    });
+  }
+
+  // 🔒 التحقق من الطبيب قبل فتح أي اتصال بالـ Database (Bug #1 Fix)
+  let effectiveDoctorId = null;
+  const hasDoctorId =
+    doctor_id !== undefined && doctor_id !== null && doctor_id !== "";
+  if (hasDoctorId) {
+    if (!isValidUuid(doctor_id)) {
+      return res.status(400).json({ error: "معرّف الطبيب غير صالح" });
+    }
+    effectiveDoctorId = doctor_id;
+  } else if (req.user.role === "Doctor") {
+    effectiveDoctorId = req.user.id;
+  }
+
   let client;
+  let broken = false;
+
   try {
-    const clinicId = req.user.clinic_id;
-    const { patientId } = req.params;
-    const { itemIds, doctor_id } = req.body || {};
-
-    if (!isValidUuid(patientId)) {
-      return res.status(400).json({ error: "معرّف المريض غير صالح" });
-    }
-
-    if (!Array.isArray(itemIds) || itemIds.length === 0) {
-      return res.status(400).json({
-        error: "يرجى تحديد بند علاج مكتمل واحد على الأقل لإصدار الفاتورة",
-      });
-    }
-
-    const hasInvalidId = itemIds.some((id) => !isValidUuid(id));
-    if (hasInvalidId) {
-      return res.status(400).json({
-        error: "أحد معرّفات بنود العلاج المحددة غير صالح",
-      });
-    }
-
-    // تحديد الطبيب المعالج (إما ممرر صراحة، أو الطبيب صاحب الطلب)
-    let effectiveDoctorId = null;
-    if (doctor_id && isValidUuid(doctor_id)) {
-      effectiveDoctorId = doctor_id;
-    } else if (req.user.role === "Doctor") {
-      effectiveDoctorId = req.user.id;
-    }
-
     client = await pool.connect();
     await client.query("BEGIN");
+
+    // التحقق من تبعية الطبيب للعيادة داخل الـ Transaction
+    if (hasDoctorId) {
+      const docCheck = await client.query(
+        "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor';",
+        [effectiveDoctorId, clinicId],
+      );
+      if (docCheck.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res
+          .status(400)
+          .json({ error: "الطبيب المحدد غير تابع لهذه العيادة" });
+      }
+    }
 
     // التحقق من المريض
     const patientCheck = await client.query(
@@ -395,9 +426,16 @@ const convertPlanItemsToInvoice = async (req, res) => {
       });
     }
 
+    if (totalAmountInCents > 9_999_999_999) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: "إجمالي الفاتورة كبير جداً ويتجاوز الحد الأقصى للنظام",
+      });
+    }
+
     const finalTotalAmount = (totalAmountInCents / 100).toFixed(2);
 
-    // ✅ إنشاء الفاتورة مع تثبيت doctor_id لضمان احتسابها في تقرير إنتاجية الأطباء
+    // ✅ إنشاء الفاتورة مع تثبيت doctor_id
     const insertInvoiceQuery = `
       INSERT INTO invoices (clinic_id, patient_id, doctor_id, total_amount, status)
       VALUES ($1, $2, $3, $4, 'unpaid')
@@ -411,7 +449,7 @@ const convertPlanItemsToInvoice = async (req, res) => {
     ]);
     const newInvoice = invoiceRes.rows[0];
 
-    // إدخال البنود في invoice_items
+    // إدخال البنود في invoice_items مع قص الوصف بـ 255 حرفاً
     const insertInvoiceItemQuery = `
       INSERT INTO invoice_items (clinic_id, invoice_id, description, quantity, unit_price, total_price)
       VALUES ($1, $2, $3, 1, $4, $4);
@@ -419,7 +457,7 @@ const convertPlanItemsToInvoice = async (req, res) => {
 
     for (const item of itemsToInvoice) {
       const toothLabel = item.tooth_number ? `سن #${item.tooth_number}: ` : "";
-      const description = `${toothLabel}${item.procedure_name}`;
+      const description = `${toothLabel}${item.procedure_name}`.slice(0, 255);
       const itemPrice = (
         Math.round(parseFloat(item.estimated_cost) * 100) / 100
       ).toFixed(2);
@@ -474,14 +512,21 @@ const convertPlanItemsToInvoice = async (req, res) => {
       invoice: newInvoice,
     });
   } catch (error) {
-    if (client) await client.query("ROLLBACK");
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackErr) {
+        broken = true;
+        console.error("Rollback failed:", rollbackErr.message);
+      }
+    }
     captureError(error, req);
     console.error("Error converting treatment plan to invoice:", error.message);
     res
       .status(500)
       .json({ error: "خطأ في السيرفر أثناء تحويل خطة العلاج لفاتورة" });
   } finally {
-    if (client) client.release();
+    if (client) client.release(broken);
   }
 };
 
@@ -584,10 +629,20 @@ const deleteTreatmentPlanItem = async (req, res) => {
       });
     }
 
-    await pool.query(
-      "DELETE FROM treatment_plan_items WHERE id = $1 AND clinic_id = $2;",
+    const delRes = await pool.query(
+      `DELETE FROM treatment_plan_items
+       WHERE id = $1
+         AND clinic_id = $2
+         AND invoice_id IS NULL
+       RETURNING id;`,
       [itemId, clinicId],
     );
+
+    if (delRes.rows.length === 0) {
+      return res.status(409).json({
+        error: "لا يمكن حذف هذا البند؛ تمت فوترته رسمياً أو تم حذفه بالفعل",
+      });
+    }
 
     const toothDesc = item.tooth_number ? `للسن #${item.tooth_number}` : "";
 

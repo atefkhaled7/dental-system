@@ -155,6 +155,25 @@ const setDoctorShifts = async (req, res) => {
     }
   }
 
+  // 🔒 فحص عدم تداخل الشفتات لنفس الطبيب في نفس اليوم
+  const shiftsByDay = {};
+  for (const s of shifts) {
+    const day = Number(s.day_of_week);
+    (shiftsByDay[day] ||= []).push([
+      toMinutes(s.start_time),
+      toMinutes(s.end_time),
+    ]);
+  }
+  for (const list of Object.values(shiftsByDay)) {
+    list.sort((a, b) => a[0] - b[0]);
+    for (let i = 1; i < list.length; i++) {
+      if (list[i][0] < list[i - 1][1]) {
+        return res.status(400).json({
+          error: "يوجد تداخل زمني بين شفتين مسجلين في نفس اليوم",
+        });
+      }
+    }
+  }
   let client;
   try {
     client = await pool.connect();

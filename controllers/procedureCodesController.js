@@ -11,15 +11,47 @@ const createProcedureCode = async (req, res) => {
     if (
       default_price === undefined ||
       default_price === null ||
-      !description ||
-      !code
+      typeof description !== "string" ||
+      !description.trim() ||
+      typeof code !== "string" ||
+      !code.trim()
     ) {
-      return res.status(400).json({ message: "يوجد حقل فارغ مطلوب!" });
+      return res.status(400).json({
+        error: "الحقول المطلوبة غير صالحة أو فارغة",
+        message: "الحقول المطلوبة غير صالحة أو فارغة",
+      });
+    }
+
+    const cleanCode = code.trim().toUpperCase();
+    const cleanDesc = description.trim();
+
+    if (cleanCode.length < 1 || cleanCode.length > 50) {
+      return res.status(400).json({
+        error: "كود الإجراء يجب ألا يتجاوز 50 حرفاً",
+        message: "كود الإجراء يجب ألا يتجاوز 50 حرفاً",
+      });
+    }
+
+    if (cleanDesc.length < 2 || cleanDesc.length > 255) {
+      return res.status(400).json({
+        error: "وصف الإجراء يجب أن يتراوح بين حرفين و 255 حرفاً",
+        message: "وصف الإجراء يجب أن يتراوح بين حرفين و 255 حرفاً",
+      });
     }
 
     const price = parseFloat(default_price);
     if (isNaN(price) || price < 0) {
-      return res.status(400).json({ message: "السعر لا يمكن أن يكون سالبًا" });
+      return res.status(400).json({
+        error: "السعر لا يمكن أن يكون سالبًا",
+        message: "السعر لا يمكن أن يكون سالبًا",
+      });
+    }
+
+    if (price > 99999999.99) {
+      return res.status(400).json({
+        error: "السعر يتجاوز الحد الأقصى المسموح به",
+        message: "السعر يتجاوز الحد الأقصى المسموح به",
+      });
     }
 
     // فحص مدة الخدمة بالدقائق (اختيارية، بين 5 و 480 دقيقة)
@@ -36,13 +68,12 @@ const createProcedureCode = async (req, res) => {
         parsedDuration > 480
       ) {
         return res.status(400).json({
+          error: "مدة الإجراء يجب أن تكون رقماً صحيحاً بين 5 و 480 دقيقة",
           message: "مدة الإجراء يجب أن تكون رقماً صحيحاً بين 5 و 480 دقيقة",
         });
       }
       validatedDuration = parsedDuration;
     }
-
-    const cleanCode = code.trim().toUpperCase();
 
     // 🔒 1. فحص هل الكود موجود مسبقاً في العيادة (سواء نشط أو معطل)
     const existingCheck = await pool.query(
@@ -53,26 +84,24 @@ const createProcedureCode = async (req, res) => {
     if (existingCheck.rows.length > 0) {
       const existing = existingCheck.rows[0];
 
-      // إذا كان مسجلاً ونشطاً بالفعل
       if (existing.is_active) {
-        return res
-          .status(400)
-          .json({
-            message: "كود الإجراء مسجل بالفعل لخدمة نشطة في هذه العيادة",
-          });
+        return res.status(400).json({
+          error: "كود الإجراء مسجل بالفعل لخدمة نشطة في هذه العيادة",
+          message: "كود الإجراء مسجل بالفعل لخدمة نشطة في هذه العيادة",
+        });
       }
 
-      // ✅ 2. إذا كان الكود معطلاً (محذوفاً سابقاً)، نقوم بإعادة تفعيله فوراً وتحديث بياناته
+      // ✅ 2. إذا كان الكود معطلاً، نقوم بإعادة تفعيله فوراً وتحديث بياناته
       const restoreResult = await pool.query(
-        `UPDATE procedure_codes
-         SET is_active = true,
-             description = $1,
-             default_price = $2,
-             duration_minutes = $3,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = $4 AND clinic_id = $5
+        `UPDATE procedure_codes 
+         SET is_active = true, 
+             description = $1, 
+             default_price = $2, 
+             duration_minutes = $3, 
+             updated_at = CURRENT_TIMESTAMP 
+         WHERE id = $4 AND clinic_id = $5 
          RETURNING *;`,
-        [description.trim(), price, validatedDuration, existing.id, clinic_id],
+        [cleanDesc, price, validatedDuration, existing.id, clinic_id],
       );
 
       return res.status(200).json({
@@ -86,23 +115,33 @@ const createProcedureCode = async (req, res) => {
       `INSERT INTO procedure_codes (clinic_id, code, description, default_price, duration_minutes, is_active) 
        VALUES ($1, $2, $3, $4, $5, true) 
        RETURNING *;`,
-      [clinic_id, cleanCode, description.trim(), price, validatedDuration],
+      [clinic_id, cleanCode, cleanDesc, price, validatedDuration],
     );
 
     res.status(201).json(result.rows[0]);
   } catch (error) {
     if (error.code === "23505") {
-      return res
-        .status(400)
-        .json({ message: "كود الإجراء مسجل بالفعل في هذه العيادة" });
+      return res.status(400).json({
+        error: "كود الإجراء مسجل بالفعل في هذه العيادة",
+        message: "كود الإجراء مسجل بالفعل في هذه العيادة",
+      });
+    }
+    if (error.code === "22001") {
+      return res.status(400).json({
+        error: "أحد البيانات يتجاوز الحد الأقصى المسموح به للحروف",
+        message: "أحد البيانات يتجاوز الحد الأقصى المسموح به للحروف",
+      });
     }
     captureError(error, req);
     console.error("Error creating procedure code:", error.message);
-    res.status(500).json({ message: "حدث خطأ أثناء إنشاء كود الإجراء" });
+    res.status(500).json({
+      error: "حدث خطأ أثناء إنشاء كود الإجراء",
+      message: "حدث خطأ أثناء إنشاء كود الإجراء",
+    });
   }
 };
 
-// 2. جلب أكواد الإجراءات للعيادة (مع دعم إظهار المعطلة عند الطلب)
+// 2. جلب أكواد الإجراءات للعيادة
 const getProcedureCodes = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const { include_inactive } = req.query;
@@ -119,34 +158,42 @@ const getProcedureCodes = async (req, res) => {
   } catch (error) {
     captureError(error, req);
     console.error("Error fetching procedure codes:", error.message);
-    res.status(500).json({ message: "حدث خطأ أثناء جلب أكواد الإجراءات" });
+    res.status(500).json({
+      error: "حدث خطأ أثناء جلب أكواد الإجراءات",
+      message: "حدث خطأ أثناء جلب أكواد الإجراءات",
+    });
   }
 };
 
-// 3. تعديل كود إجراء (مع حماية تعارض الأسماء وفك حجز المعطل)
+// 3. تعديل كود إجراء
 const updateProcedureCode = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const { id } = req.params;
   const { default_price, description, code, duration_minutes } = req.body || {};
 
   if (!isValidUuid(id)) {
-    return res.status(400).json({ message: "معرّف الإجراء غير صالح" });
+    return res.status(400).json({
+      error: "معرّف الإجراء غير صالح",
+      message: "معرّف الإجراء غير صالح",
+    });
   }
 
   try {
-    // جلب البيانات الحالية للخدمة
     const checkRes = await pool.query(
       "SELECT id, code, description, default_price, duration_minutes FROM procedure_codes WHERE id = $1 AND clinic_id = $2 AND is_active = true;",
       [id, clinic_id],
     );
 
     if (checkRes.rows.length === 0) {
-      return res.status(404).json({ message: "كود الإجراء غير موجود" });
+      return res.status(404).json({
+        error: "كود الإجراء غير موجود",
+        message: "كود الإجراء غير موجود",
+      });
     }
 
     const current = checkRes.rows[0];
 
-    // 1. فحص وتحديث مدة الخدمة (لو متبعتتش نحتفظ بالقديمة)
+    // 1. فحص وتحديث مدة الخدمة
     let finalDuration = current.duration_minutes;
     if (duration_minutes !== undefined) {
       if (duration_minutes === null || duration_minutes === "") {
@@ -159,6 +206,7 @@ const updateProcedureCode = async (req, res) => {
           parsedDuration > 480
         ) {
           return res.status(400).json({
+            error: "مدة الإجراء يجب أن تكون رقماً صحيحاً بين 5 و 480 دقيقة",
             message: "مدة الإجراء يجب أن تكون رقماً صحيحاً بين 5 و 480 دقيقة",
           });
         }
@@ -171,9 +219,16 @@ const updateProcedureCode = async (req, res) => {
     if (default_price !== undefined && default_price !== null) {
       const p = parseFloat(default_price);
       if (isNaN(p) || p < 0) {
-        return res
-          .status(400)
-          .json({ message: "السعر لا يمكن أن يكون سالبًا" });
+        return res.status(400).json({
+          error: "السعر لا يمكن أن يكون سالبًا",
+          message: "السعر لا يمكن أن يكون سالبًا",
+        });
+      }
+      if (p > 99999999.99) {
+        return res.status(400).json({
+          error: "السعر يتجاوز الحد الأقصى المسموح به",
+          message: "السعر يتجاوز الحد الأقصى المسموح به",
+        });
       }
       finalPrice = p;
     }
@@ -182,6 +237,14 @@ const updateProcedureCode = async (req, res) => {
     let finalCode = current.code;
     if (code && typeof code === "string") {
       const candidateCode = code.trim().toUpperCase();
+
+      if (candidateCode.length < 1 || candidateCode.length > 50) {
+        return res.status(400).json({
+          error: "كود الإجراء يجب ألا يتجاوز 50 حرفاً",
+          message: "كود الإجراء يجب ألا يتجاوز 50 حرفاً",
+        });
+      }
+
       if (candidateCode !== current.code) {
         const conflictCheck = await pool.query(
           "SELECT id, is_active FROM procedure_codes WHERE clinic_id = $1 AND code = $2 AND id != $3;",
@@ -191,11 +254,11 @@ const updateProcedureCode = async (req, res) => {
         if (conflictCheck.rows.length > 0) {
           const conflict = conflictCheck.rows[0];
           if (conflict.is_active) {
-            return res
-              .status(400)
-              .json({ message: "كود الإجراء مسجل بالفعل لخدمة نشطة أخرى" });
+            return res.status(400).json({
+              error: "كود الإجراء مسجل بالفعل لخدمة نشطة أخرى",
+              message: "كود الإجراء مسجل بالفعل لخدمة نشطة أخرى",
+            });
           } else {
-            // فك حجز الكود من السجل المعطل القديم ليتسنى للخدمة الحالية استخدامه
             await pool.query(
               "UPDATE procedure_codes SET code = code || '_OLD_' || SUBSTRING(id::text, 1, 6) WHERE id = $1;",
               [conflict.id],
@@ -206,17 +269,27 @@ const updateProcedureCode = async (req, res) => {
       }
     }
 
-    const finalDescription =
-      description != null ? description.trim() : current.description;
+    let finalDescription = current.description;
+    if (description !== undefined && description !== null) {
+      const cleanDesc =
+        typeof description === "string" ? description.trim() : "";
+      if (cleanDesc.length < 2 || cleanDesc.length > 255) {
+        return res.status(400).json({
+          error: "وصف الإجراء يجب أن يتراوح بين حرفين و 255 حرفاً",
+          message: "وصف الإجراء يجب أن يتراوح بين حرفين و 255 حرفاً",
+        });
+      }
+      finalDescription = cleanDesc;
+    }
 
     const result = await pool.query(
-      `UPDATE procedure_codes
-       SET code = $1,
-           description = $2,
-           default_price = $3,
-           duration_minutes = $4,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $5 AND clinic_id = $6
+      `UPDATE procedure_codes 
+       SET code = $1, 
+           description = $2, 
+           default_price = $3, 
+           duration_minutes = $4, 
+           updated_at = CURRENT_TIMESTAMP 
+       WHERE id = $5 AND clinic_id = $6 
        RETURNING *;`,
       [finalCode, finalDescription, finalPrice, finalDuration, id, clinic_id],
     );
@@ -224,13 +297,23 @@ const updateProcedureCode = async (req, res) => {
     res.status(200).json(result.rows[0]);
   } catch (error) {
     if (error.code === "23505") {
-      return res
-        .status(400)
-        .json({ message: "كود الإجراء مسجل بالفعل لخدمة أخرى" });
+      return res.status(400).json({
+        error: "كود الإجراء مسجل بالفعل لخدمة أخرى",
+        message: "كود الإجراء مسجل بالفعل لخدمة أخرى",
+      });
+    }
+    if (error.code === "22001") {
+      return res.status(400).json({
+        error: "أحد البيانات يتجاوز الحد الأقصى المسموح به للحروف",
+        message: "أحد البيانات يتجاوز الحد الأقصى المسموح به للحروف",
+      });
     }
     captureError(error, req);
     console.error("Error updating procedure code:", error.message);
-    res.status(500).json({ message: "حدث خطأ أثناء تعديل كود الإجراء" });
+    res.status(500).json({
+      error: "حدث خطأ أثناء تعديل كود الإجراء",
+      message: "حدث خطأ أثناء تعديل كود الإجراء",
+    });
   }
 };
 
@@ -240,34 +323,39 @@ const deleteProcedureCode = async (req, res) => {
   const { id } = req.params;
 
   if (!isValidUuid(id)) {
-    return res.status(400).json({ message: "معرّف الإجراء غير صالح" });
+    return res.status(400).json({
+      error: "معرّف الإجراء غير صالح",
+      message: "معرّف الإجراء غير صالح",
+    });
   }
 
   try {
     const result = await pool.query(
-      `UPDATE procedure_codes
-       SET is_active = false, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1 AND clinic_id = $2 AND is_active = true
+      `UPDATE procedure_codes 
+       SET is_active = false, updated_at = CURRENT_TIMESTAMP 
+       WHERE id = $1 AND clinic_id = $2 AND is_active = true 
        RETURNING id, code;`,
       [id, clinic_id],
     );
 
     if (result.rows.length === 0) {
-      return res
-        .status(404)
-        .json({ message: "كود الإجراء غير موجود أو معطل بالفعل" });
+      return res.status(404).json({
+        error: "كود الإجراء غير موجود أو معطل بالفعل",
+        message: "كود الإجراء غير موجود أو معطل بالفعل",
+      });
     }
 
-    res
-      .status(200)
-      .json({
-        message: "تم تعطيل كود الإجراء بنجاح",
-        procedure: result.rows[0],
-      });
+    res.status(200).json({
+      message: "تم تعطيل كود الإجراء بنجاح",
+      procedure: result.rows[0],
+    });
   } catch (error) {
     captureError(error, req);
     console.error("Error deleting procedure code:", error.message);
-    res.status(500).json({ message: "حدث خطأ أثناء تعطيل كود الإجراء" });
+    res.status(500).json({
+      error: "حدث خطأ أثناء تعطيل كود الإجراء",
+      message: "حدث خطأ أثناء تعطيل كود الإجراء",
+    });
   }
 };
 
@@ -277,7 +365,10 @@ const restoreProcedureCode = async (req, res) => {
   const { id } = req.params;
 
   if (!isValidUuid(id)) {
-    return res.status(400).json({ message: "معرّف الإجراء غير صالح" });
+    return res.status(400).json({
+      error: "معرّف الإجراء غير صالح",
+      message: "معرّف الإجراء غير صالح",
+    });
   }
 
   try {
@@ -287,31 +378,38 @@ const restoreProcedureCode = async (req, res) => {
     );
 
     if (checkRes.rows.length === 0) {
-      return res.status(404).json({ message: "كود الإجراء غير موجود" });
+      return res.status(404).json({
+        error: "كود الإجراء غير موجود",
+        message: "كود الإجراء غير موجود",
+      });
     }
 
     if (checkRes.rows[0].is_active) {
-      return res.status(400).json({ message: "كود الإجراء نشط بالفعل" });
+      return res.status(400).json({
+        error: "كود الإجراء نشط بالفعل",
+        message: "كود الإجراء نشط بالفعل",
+      });
     }
 
     const result = await pool.query(
-      `UPDATE procedure_codes
-       SET is_active = true, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $1 AND clinic_id = $2
+      `UPDATE procedure_codes 
+       SET is_active = true, updated_at = CURRENT_TIMESTAMP 
+       WHERE id = $1 AND clinic_id = $2 
        RETURNING *;`,
       [id, clinic_id],
     );
 
-    res
-      .status(200)
-      .json({
-        message: "تمت استعادة كود الإجراء بنجاح",
-        procedure: result.rows[0],
-      });
+    res.status(200).json({
+      message: "تمت استعادة كود الإجراء بنجاح",
+      procedure: result.rows[0],
+    });
   } catch (error) {
     captureError(error, req);
     console.error("Error restoring procedure code:", error.message);
-    res.status(500).json({ message: "حدث خطأ أثناء استعادة كود الإجراء" });
+    res.status(500).json({
+      error: "حدث خطأ أثناء استعادة كود الإجراء",
+      message: "حدث خطأ أثناء استعادة كود الإجراء",
+    });
   }
 };
 

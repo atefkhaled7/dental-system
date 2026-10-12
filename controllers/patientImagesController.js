@@ -19,7 +19,7 @@ const VALID_FDI_TEETH = new Set([
   34, 35, 36, 37, 38, 41, 42, 43, 44, 45, 46, 47, 48,
 ]);
 
-// 🔒 فحص الـ Magic Bytes مباشرة من الذاكرة (Buffer) بدون I/O
+// 🔒 فحص الـ Magic Bytes مباشرة من الذاكرة (Buffer)
 const verifyImageMagicBytes = (buffer) => {
   if (!buffer || buffer.length < 12) return false;
 
@@ -57,7 +57,7 @@ const uploadPatientImage = async (req, res) => {
     const clinicId = req.user.clinic_id;
     const userId = req.user.id;
     const { patientId } = req.params;
-    const { tooth_number, category, description } = req.body;
+    const { tooth_number, category, description } = req.body || {};
 
     if (!patientId || !isValidUuid(patientId)) {
       return res.status(400).json({ error: "معرّف المريض غير صالح" });
@@ -67,7 +67,6 @@ const uploadPatientImage = async (req, res) => {
       return res.status(400).json({ error: "يرجى اختيار ملف الصورة لرفعه" });
     }
 
-    // 🔒 1. فحص الـ Magic Bytes الحقيقي للملف من الـ Buffer
     const isValidImage = verifyImageMagicBytes(req.file.buffer);
     if (!isValidImage) {
       return res.status(400).json({
@@ -76,7 +75,6 @@ const uploadPatientImage = async (req, res) => {
       });
     }
 
-    // 🔒 2. فحص المريض وعزل العيادة
     const patientCheck = await pool.query(
       "SELECT id FROM patients WHERE id = $1 AND clinic_id = $2 AND is_active = TRUE",
       [patientId, clinicId],
@@ -88,7 +86,7 @@ const uploadPatientImage = async (req, res) => {
         .json({ error: "المريض غير موجود في هذه العيادة أو تمت أرشفته" });
     }
 
-    // 3. فحص رقم السن بنظام FDI
+    // 3. فحص رقم السن بنظام FDI مع التحقق من أنه رقم صحيح
     let validatedTooth = null;
     if (
       tooth_number !== undefined &&
@@ -96,7 +94,7 @@ const uploadPatientImage = async (req, res) => {
       tooth_number !== ""
     ) {
       const parsedTooth = parseInt(tooth_number, 10);
-      if (isNaN(parsedTooth) || !VALID_FDI_TEETH.has(parsedTooth)) {
+      if (!Number.isInteger(parsedTooth) || !VALID_FDI_TEETH.has(parsedTooth)) {
         return res.status(400).json({ error: "رقم السن غير صالح بنظام FDI" });
       }
       validatedTooth = parsedTooth;
@@ -105,12 +103,10 @@ const uploadPatientImage = async (req, res) => {
     const normalizedCategory =
       category && VALID_CATEGORIES.includes(category) ? category : "other";
 
-    // توليد اسم فريد للملف
     const uniqueSuffix = crypto.randomBytes(16).toString("hex");
     const ext = path.extname(req.file.originalname).toLowerCase();
     const storageKey = `clinic_${clinicId}_${uniqueSuffix}${ext}`;
 
-    // 🚀 الرفع عبر خدمة التخزين
     const uploadRes = await storageService.uploadFile({
       buffer: req.file.buffer,
       filename: storageKey,
@@ -136,7 +132,9 @@ const uploadPatientImage = async (req, res) => {
       req.file.originalname,
       req.file.mimetype,
       req.file.size,
-      description ? description.trim() : null,
+      description && typeof description === "string"
+        ? description.trim().slice(0, 1000)
+        : null,
       userId,
     ];
 
@@ -204,10 +202,22 @@ const getPatientImages = async (req, res) => {
     `;
     const queryParams = [clinicId, patientId, isArchived];
 
-    if (tooth_number) {
-      queryParams.push(parseInt(tooth_number, 10));
-      query += ` AND pi.tooth_number = $${queryParams.length}`;
+    if (
+      tooth_number !== undefined &&
+      tooth_number !== null &&
+      tooth_number !== ""
+    ) {
+      const parsedTooth = parseInt(tooth_number, 10);
+      if (Number.isInteger(parsedTooth) && VALID_FDI_TEETH.has(parsedTooth)) {
+        queryParams.push(parsedTooth);
+        query += ` AND pi.tooth_number = $${queryParams.length}`;
+      } else {
+        return res
+          .status(400)
+          .json({ error: "رقم السن في الفلتر غير صالح بنظام FDI" });
+      }
     }
+
     if (category && VALID_CATEGORIES.includes(category)) {
       queryParams.push(category);
       query += ` AND pi.category = $${queryParams.length}`;
@@ -252,7 +262,7 @@ const getPatientImages = async (req, res) => {
   }
 };
 
-// 🌟 3. عرض وتحميل الصورة الطبية بأمان (Streaming من Cloudinary أو محلياً)
+// 3. عرض وتحميل الصورة الطبية بأمان
 const getProtectedImageFile = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
@@ -283,9 +293,8 @@ const getProtectedImageFile = async (req, res) => {
     }
 
     res.setHeader("Content-Type", mime_type);
-    res.setHeader("Cache-Control", "private, max-age=86400"); // كاش آمن لمدة يوم للمستخدم المصرح له
+    res.setHeader("Cache-Control", "private, max-age=86400");
 
-    // لو الـ stream متاح (سواء من Cloudinary أو S3 أو FileStream)
     if (fileData.stream?.pipe) {
       fileData.stream.on("error", (streamErr) => {
         captureError(streamErr, req);
@@ -295,7 +304,6 @@ const getProtectedImageFile = async (req, res) => {
             error: "خطأ أثناء قراءة بيانات الملف من التخزين",
           });
         } else {
-          // الاستجابة بدأت بالفعل؛ لا يمكن إرسال JSON جديد بأمان
           res.destroy(streamErr);
         }
       });
@@ -303,7 +311,6 @@ const getProtectedImageFile = async (req, res) => {
     } else if (fileData.filePath) {
       res.sendFile(fileData.filePath);
     } else {
-      // ✅ تصليح ReferenceError: كائن Error صريح
       captureError(
         new Error(
           `تعذر قراءة بيانات الملف للصورة ${id}: لا يتوفر stream أو filePath`,

@@ -20,10 +20,17 @@ const recordPayment = async (req, res) => {
 
   const payingAmount = parseFloat(amount);
 
-  if (isNaN(payingAmount) || payingAmount <= 0) {
-    return res
-      .status(400)
-      .json({ error: "المبلغ المدفوع يجب أن يكون أكبر من الصفر" });
+  if (isNaN(payingAmount) || payingAmount < 0.01) {
+    return res.status(400).json({
+      error:
+        "المبلغ المدفوع يجب أن يكون رقماً صالحاً ولا يقل عن 0.01 ج.م (قرش واحد)",
+    });
+  }
+
+  if (notes && typeof notes === "string" && notes.trim().length > 1000) {
+    return res.status(400).json({
+      error: "الملاحظات يجب ألا تتجاوز 1000 حرف",
+    });
   }
 
   const validMethods = [
@@ -41,6 +48,20 @@ const recordPayment = async (req, res) => {
     return res.status(400).json({ error: "طريقة الدفع غير صالحة" });
   }
 
+  const payingAmountCents = Math.round(payingAmount * 100);
+  const cleanPayingAmount = payingAmountCents / 100;
+
+  if (notes !== undefined && notes !== null && typeof notes !== "string") {
+    return res.status(400).json({
+      error: "الملاحظات يجب أن تكون نصًا صالحًا",
+    });
+  }
+
+  if (typeof notes === "string" && notes.trim().length > 1000) {
+    return res.status(400).json({
+      error: "الملاحظات يجب ألا تتجاوز 1000 حرف",
+    });
+  }
   let client;
   try {
     client = await pool.connect();
@@ -72,7 +93,7 @@ const recordPayment = async (req, res) => {
         .json({ error: "لا يمكن الدفع لفاتورة ملغاة أو مؤرشفة" });
     }
 
-    // حساب المدفوع مسبقاً (الدفعات الناجحة فقط)
+    // حساب المدفوع مسبقاً بدقة القروش (الدفعات الناجحة فقط)
     const paidResult = await client.query(
       "SELECT COALESCE(SUM(amount), 0) AS total_paid FROM payments WHERE invoice_id = $1 AND clinic_id = $2 AND status = 'paid';",
       [invoice_id, clinic_id],
@@ -84,7 +105,6 @@ const recordPayment = async (req, res) => {
     const alreadyPaidCents = Math.round(
       parseFloat(paidResult.rows[0].total_paid) * 100,
     );
-    const payingAmountCents = Math.round(payingAmount * 100);
     const newTotalPaidCents = alreadyPaidCents + payingAmountCents;
 
     if (newTotalPaidCents > invoiceTotalCents) {
@@ -95,7 +115,7 @@ const recordPayment = async (req, res) => {
       });
     }
 
-    // إضافة الدفعة مع تثبيت paid_at لضمان حسابها في إيرادات الداشبورد اليومية
+    // إضافة الدفعة بالقيمة الموحدة النظيفة
     const paymentResult = await client.query(
       `INSERT INTO payments (clinic_id, invoice_id, amount, payment_method, status, notes, created_by, paid_at)
        VALUES ($1, $2, $3, $4, 'paid', $5, $6, CURRENT_TIMESTAMP)
@@ -103,9 +123,9 @@ const recordPayment = async (req, res) => {
       [
         clinic_id,
         invoice_id,
-        payingAmount,
+        cleanPayingAmount,
         normalizedMethod,
-        notes || null,
+        notes?.trim() || null,
         user_id,
       ],
     );
@@ -120,9 +140,12 @@ const recordPayment = async (req, res) => {
 
     await client.query("COMMIT");
 
-    const remainingFinal = (invoiceTotalCents - newTotalPaidCents) / 100;
+    const remainingFinal = Math.max(
+      0,
+      (invoiceTotalCents - newTotalPaidCents) / 100,
+    );
 
-    // تسجيل العملية في سجل الرقابة قبل إرسال الرد
+    // تسجيل العملية في سجل الرقابة
     try {
       await logActivity({
         clinic_id,
@@ -132,12 +155,12 @@ const recordPayment = async (req, res) => {
         entity_id: invoice_id,
         description: `قام ${
           req.user.name || "الموظف"
-        } بتحصيل دفعة بقيمة ${payingAmount} ج.م للفاتورة #${invoice_id.slice(
+        } بتحصيل دفعة بقيمة ${cleanPayingAmount} ج.م للفاتورة #${invoice_id.slice(
           0,
           8,
         )}`,
         metadata: {
-          amount: payingAmount,
+          amount: cleanPayingAmount,
           payment_method: normalizedMethod,
           remaining_amount: remainingFinal,
         },
@@ -153,8 +176,14 @@ const recordPayment = async (req, res) => {
       remaining_amount: remainingFinal,
     });
   } catch (error) {
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackErr) {
+        console.error("Rollback error:", rollbackErr.message);
+      }
+    }
     captureError(error, req);
-    if (client) await client.query("ROLLBACK");
     console.error("Error recording payment:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء تسجيل الدفع" });
   } finally {
@@ -168,14 +197,13 @@ const recordPayment = async (req, res) => {
 const createOnlinePayment = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const user_id = req.user.id;
-  const clinic_email = req.user.email; // إيميل المستخدم الحالي كـ fallback رسمي للعيادة
+  const clinic_email = req.user.email;
   const { invoice_id, amount, notes, expires_hours = 24 } = req.body;
 
   if (!invoice_id || !isValidUuid(invoice_id)) {
     return res.status(400).json({ error: "معرّف الفاتورة غير صالح" });
   }
 
-  // Validation لـ expires_hours (من ساعة إلى 7 أيام كحد أقصى)
   const parsedHours = parseInt(expires_hours, 10);
   const validHours =
     !isNaN(parsedHours) && parsedHours >= 1 && parsedHours <= 168
@@ -185,7 +213,6 @@ const createOnlinePayment = async (req, res) => {
   const provider = getPaymentProvider("paymob");
 
   if (!provider.isMock() && !provider.isConfigured()) {
-    // ✅ تصليح ReferenceError: إنشاء كائن Error صريح
     captureError(
       new Error(
         "خدمة الدفع الإلكتروني غير مُهيأة (Paymob credentials missing)",
@@ -194,6 +221,18 @@ const createOnlinePayment = async (req, res) => {
     );
     return res.status(503).json({
       error: "خدمة الدفع الإلكتروني غير مُهيأة حاليًا.",
+    });
+  }
+
+  if (notes !== undefined && notes !== null && typeof notes !== "string") {
+    return res.status(400).json({
+      error: "الملاحظات يجب أن تكون نصًا صالحًا",
+    });
+  }
+
+  if (typeof notes === "string" && notes.trim().length > 1000) {
+    return res.status(400).json({
+      error: "الملاحظات يجب ألا تتجاوز 1000 حرف",
     });
   }
 
@@ -241,12 +280,21 @@ const createOnlinePayment = async (req, res) => {
     );
     const remainingCents = invoiceTotalCents - alreadyPaidCents;
 
+    if (remainingCents <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: "الفاتورة مسددة بالكامل ولا يوجد متبقي لإنشاء رابط دفع",
+      });
+    }
+
     let requestedAmountCents = remainingCents;
-    if (amount) {
+    if (amount !== undefined && amount !== null && amount !== "") {
       const parsedAmount = parseFloat(amount);
-      if (isNaN(parsedAmount) || parsedAmount <= 0) {
+      if (isNaN(parsedAmount) || parsedAmount < 0.01) {
         await client.query("ROLLBACK");
-        return res.status(400).json({ error: "المبلغ المطلوب غير صالح" });
+        return res
+          .status(400)
+          .json({ error: "المبلغ المطلوب يجب ألا يقل عن 0.01 ج.م" });
       }
       requestedAmountCents = Math.round(parsedAmount * 100);
     }
@@ -313,7 +361,7 @@ const createOnlinePayment = async (req, res) => {
         finalAmountEGP,
         expiresAt,
         user_id,
-        notes || null,
+        notes?.trim() || null,
       ],
     );
 
@@ -333,13 +381,11 @@ const createOnlinePayment = async (req, res) => {
         expiresAt: expiresAt,
       });
 
-      // حفظ provider_order_id
       await pool.query(
         "UPDATE payments SET provider_order_id = $1 WHERE id = $2;",
         [session.providerOrderId, pendingPayment.id],
       );
 
-      // تجهيز رابط ورسالة الواتساب الجاهزة (wa.me)
       const whatsappLinkData = whatsAppService.generateWhatsAppLink({
         type: "payment_link",
         phone: normalizedPhone,
@@ -362,7 +408,6 @@ const createOnlinePayment = async (req, res) => {
         is_mock: provider.isMock(),
       });
     } catch (paymobError) {
-      // لو Paymob فشل بعد الـ INSERT، نحدث حالة الـ pending إلى failed فوراً
       console.error("Paymob API Session Error:", paymobError.message);
       if (pendingPaymentId) {
         await pool.query(
@@ -373,8 +418,14 @@ const createOnlinePayment = async (req, res) => {
       throw paymobError;
     }
   } catch (error) {
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackErr) {
+        console.error("Rollback error:", rollbackErr.message);
+      }
+    }
     captureError(error, req);
-    if (client) await client.query("ROLLBACK");
     console.error("Error creating online payment:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء إنشاء رابط الدفع" });
   } finally {
@@ -388,7 +439,6 @@ const createOnlinePayment = async (req, res) => {
 const handlePaymobWebhook = async (req, res) => {
   const provider = getPaymentProvider("paymob");
 
-  // التحقق من الـ HMAC Signature
   const isValidSignature = provider.verifyWebhookSignature(req);
 
   if (!isValidSignature) {
@@ -413,7 +463,6 @@ const handlePaymobWebhook = async (req, res) => {
     client = await pool.connect();
     await client.query("BEGIN");
 
-    // البحث عن الدفعة بدون قفل أولاً لمعرفة الـ invoice المرتبطة بها
     let paymentLookupQuery = "SELECT * FROM payments WHERE id = $1;";
     let paymentLookupParams = [paymentId];
 
@@ -437,19 +486,12 @@ const handlePaymobWebhook = async (req, res) => {
         }`,
       );
 
-      // نرجع 200 حتى لا يعاد إرسال webhook بلا نهاية
       return res.status(200).json({
         message: "Payment record not found, ignored.",
       });
     }
 
     const paymentRef = paymentLookupResult.rows[0];
-
-    // ==========================================
-    // 🔒 ترتيب الـ Locks:
-    // 1) Invoice
-    // 2) Payment
-    // ==========================================
 
     const invoiceResult = await client.query(
       "SELECT * FROM invoices WHERE id = $1 AND clinic_id = $2 FOR UPDATE;",
@@ -461,7 +503,6 @@ const handlePaymobWebhook = async (req, res) => {
 
       const errMessage = `Paymob Webhook: Invoice ${paymentRef.invoice_id} not found for payment ${paymentRef.id}`;
       console.error(errMessage);
-      // ✅ تصليح ReferenceError
       captureError(new Error(errMessage), req);
       return res.status(500).json({
         error: "Invoice associated with payment was not found",
@@ -470,7 +511,6 @@ const handlePaymobWebhook = async (req, res) => {
 
     const invoice = invoiceResult.rows[0];
 
-    // قفل الدفعة بعد قفل الفاتورة
     const paymentResult = await client.query(
       "SELECT * FROM payments WHERE id = $1 FOR UPDATE;",
       [paymentRef.id],
@@ -480,7 +520,6 @@ const handlePaymobWebhook = async (req, res) => {
       await client.query("ROLLBACK");
       const errMessage = `Payment record disappeared during webhook processing for payment ${paymentRef.id}`;
       console.error(errMessage);
-      // ✅ تصليح ReferenceError
       captureError(new Error(errMessage), req);
       return res.status(500).json({
         error: "Payment record disappeared during webhook processing",
@@ -488,10 +527,6 @@ const handlePaymobWebhook = async (req, res) => {
     }
 
     const payment = paymentResult.rows[0];
-
-    // ==========================================
-    // 🔁 Webhook مكرر أو دفعات منتهية بالفعل
-    // ==========================================
 
     // 1) إذا كانت الدفعة مسددة بالفعل
     if (payment.status === "paid") {
@@ -530,10 +565,7 @@ const handlePaymobWebhook = async (req, res) => {
       });
     }
 
-    // ==========================================
-    // ⏳ لا يزال Pending
-    // ==========================================
-
+    // 4) لا يزال Pending
     if (isPending) {
       await client.query(
         `UPDATE payments
@@ -549,10 +581,7 @@ const handlePaymobWebhook = async (req, res) => {
       });
     }
 
-    // ==========================================
-    // ❌ فشل محاولة الدفع الحالية
-    // ==========================================
-
+    // 5) فشل محاولة الدفع الحالية
     if (!isSuccess) {
       await client.query(
         `UPDATE payments
@@ -570,12 +599,7 @@ const handlePaymobWebhook = async (req, res) => {
       });
     }
 
-    // ==========================================
-    // ✅ في حال النجاح (isSuccess === true):
-    // هنا الدفعة إما pending أو كانت failed نتيجة محاولة سابقة فاشلة وأعاد المريض المحاولة ونجح!
-    // ==========================================
-
-    // 💰 1) التحقق من تطابق المبلغ
+    // 6) في حال النجاح (isSuccess === true)
     const expectedAmountCents = Math.round(parseFloat(payment.amount) * 100);
 
     if (Number(amountCents) !== expectedAmountCents) {
@@ -600,7 +624,6 @@ const handlePaymobWebhook = async (req, res) => {
       });
     }
 
-    // 🚫 2) الفاتورة أُلغيت أو أُرشفت قبل الدفع
     if (invoice.status === "cancelled" || invoice.is_archived) {
       await client.query(
         `UPDATE payments
@@ -623,7 +646,6 @@ const handlePaymobWebhook = async (req, res) => {
       });
     }
 
-    // 🧮 3) إعادة حساب المتبقي قبل اعتماد الدفع
     const totalPaidResult = await client.query(
       `SELECT COALESCE(SUM(amount), 0) AS total_paid
        FROM payments
@@ -643,7 +665,6 @@ const handlePaymobWebhook = async (req, res) => {
 
     const newTotalPaidCents = alreadyPaidCents + expectedAmountCents;
 
-    // ⚠ 4) Overpayment / دفع زائد
     if (newTotalPaidCents > invoiceTotalCents) {
       await client.query(
         `UPDATE payments
@@ -666,7 +687,6 @@ const handlePaymobWebhook = async (req, res) => {
       });
     }
 
-    // ✅ 5) اعتماد الدفعة رسمياً (سواء كانت pending أو تعافت من failed سابقة)
     const retryNote =
       payment.status === "failed"
         ? " [تم تأكيد الدفع بنجاح بعد محاولة فاشلة سابقة]"
@@ -696,7 +716,6 @@ const handlePaymobWebhook = async (req, res) => {
 
     await client.query("COMMIT");
 
-    // تسجيل في الـ audit log بدون تعطيل الاستجابة
     try {
       await logActivity({
         clinic_id: payment.clinic_id,
@@ -720,16 +739,16 @@ const handlePaymobWebhook = async (req, res) => {
       console.error("Audit log failed:", auditError);
     }
 
-    console.log(
-      `✅ Payment ${payment.id} verified and invoice ${invoice.id} updated to ${newInvoiceStatus}`,
-    );
-
     return res.status(200).json({
       message: "Payment successfully confirmed and recorded.",
     });
   } catch (error) {
     if (client) {
-      await client.query("ROLLBACK");
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackErr) {
+        console.error("Rollback error:", rollbackErr.message);
+      }
     }
     captureError(error, req);
     console.error("Error processing Paymob webhook:", error);
@@ -754,7 +773,6 @@ const voidPayment = async (req, res) => {
   const payment_id = req.params.id || req.params.paymentId;
   const { reason } = req.body;
 
-  // 1. صلاحية مدير العيادة فقط
   if (!["ClinicAdmin", "SuperAdmin"].includes(user_role)) {
     return res.status(403).json({
       error:
@@ -776,7 +794,6 @@ const voidPayment = async (req, res) => {
   try {
     client = await pool.connect();
 
-    // قراءة الـ invoice_id أولاً بدون قفل عشان نعرف نقفل الفاتورة الأول
     const lookupResult = await client.query(
       "SELECT invoice_id FROM payments WHERE id = $1 AND clinic_id = $2;",
       [payment_id, clinic_id],
@@ -791,7 +808,6 @@ const voidPayment = async (req, res) => {
 
     await client.query("BEGIN");
 
-    // 2. قفل الفاتورة المرتبطة بها أولاً (تجنباً للـ Deadlock)
     const invoiceResult = await client.query(
       "SELECT * FROM invoices WHERE id = $1 AND clinic_id = $2 FOR UPDATE;",
       [targetInvoiceId, clinic_id],
@@ -805,7 +821,6 @@ const voidPayment = async (req, res) => {
     }
     const invoice = invoiceResult.rows[0];
 
-    // 3. جلب الدفعة وقفل السطر ثانياً
     const paymentResult = await client.query(
       "SELECT * FROM payments WHERE id = $1 AND clinic_id = $2 FOR UPDATE;",
       [payment_id, clinic_id],
@@ -817,7 +832,6 @@ const voidPayment = async (req, res) => {
     }
     const payment = paymentResult.rows[0];
 
-    // التأكد إن الدفعة مسددة وليست ملغاة بالفعل
     if (payment.status !== "paid") {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -836,7 +850,6 @@ const voidPayment = async (req, res) => {
       });
     }
 
-    // 4. تحديث حالة الدفعة إلى cancelled مع تسجيل السبب واسم من قام بالإلغاء
     const voidNote = ` [ملغاة بواسطة ${req.user.name || "المدير"}: ${reason.trim()}]`;
     const updatedPaymentResult = await client.query(
       `UPDATE payments 
@@ -847,7 +860,6 @@ const voidPayment = async (req, res) => {
       [voidNote, payment_id, clinic_id],
     );
 
-    // 5. إعادة حساب إجمالي المدفوع الساري فقط بعد استبعاد الدفعة الملغاة
     const totalPaidResult = await client.query(
       `SELECT COALESCE(SUM(amount), 0) AS total_paid 
        FROM payments 
@@ -862,7 +874,6 @@ const voidPayment = async (req, res) => {
       parseFloat(totalPaidResult.rows[0].total_paid) * 100,
     );
 
-    // تقييم حالة الفاتورة الجديدة بدقة السنت
     let newInvoiceStatus = "unpaid";
     if (newPaidCents >= invoiceTotalCents) {
       newInvoiceStatus = "paid";
@@ -870,22 +881,22 @@ const voidPayment = async (req, res) => {
       newInvoiceStatus = "partially_paid";
     }
 
-    // لو الفاتورة متبقي عليها فلوس، نفك أرشفتها فوراً عشان ترجع تظهر في الديون
     let newIsArchived = invoice.is_archived;
     if (newInvoiceStatus !== "paid") {
       newIsArchived = false;
     }
 
-    // تحديث حالة الفاتورة والأرشفة
     await client.query(
       "UPDATE invoices SET status = $1, is_archived = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3 AND clinic_id = $4;",
       [newInvoiceStatus, newIsArchived, invoice.id, clinic_id],
     );
     await client.query("COMMIT");
 
-    const remainingAmount = (invoiceTotalCents - newPaidCents) / 100;
+    const remainingAmount = Math.max(
+      0,
+      (invoiceTotalCents - newPaidCents) / 100,
+    );
 
-    // 6. تسجيل العملية في سجل الرقابة
     try {
       await logActivity({
         clinic_id,
@@ -914,10 +925,14 @@ const voidPayment = async (req, res) => {
       remaining_amount: remainingAmount,
     });
   } catch (error) {
-    if (client) await client.query("ROLLBACK");
-    if (typeof captureError === "function") {
-      captureError(error, req);
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackErr) {
+        console.error("Rollback error:", rollbackErr.message);
+      }
     }
+    captureError(error, req);
     console.error("Error voiding payment:", error.message);
     res.status(500).json({ error: "حدث خطأ أثناء إلغاء الدفعة المالية" });
   } finally {

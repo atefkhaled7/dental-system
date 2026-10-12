@@ -33,7 +33,7 @@ const createLabOrder = async (req, res) => {
 
     const doctorCheck = await pool.query(
       "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor'",
-      [doctor_id, clinic_id]
+      [doctor_id, clinic_id],
     );
     if (doctorCheck.rows.length === 0) {
       return res.status(400).json({
@@ -43,7 +43,7 @@ const createLabOrder = async (req, res) => {
 
     const patientCheck = await pool.query(
       "SELECT id FROM patients WHERE id = $1 AND clinic_id = $2 AND is_active = TRUE",
-      [patient_id, clinic_id]
+      [patient_id, clinic_id],
     );
     if (patientCheck.rows.length === 0) {
       return res.status(400).json({
@@ -54,7 +54,7 @@ const createLabOrder = async (req, res) => {
     if (appointment_id) {
       const apptCheck = await pool.query(
         "SELECT id FROM appointments WHERE id = $1 AND clinic_id = $2 AND patient_id = $3",
-        [appointment_id, clinic_id, patient_id]
+        [appointment_id, clinic_id, patient_id],
       );
       if (apptCheck.rows.length === 0) {
         return res.status(400).json({
@@ -62,20 +62,35 @@ const createLabOrder = async (req, res) => {
         });
       }
     }
-    const addLabOrderQuery =
-      "INSERT INTO lab_orders (clinic_id, patient_id, doctor_id, appointment_id, lab_name, design_software, case_number, expected_at, notes, lab_notes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *";
+
+    const cleanLabName = lab_name.trim();
+    const cleanCaseNumber =
+      typeof case_number === "string" && case_number.trim() !== ""
+        ? case_number.trim()
+        : null;
+
+    const addLabOrderQuery = `
+      INSERT INTO lab_orders (
+        clinic_id, patient_id, doctor_id, appointment_id,
+        lab_name, design_software, case_number,
+        expected_at, notes, lab_notes
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING *
+    `;
+
     const result = await pool.query(addLabOrderQuery, [
       clinic_id,
       patient_id,
       doctor_id,
       appointment_id || null,
-      lab_name,
+      cleanLabName,
       design_software || null,
-      case_number || null,
+      cleanCaseNumber,
       expected_at || null,
       notes || null,
       lab_notes || null,
     ]);
+
     try {
       await logActivity({
         clinic_id,
@@ -85,13 +100,10 @@ const createLabOrder = async (req, res) => {
         entity_id: result.rows[0].id,
         description: `قام ${
           req.user.name || "الموظف"
-        } بإنشاء طلب معمل (${lab_name.trim()}) للمريض #${patient_id.slice(
-          0,
-          8
-        )}`,
+        } بإنشاء طلب معمل (${cleanLabName}) للمريض #${patient_id.slice(0, 8)}`,
         metadata: {
-          lab_name: lab_name.trim(),
-          case_number: case_number || null,
+          lab_name: cleanLabName,
+          case_number: cleanCaseNumber,
         },
       });
     } catch (auditError) {
@@ -113,6 +125,17 @@ const createLabOrder = async (req, res) => {
         error: "تاريخ الاستلام المتوقع يجب أن يكون بعد تاريخ الإرسال",
       });
     }
+    if (error.code === "22007" || error.code === "22008") {
+      return res.status(400).json({
+        error: "صيغة التاريخ غير صالحة",
+      });
+    }
+    if (error.code === "22001") {
+      return res.status(400).json({
+        error: "أحد الحقول يتجاوز الحد الأقصى المسموح به من الحروف",
+      });
+    }
+
     captureError(error, req);
     console.error("Error creating lab order:", error);
     res.status(500).json({ error: "خطأ في السيرفر أثناء إنشاء طلب المعمل" });
@@ -155,24 +178,30 @@ const getLabOrders = async (req, res) => {
       WHERE lab_orders.clinic_id = $1
     `;
     const queryParams = [clinic_id];
+
     if (status === "late") {
-      query += ` AND lab_orders.expected_at < CURRENT_DATE AND lab_orders.status NOT IN ('received', 'cancelled')`;
+      // حساب التاريخ بتوقيت القاهرة لمنع مشاكل فرق التوقيت مع سيرفرات Vercel/Neon
+      query += ` AND lab_orders.expected_at < (NOW() AT TIME ZONE 'Africa/Cairo')::date AND lab_orders.status NOT IN ('received', 'cancelled')`;
     } else if (status) {
       queryParams.push(status);
       query += ` AND lab_orders.status = $${queryParams.length}`;
     }
+
     if (lab_name) {
       queryParams.push(lab_name);
       query += ` AND lab_orders.lab_name = $${queryParams.length}`;
     }
+
     if (search && search.trim() !== "") {
       queryParams.push(`%${search.trim()}%`);
       query += ` AND (patients.name ILIKE $${queryParams.length} OR lab_orders.case_number ILIKE $${queryParams.length} OR lab_orders.lab_name ILIKE $${queryParams.length})`;
     }
+
     if (patient_id) {
       queryParams.push(patient_id);
       query += ` AND lab_orders.patient_id = $${queryParams.length}`;
     }
+
     query += ` ORDER BY lab_orders.sent_at DESC`;
 
     const isPaginated = page !== undefined || limit !== undefined;
@@ -181,9 +210,7 @@ const getLabOrders = async (req, res) => {
       const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
       const offset = (pageNum - 1) * limitNum;
 
-      query += ` LIMIT $${queryParams.length + 1} OFFSET $${
-        queryParams.length + 2
-      };`;
+      query += ` LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2};`;
       queryParams.push(limitNum, offset);
 
       const result = await pool.query(query, queryParams);
@@ -218,6 +245,10 @@ const updateLabOrderStatus = async (req, res) => {
     const clinic_id = req.user.clinic_id;
     const { id } = req.params;
     const { status } = req.body;
+
+    if (!isValidUuid(id)) {
+      return res.status(400).json({ error: "معرّف طلب المعمل غير صالح" });
+    }
 
     if (!["ready", "received", "sent_to_lab", "cancelled"].includes(status)) {
       return res.status(400).json({ error: "الحالة غير صالحة" });
@@ -275,6 +306,10 @@ const updateLabOrder = async (req, res) => {
     const clinic_id = req.user.clinic_id;
     const { id } = req.params;
 
+    if (!isValidUuid(id)) {
+      return res.status(400).json({ error: "معرّف طلب المعمل غير صالح" });
+    }
+
     const allowedFields = [
       "lab_name",
       "case_number",
@@ -289,7 +324,20 @@ const updateLabOrder = async (req, res) => {
 
     for (const field of allowedFields) {
       if (Object.prototype.hasOwnProperty.call(req.body, field)) {
-        queryParams.push(req.body[field] === "" ? null : req.body[field]);
+        let val = req.body[field];
+
+        if (field === "lab_name") {
+          if (typeof val !== "string" || val.trim() === "") {
+            return res
+              .status(400)
+              .json({ error: "اسم المعمل لا يمكن أن يكون فارغاً" });
+          }
+          val = val.trim();
+        } else if (typeof val === "string") {
+          val = val.trim() === "" ? null : val.trim();
+        }
+
+        queryParams.push(val);
         updateParts.push(`${field} = $${queryParams.length}`);
       }
     }
@@ -334,6 +382,22 @@ const updateLabOrder = async (req, res) => {
         error: "رقم الحالة مسجل بالفعل في هذه العيادة",
       });
     }
+    if (error.code === "23514") {
+      return res.status(400).json({
+        error: "تاريخ الاستلام المتوقع يجب أن يكون بعد تاريخ الإرسال",
+      });
+    }
+    if (error.code === "22007" || error.code === "22008") {
+      return res.status(400).json({
+        error: "صيغة التاريخ غير صالحة",
+      });
+    }
+    if (error.code === "22001") {
+      return res.status(400).json({
+        error: "أحد الحقول يتجاوز الحد الأقصى المسموح به من الحروف",
+      });
+    }
+
     captureError(error, req);
     console.error("Error updating lab order:", error.message);
     res.status(500).json({
@@ -348,7 +412,7 @@ const getDistinctLabs = async (req, res) => {
     const { clinic_id } = req.user;
     const result = await pool.query(
       "SELECT DISTINCT lab_name FROM lab_orders WHERE clinic_id = $1 AND lab_name IS NOT NULL AND lab_name <> '' ORDER BY lab_name ASC",
-      [clinic_id]
+      [clinic_id],
     );
     res.status(200).json({ labs: result.rows.map((r) => r.lab_name) });
   } catch (error) {
@@ -358,11 +422,10 @@ const getDistinctLabs = async (req, res) => {
   }
 };
 
-// ضيف getDistinctLabs في module.exports:
 module.exports = {
   createLabOrder,
   getLabOrders,
   updateLabOrderStatus,
   updateLabOrder,
-  getDistinctLabs, 
+  getDistinctLabs,
 };

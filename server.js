@@ -44,6 +44,11 @@ app.use(
 // 4. Body Parsers (حماية من الـ DoS عبر تقييد حجم الـ Payload)
 app.use(express.json({ limit: "100kb" }));
 
+// 🔒 حماية مركزية: ضمان أن req.body دائماً كائن حتى عند غياب الـ Body أو Content-Type
+app.use((req, res, next) => {
+  if (req.body === undefined) req.body = {};
+  next();
+});
 // 5. Rate Limiters
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,

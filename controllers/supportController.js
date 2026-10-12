@@ -1,12 +1,39 @@
 const pool = require("../db");
 const { captureError } = require("../utils/errorTracker");
 const { normalizeEgyptianPhone } = require("../utils/phoneNormalizer");
+const { isValidUuid } = require("../middleware/validateUuid");
 
 // 1. إنشاء تذكرة دعم جديدة
 const createSupportTicket = async (req, res) => {
-  const { category, message, page_url, browser_info, contact_phone } = req.body;
-  const clinic_id = req.user?.clinic_id;
+  const {
+    category,
+    message,
+    page_url,
+    browser_info,
+    contact_phone,
+    clinic_id: bodyClinicId,
+  } = req.body || {};
   const user_id = req.user?.id;
+  const userRole = req.user?.role;
+  let clinic_id = req.user?.clinic_id;
+
+  // إذا كان المستخدم SuperAdmin، يجب تمرير clinic_id صراحة لمنع مخالفة قيد NOT NULL
+  if (userRole === "SuperAdmin") {
+    if (bodyClinicId && isValidUuid(bodyClinicId)) {
+      clinic_id = bodyClinicId;
+    } else {
+      return res.status(400).json({
+        error:
+          "حساب السوبر أدمن غير مرتبط بعيادة افتراضية، يرجى تحديد معرّف العيادة (clinic_id) لإنشاء التذكرة",
+      });
+    }
+  }
+
+  if (!clinic_id || !isValidUuid(clinic_id)) {
+    return res.status(400).json({
+      error: "تذاكر الدعم الفني مخصصة لمستخدمي العيادات المسجلين فقط",
+    });
+  }
 
   try {
     if (!message || typeof message !== "string" || message.trim().length < 5) {
@@ -18,9 +45,7 @@ const createSupportTicket = async (req, res) => {
     const validCategories = ["bug", "question", "feature"];
     const safeCategory = validCategories.includes(category) ? category : "bug";
 
-    // 🔒 تحصين رقم الهاتف لتفادي كسر الـ VARCHAR(20)
     let safePhone = null;
-
     if (
       contact_phone !== undefined &&
       contact_phone !== null &&
@@ -31,15 +56,12 @@ const createSupportTicket = async (req, res) => {
           error: "رقم الهاتف غير صالح",
         });
       }
-
       const normalized = normalizeEgyptianPhone(contact_phone.trim());
-
       if (typeof normalized !== "string" || normalized.length > 20) {
         return res.status(400).json({
           error: "يرجى إدخال رقم هاتف مصري صحيح",
         });
       }
-
       safePhone = normalized;
     }
 
@@ -59,7 +81,7 @@ const createSupportTicket = async (req, res) => {
         clinic_id,
         user_id,
         safeCategory,
-        message.trim(),
+        message.trim().slice(0, 5000),
         page_url ? String(page_url).slice(0, 500) : null,
         browser_info ? String(browser_info).slice(0, 1000) : null,
         safePhone,
@@ -95,12 +117,10 @@ const getSupportTickets = async (req, res) => {
       LEFT JOIN users u ON st.user_id = u.id
     `;
     const params = [];
-
     if (!isSuperAdmin) {
       query += ` WHERE st.clinic_id = $1 `;
       params.push(clinic_id);
     }
-
     query += ` ORDER BY st.created_at DESC LIMIT 50;`;
 
     const result = await pool.query(query, params);
@@ -115,7 +135,7 @@ const getSupportTickets = async (req, res) => {
 // 3. تحديث حالة التذكرة وإغلاقها (SuperAdmin فقط)
 const updateTicketStatus = async (req, res) => {
   const { id } = req.params;
-  const { status, admin_notes } = req.body;
+  const { status, admin_notes } = req.body || {};
 
   if (req.user.role !== "SuperAdmin") {
     return res
@@ -123,23 +143,30 @@ const updateTicketStatus = async (req, res) => {
       .json({ error: "هذه الصلاحية خاصة بالسوبر أدمن فقط" });
   }
 
-  const validStatuses = ["open", "resolved", "closed"];
+  if (!isValidUuid(id)) {
+    return res.status(400).json({ error: "معرّف التذكرة غير صالح" });
+  }
 
+  const validStatuses = ["open", "resolved", "closed"];
   if (!validStatuses.includes(status)) {
     return res.status(400).json({
       error: "حالة التذكرة غير صالحة",
     });
   }
 
-  const safeStatus = status;
-
   try {
     const result = await pool.query(
       `UPDATE support_tickets 
-       SET status = $1, admin_notes = COALESCE($2, admin_notes)
+       SET status = $1, 
+           admin_notes = COALESCE($2, admin_notes),
+           updated_at = CURRENT_TIMESTAMP
        WHERE id = $3
        RETURNING *;`,
-      [safeStatus, admin_notes ? String(admin_notes).trim() : null, id],
+      [
+        status,
+        admin_notes ? String(admin_notes).trim().slice(0, 2000) : null,
+        id,
+      ],
     );
 
     if (result.rows.length === 0) {

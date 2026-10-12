@@ -3,6 +3,9 @@ const { logActivity } = require("../utils/auditLogger");
 const { isValidUuid } = require("../middleware/validateUuid");
 const { captureError } = require("../utils/errorTracker");
 
+// ==========================================
+// 1. إنشاء فاتورة جديدة
+// ==========================================
 const createInvoice = async (req, res) => {
   const {
     patient_id,
@@ -14,7 +17,9 @@ const createInvoice = async (req, res) => {
   } = req.body;
   const clinic_id = req.user.clinic_id;
 
-  // 🔒 فحص الـ UUIDs لمدخلات الـ body (بدون أي queryParams)
+  let finalAppointmentId = appointment_id || null;
+  let finalInvoiceDoctorId = null;
+  // 🔒 فحص الـ UUIDs لمدخلات الـ body
   if (!patient_id || !isValidUuid(patient_id)) {
     return res.status(400).json({ error: "معرّف المريض غير صالح" });
   }
@@ -37,11 +42,16 @@ const createInvoice = async (req, res) => {
     ) {
       return res.status(400).json({ error: "وصف البند مطلوب لكل البنود" });
     }
-    const qty = parseInt(item.quantity, 10);
-    if (isNaN(qty) || qty <= 0) {
+    if (item.procedure_code_id && !isValidUuid(item.procedure_code_id)) {
       return res
         .status(400)
-        .json({ error: "الكمية يجب أن تكون رقماً صحيحاً أكبر من الصفر" });
+        .json({ error: "معرّف الإجراء الطبي المرفق بالبند غير صالح" });
+    }
+    const qty = parseInt(item.quantity, 10);
+    if (isNaN(qty) || qty <= 0 || qty > 1000) {
+      return res
+        .status(400)
+        .json({ error: "الكمية يجب أن تكون رقماً صحيحاً بين 1 و 1000" });
     }
     const price = parseFloat(item.unit_price);
     if (isNaN(price) || price < 0) {
@@ -51,7 +61,7 @@ const createInvoice = async (req, res) => {
     }
   }
 
-  // حساب الإجمالي بالقروش لتجنب مشاكل الفاصلة العائمة
+  // حساب الإجمالي بالقروش بدقة لتجنب مشاكل الفاصلة العائمة
   const totalAmountInCents = items.reduce((total, item) => {
     const qty = parseInt(item.quantity, 10);
     const unitPriceCents = Math.round(parseFloat(item.unit_price) * 100);
@@ -59,8 +69,30 @@ const createInvoice = async (req, res) => {
   }, 0);
 
   const totalAmount = totalAmountInCents / 100;
-  const paidNow = initial_payment ? parseFloat(initial_payment.amount) || 0 : 0;
-  const paidNowCents = Math.round(paidNow * 100);
+
+  // التحقق من الدفعة الفورية إن وُجدت
+  let paidNowCents = 0;
+  if (
+    initial_payment &&
+    initial_payment.amount !== undefined &&
+    initial_payment.amount !== null &&
+    initial_payment.amount !== ""
+  ) {
+    const rawPaid = parseFloat(initial_payment.amount);
+    if (isNaN(rawPaid) || rawPaid < 0) {
+      return res.status(400).json({
+        error: "المبلغ المدفوع يجب أن يكون رقماً صالحاً وغير سالب",
+      });
+    }
+    if (rawPaid > 0 && rawPaid < 0.01) {
+      return res.status(400).json({
+        error: "أقل مبلغ دفع مسموح به هو 0.01 ج.م (قرش واحد)",
+      });
+    }
+    paidNowCents = Math.round(rawPaid * 100);
+  }
+
+  const paidNow = paidNowCents / 100;
 
   if (paidNowCents > totalAmountInCents) {
     return res.status(400).json({
@@ -69,7 +101,6 @@ const createInvoice = async (req, res) => {
   }
 
   let initialStatus = "unpaid";
-  // إذا كانت الفاتورة بقيمة صفر (كشف مجاني) أو تم سداد كامل المبلغ فوراً
   if (
     totalAmountInCents === 0 ||
     (paidNowCents >= totalAmountInCents && totalAmountInCents > 0)
@@ -86,7 +117,6 @@ const createInvoice = async (req, res) => {
     "vodafone_cash",
     "other",
   ];
-  // توحيد الحروف الصغيرة ومعالجة الفروق الشائعة
   let rawMethod = (initial_payment?.payment_method || "cash")
     .toLowerCase()
     .trim();
@@ -114,12 +144,10 @@ const createInvoice = async (req, res) => {
       return res.status(404).json({ error: "المريض غير موجود في هذه العيادة" });
     }
 
-    let finalAppointmentId = appointment_id || null;
-
     // 2. التحقق من الموعد إذا تم تمريره
     if (finalAppointmentId) {
       const apptCheck = await client.query(
-        `SELECT id
+        `SELECT id, doctor_id
          FROM appointments
          WHERE id = $1
            AND clinic_id = $2
@@ -134,6 +162,20 @@ const createInvoice = async (req, res) => {
           error: "الموعد المحدد لا يخص هذا المريض أو العيادة",
         });
       }
+      const appointmentDoctorId = apptCheck.rows[0].doctor_id;
+
+      if (
+        doctor_id &&
+        String(doctor_id).toLowerCase() !==
+          String(appointmentDoctorId || "").toLowerCase()
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: "الطبيب المحدد لا يطابق الطبيب المسجل في الموعد",
+        });
+      }
+
+      finalInvoiceDoctorId = appointmentDoctorId || null;
 
       const existingInvoiceCheck = await client.query(
         `SELECT id
@@ -156,7 +198,6 @@ const createInvoice = async (req, res) => {
 
     // 3. إنشاء موعد تلقائي سليم ومحمى من التعارض إذا حُدد دكتور بدون موعد سابق
     if (!finalAppointmentId && doctor_id) {
-      // قفل صف الطبيب النشط لحماية التزامن
       const doctorCheck = await client.query(
         "SELECT id FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor' AND is_active = TRUE FOR UPDATE",
         [doctor_id, clinic_id],
@@ -168,7 +209,6 @@ const createInvoice = async (req, res) => {
         });
       }
 
-      // فحص صحة التاريخ
       let appDate;
       if (appointment_date) {
         appDate = new Date(appointment_date);
@@ -180,7 +220,6 @@ const createInvoice = async (req, res) => {
         appDate = new Date();
       }
 
-      // جلب مدة الكشف الافتراضية للعيادة
       const clinicRes = await client.query(
         "SELECT default_appointment_duration FROM clinics WHERE id = $1",
         [clinic_id],
@@ -191,16 +230,15 @@ const createInvoice = async (req, res) => {
       const isFuture = appDate > new Date();
       const appStatus = isFuture ? "scheduled" : "completed";
 
-      // إذا كان الموعد في المستقبل، نطبق فحص التعارض الزمني
       if (isFuture) {
         const conflictCheck = await client.query(
           `SELECT id FROM appointments
-       WHERE clinic_id = $1 
-         AND doctor_id = $2 
-         AND status = 'scheduled'
-         AND appointment_date < ($3::timestamptz + ($4 * INTERVAL '1 minute'))
-         AND (appointment_date + (duration_minutes * INTERVAL '1 minute')) > $3::timestamptz
-       LIMIT 1`,
+           WHERE clinic_id = $1 
+             AND doctor_id = $2 
+             AND status NOT IN ('cancelled', 'no_show')
+             AND appointment_date < ($3::timestamptz + ($4 * INTERVAL '1 minute'))
+             AND (appointment_date + (duration_minutes * INTERVAL '1 minute')) > $3::timestamptz
+           LIMIT 1`,
           [clinic_id, doctor_id, appDate.toISOString(), apptDuration],
         );
 
@@ -212,10 +250,12 @@ const createInvoice = async (req, res) => {
         }
       }
 
+      finalInvoiceDoctorId = doctor_id;
+
       const autoAppt = await client.query(
         `INSERT INTO appointments (clinic_id, patient_id, doctor_id, appointment_date, duration_minutes, status, notes)
-     VALUES ($1, $2, $3, $4, $5, $6, 'كشف مربوط بالفاتورة')
-     RETURNING id;`,
+         VALUES ($1, $2, $3, $4, $5, $6, 'كشف مربوط بالفاتورة')
+         RETURNING id;`,
         [
           clinic_id,
           patient_id,
@@ -228,16 +268,17 @@ const createInvoice = async (req, res) => {
       finalAppointmentId = autoAppt.rows[0].id;
     }
 
-    // 4. إنشاء الفاتورة
+    // 4. إنشاء الفاتورة مع حفظ doctor_id لتسهيل تقارير الإنتاجية
     const insertInvoiceQuery = `
-      INSERT INTO invoices (clinic_id, patient_id, appointment_id, total_amount, status)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO invoices (clinic_id, patient_id, appointment_id, doctor_id, total_amount, status)
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING *;
     `;
     const invoiceResult = await client.query(insertInvoiceQuery, [
       clinic_id,
       patient_id,
       finalAppointmentId,
+      finalInvoiceDoctorId,
       totalAmount,
       initialStatus,
     ]);
@@ -245,7 +286,7 @@ const createInvoice = async (req, res) => {
     const newInvoice = invoiceResult.rows[0];
     const invoiceId = newInvoice.id;
 
-    // 5. إدخال البنود
+    // 5. إدخال البنود بدقة القروش
     const insertItemQuery = `
       INSERT INTO invoice_items (clinic_id, invoice_id, procedure_code_id, description, quantity, unit_price, total_price)
       VALUES ($1, $2, $3, $4, $5, $6, $7);
@@ -253,8 +294,9 @@ const createInvoice = async (req, res) => {
 
     for (const item of items) {
       const qty = parseInt(item.quantity, 10);
-      const unitPrice = parseFloat(item.unit_price);
-      const itemTotal = (qty * Math.round(unitPrice * 100)) / 100;
+      const unitPriceCents = Math.round(parseFloat(item.unit_price) * 100);
+      const unitPrice = unitPriceCents / 100;
+      const itemTotal = (qty * unitPriceCents) / 100;
 
       await client.query(insertItemQuery, [
         clinic_id,
@@ -268,10 +310,10 @@ const createInvoice = async (req, res) => {
     }
 
     // 6. تسجيل الدفعة الفورية إذا وُجدت
-    if (paidNow > 0) {
+    if (paidNowCents > 0) {
       await client.query(
         `INSERT INTO payments (clinic_id, invoice_id, amount, payment_method, notes, status, created_by, paid_at)
-     VALUES ($1, $2, $3, $4, $5, 'paid', $6, CURRENT_TIMESTAMP);`,
+         VALUES ($1, $2, $3, $4, $5, 'paid', $6, CURRENT_TIMESTAMP);`,
         [
           clinic_id,
           invoiceId,
@@ -304,7 +346,7 @@ const createInvoice = async (req, res) => {
         },
       });
 
-      if (paidNow > 0) {
+      if (paidNowCents > 0) {
         await logActivity({
           clinic_id,
           user_id: req.user.id,
@@ -342,7 +384,12 @@ const createInvoice = async (req, res) => {
 
     if (error.code === "23503") {
       return res.status(400).json({
-        error: "بيانات غير صحيحة (مريض أو دكتور أو بند غير موجود)",
+        error: "بيانات غير صحيحة (مريض أو دكتور أو إجراء غير موجود)",
+      });
+    }
+    if (error.code === "22P02") {
+      return res.status(400).json({
+        error: "معرّف غير صالح",
       });
     }
 
@@ -369,7 +416,6 @@ const getInvoices = async (req, res) => {
   }
 
   try {
-    // 1. حساب الـ Pagination
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
     const offset = (pageNum - 1) * limitNum;
@@ -387,13 +433,16 @@ const getInvoices = async (req, res) => {
           SUM(CASE WHEN payments.status = 'paid' THEN payments.amount ELSE 0 END),
           0
         ) AS paid_amount,
-        (
-          invoices.total_amount -
-          COALESCE(
-            SUM(CASE WHEN payments.status = 'paid' THEN payments.amount ELSE 0 END),
-            0
+        CASE 
+          WHEN invoices.status = 'cancelled' THEN 0 
+          ELSE ROUND(
+            GREATEST(
+              0,
+              invoices.total_amount - COALESCE(SUM(CASE WHEN payments.status = 'paid' THEN payments.amount ELSE 0 END), 0)
+            ),
+            2
           )
-        ) AS remaining_amount,
+        END AS remaining_amount,
         COUNT(*) OVER() AS full_count
       FROM invoices 
       JOIN patients ON invoices.patient_id = patients.id AND patients.clinic_id = invoices.clinic_id
@@ -404,34 +453,29 @@ const getInvoices = async (req, res) => {
     const queryParams = [clinic_id];
     let paramCounter = 2;
 
-    // 2. فلتر البحث بالاسم أو التليفون
     if (search && search.trim() !== "") {
       queryParams.push(`%${search.trim()}%`);
       query += ` AND (patients.name ILIKE $${paramCounter} OR patients.phone_number ILIKE $${paramCounter})`;
       paramCounter++;
     }
 
-    // 3. فلتر حالة الدفع (paid / partially_paid / unpaid / cancelled)
     if (status && status.trim() !== "") {
       queryParams.push(status.trim());
       query += ` AND invoices.status = $${paramCounter}`;
       paramCounter++;
     }
 
-    // 4. فلتر مريض محدد
     if (patient_id) {
       queryParams.push(patient_id);
       query += ` AND invoices.patient_id = $${paramCounter}`;
       paramCounter++;
     }
 
-    // 5. فلتر الأرشفة (الافتراضي: الفواتير النشطة فقط)
     const isArchived = archived === "true";
     queryParams.push(isArchived);
     query += ` AND invoices.is_archived = $${paramCounter}`;
     paramCounter++;
 
-    // 6. الترتيب وتقسيم الصفحات
     query += ` GROUP BY invoices.id, patients.name, patients.phone_number ORDER BY invoices.created_at DESC LIMIT $${paramCounter} OFFSET $${
       paramCounter + 1
     };`;
@@ -439,13 +483,11 @@ const getInvoices = async (req, res) => {
 
     const invoicesResult = await pool.query(query, queryParams);
 
-    // استخراج الإجمالي الكلي للنتائج المطابقة
     const total =
       invoicesResult.rows.length > 0
         ? Number(invoicesResult.rows[0].full_count)
         : 0;
 
-    // تنظيف الحقل full_count من كائنات الفواتير
     const invoices = invoicesResult.rows.map(
       ({ full_count, ...invoice }) => invoice,
     );
@@ -467,16 +509,18 @@ const getInvoices = async (req, res) => {
   }
 };
 
+// ==========================================
+// 3. جلب تفاصيل فاتورة واحدة
+// ==========================================
 const getInvoiceById = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const invoiceId = req.params.id;
 
-  if (!isValidUuid(req.params.id)) {
+  if (!isValidUuid(invoiceId)) {
     return res.status(400).json({ error: "معرّف الفاتورة غير صالح" });
   }
 
   try {
-    // جلب الفاتورة مع المريض والدكتور وميعاد الكشف
     const invoiceQuery = `
       SELECT 
         invoices.*, 
@@ -487,7 +531,9 @@ const getInvoiceById = async (req, res) => {
       FROM invoices 
       JOIN patients ON invoices.patient_id = patients.id 
       LEFT JOIN appointments ON invoices.appointment_id = appointments.id
-      LEFT JOIN users ON appointments.doctor_id = users.id
+      LEFT JOIN users
+      ON COALESCE(invoices.doctor_id, appointments.doctor_id) = users.id
+      AND users.clinic_id = invoices.clinic_id
       WHERE invoices.clinic_id = $1 AND invoices.id = $2
     `;
 
@@ -509,20 +555,26 @@ const getInvoiceById = async (req, res) => {
     );
     invoice.items = itemsResult.rows;
 
-    // جلب سجل المدفوعات بالتفصيل (دفع إيه وإمتى وطريقة الدفع)
+    // جلب سجل المدفوعات
     const paymentsResult = await pool.query(
       "SELECT id, amount, payment_method, CASE WHEN status = 'pending' AND expires_at < NOW() THEN 'expired' ELSE status END AS status, notes, paid_at, created_at FROM payments WHERE clinic_id = $1 AND invoice_id = $2 ORDER BY paid_at DESC",
       [clinic_id, invoiceId],
     );
     invoice.payments = paymentsResult.rows;
 
-    // حساب المدفوع والمتبقي
-    const totalPaid = paymentsResult.rows
+    // حساب المدفوع والمتبقي بدقة القروش ومنع أي سالب
+    const totalPaidCents = paymentsResult.rows
       .filter((p) => p.status === "paid")
-      .reduce((sum, p) => sum + parseFloat(p.amount), 0);
+      .reduce((sum, p) => sum + Math.round(parseFloat(p.amount) * 100), 0);
 
-    invoice.paid_amount = totalPaid;
-    invoice.remaining_amount = parseFloat(invoice.total_amount) - totalPaid;
+    const totalAmountCents = Math.round(parseFloat(invoice.total_amount) * 100);
+    const remainingCents =
+      invoice.status === "cancelled"
+        ? 0
+        : Math.max(0, totalAmountCents - totalPaidCents);
+
+    invoice.paid_amount = totalPaidCents / 100;
+    invoice.remaining_amount = remainingCents / 100;
 
     res.status(200).json(invoice);
   } catch (error) {
@@ -532,11 +584,14 @@ const getInvoiceById = async (req, res) => {
   }
 };
 
+// ==========================================
+// 4. إلغاء الفاتورة غير المدفوعة
+// ==========================================
 const cancelInvoice = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const invoiceId = req.params.id;
 
-  if (!isValidUuid(req.params.id)) {
+  if (!isValidUuid(invoiceId)) {
     return res.status(400).json({ error: "معرّف الفاتورة غير صالح" });
   }
 
@@ -545,42 +600,58 @@ const cancelInvoice = async (req, res) => {
     client = await pool.connect();
     await client.query("BEGIN");
 
-    // إلغاء الفاتورة فقط إذا كانت غير مدفوعة وتتبع نفس العيادة
+    // التحقق من وجود الفاتورة وحالتها الحالية
+    const checkRes = await client.query(
+      `SELECT status FROM invoices WHERE clinic_id = $1 AND id = $2 FOR UPDATE`,
+      [clinic_id, invoiceId],
+    );
+
+    if (checkRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "الفاتورة غير موجودة" });
+    }
+
+    const currentStatus = checkRes.rows[0].status;
+    if (currentStatus === "cancelled") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ error: "الفاتورة ملغاة بالفعل" });
+    }
+
+    if (currentStatus !== "unpaid") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: "لا يمكن إلغاء فاتورة تم سداد جزء منها أو تم سدادها بالكامل",
+      });
+    }
+
+    // إلغاء الفاتورة
     const result = await client.query(
       `UPDATE invoices 
        SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP 
-       WHERE clinic_id = $1 AND id = $2 AND status = 'unpaid' 
+       WHERE clinic_id = $1 AND id = $2 
        RETURNING *`,
       [clinic_id, invoiceId],
     );
 
-    if (result.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({
-        error: "الفاتورة غير موجودة أو تم سدادها بالفعل ولا يمكن إلغاؤها",
-      });
-    }
-
     // فك بنود خطط العلاج المربوطة بهذه الفاتورة لترجع قابلة للفوترة من جديد
     await client.query(
       `UPDATE treatment_plan_items 
-   SET invoice_id = NULL
-   WHERE clinic_id = $1 AND invoice_id = $2`,
+       SET invoice_id = NULL
+       WHERE clinic_id = $1 AND invoice_id = $2`,
       [clinic_id, invoiceId],
     );
 
     // إلغاء أي روابط دفع إلكتروني معلقة (pending) تابعة لهذه الفاتورة
     await client.query(
       `UPDATE payments 
-   SET status = 'cancelled', 
-       notes = COALESCE(notes, '') || ' [ملغى: تم إلغاء الفاتورة الأصلية]'
-   WHERE clinic_id = $1 AND invoice_id = $2 AND status = 'pending'`,
+       SET status = 'cancelled', 
+           notes = COALESCE(notes, '') || ' [ملغى: تم إلغاء الفاتورة الأصلية]'
+       WHERE clinic_id = $1 AND invoice_id = $2 AND status = 'pending'`,
       [clinic_id, invoiceId],
     );
 
     await client.query("COMMIT");
 
-    // تسجيل العملية في الرقابة
     try {
       await logActivity({
         clinic_id,
@@ -621,6 +692,9 @@ const cancelInvoice = async (req, res) => {
   }
 };
 
+// ==========================================
+// 5. أرشفة الفاتورة
+// ==========================================
 const archiveInvoice = async (req, res) => {
   try {
     const { id } = req.params;
@@ -631,7 +705,6 @@ const archiveInvoice = async (req, res) => {
       return res.status(400).json({ error: "معرّف الفاتورة غير صالح" });
     }
 
-    // منع الريسبشن من أرشفة الفواتير
     if (userRole !== "ClinicAdmin") {
       return res.status(403).json({
         error: "غير مصرح لك بأرشفة الفواتير، هذه الصلاحية لمدير العيادة فقط",
@@ -657,7 +730,6 @@ const archiveInvoice = async (req, res) => {
       });
     }
 
-    // 🔒 تسجيل العملية في الرقابة أولاً قبل إرسال الرد لضمان عدم ضياعها على Vercel
     try {
       await logActivity({
         clinic_id,
@@ -686,13 +758,11 @@ const archiveInvoice = async (req, res) => {
 
 // ==========================================
 // 6. تصدير التقرير المالي والفواتير كـ CSV
-// ClinicAdmin فقط
 // ==========================================
 const exportInvoices = async (req, res) => {
   try {
     const { clinic_id, role } = req.user;
 
-    // طبقة حماية إضافية داخل الـcontroller
     if (role !== "ClinicAdmin") {
       return res.status(403).json({
         error: "غير مصرح لك بتصدير التقارير المالية",
@@ -720,19 +790,16 @@ const exportInvoices = async (req, res) => {
           ),
           0
         ) AS paid_amount,
-        (
-          invoices.total_amount -
-          COALESCE(
-            SUM(
-              CASE
-                WHEN payments.status = 'paid'
-                THEN payments.amount
-                ELSE 0
-              END
+        CASE 
+          WHEN invoices.status = 'cancelled' THEN 0 
+          ELSE ROUND(
+            GREATEST(
+              0,
+              invoices.total_amount - COALESCE(SUM(CASE WHEN payments.status = 'paid' THEN payments.amount ELSE 0 END), 0)
             ),
-            0
+            2
           )
-        ) AS remaining_amount
+        END AS remaining_amount
       FROM invoices
       JOIN patients
         ON invoices.patient_id = patients.id
@@ -751,10 +818,8 @@ const exportInvoices = async (req, res) => {
 
     const result = await pool.query(query, [clinic_id]);
 
-    // حماية قيم CSV من الاقتباسات + Formula Injection
     const escapeCsvValue = (value) => {
       const stringValue = String(value ?? "");
-
       const safeValue = /^[=+\-@]/.test(stringValue)
         ? `'${stringValue}`
         : stringValue;
@@ -762,7 +827,6 @@ const exportInvoices = async (req, res) => {
       return `"${safeValue.replace(/"/g, '""')}"`;
     };
 
-    // UTF-8 BOM لدعم العربية بشكل أفضل في Excel
     let csv =
       "\uFEFFرقم الفاتورة,اسم المريض,رقم الهاتف,إجمالي الفاتورة (ج.م),المدفوع (ج.م),المتبقي (ج.م),حالة الدفع,تاريخ الفاتورة\n";
 
@@ -783,7 +847,6 @@ const exportInvoices = async (req, res) => {
       const remaining = parseFloat(inv.remaining_amount || 0);
 
       const status = escapeCsvValue(statusMap[inv.status] || inv.status || "-");
-
       const date = escapeCsvValue(inv.created_at || "-");
 
       csv += `${invId},${patient},${phone},${total},${paid},${remaining},${status},${date}\n`;

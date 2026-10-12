@@ -2,6 +2,7 @@ const pool = require("../db");
 const bcrypt = require("bcrypt");
 const { logActivity } = require("../utils/auditLogger");
 const { captureError } = require("../utils/errorTracker");
+const { isValidUuid } = require("../middleware/validateUuid");
 
 // 1. جلب طاقم العيادة الحالية
 const getClinicStaff = async (req, res) => {
@@ -52,12 +53,31 @@ const addStaffMember = async (req, res) => {
       });
     }
 
+    if (password.length > 72) {
+      return res.status(400).json({
+        error: "كلمة المرور يجب أن لا تتجاوز 72 حرفاً",
+      });
+    }
+
     const cleanName = name.trim();
     const cleanEmail = email.trim().toLowerCase();
 
     if (!cleanName || !cleanEmail) {
       return res.status(400).json({
         error: "الاسم والبريد الإلكتروني مطلوبان",
+      });
+    }
+
+    if (cleanName.length > 100) {
+      return res.status(400).json({
+        error: "اسم الموظف يجب ألا يتجاوز 100 حرف",
+      });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(cleanEmail) || cleanEmail.length > 255) {
+      return res.status(400).json({
+        error: "صيغة البريد الإلكتروني غير صالحة",
       });
     }
 
@@ -111,6 +131,11 @@ const addStaffMember = async (req, res) => {
         error: "البريد الإلكتروني مسجل بالفعل لمستخدم آخر",
       });
     }
+    if (error.code === "22001") {
+      return res.status(400).json({
+        error: "أحد البيانات المدخلة يتجاوز الحد الأقصى المسموح به",
+      });
+    }
     captureError(error, req);
     console.error("Error adding staff member:", error.message);
     return res.status(500).json({
@@ -119,11 +144,17 @@ const addStaffMember = async (req, res) => {
   }
 };
 
-// 3. تعطيل أو تفعيل حساب موظف (مع إبطال جلساته فوراً عند التعطيل)
+// 3. تعطيل أو تفعيل حساب موظف (مع دعم Idempotent Boolean وإبطال الجلسات عند التعطيل)
 const toggleStaffStatus = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
     const targetUserId = req.params.id;
+
+    if (!isValidUuid(targetUserId)) {
+      return res.status(400).json({
+        error: "معرّف الموظف غير صالح",
+      });
+    }
 
     // منع الأدمن من تعطيل نفسه
     if (targetUserId === req.user.id) {
@@ -132,18 +163,39 @@ const toggleStaffStatus = async (req, res) => {
       });
     }
 
-    const query = `
-      UPDATE users
-      SET is_active = NOT is_active,
-          token_version = COALESCE(token_version, 1) + 1,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = $1
-        AND clinic_id = $2
-        AND role IN ('Doctor', 'Receptionist')
-      RETURNING id, name, role, is_active;
-    `;
+    const { is_active } = req.body || {};
+    let query;
+    let queryParams;
 
-    const result = await pool.query(query, [targetUserId, clinicId]);
+    // لو الـ frontend بعت قيمة boolean صريحة نجعل العملية Idempotent
+    if (typeof is_active === "boolean") {
+      query = `
+        UPDATE users
+        SET is_active = $1,
+            token_version = CASE WHEN $1 = FALSE THEN COALESCE(token_version, 1) + 1 ELSE token_version END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $2
+          AND clinic_id = $3
+          AND role IN ('Doctor', 'Receptionist')
+        RETURNING id, name, role, is_active;
+      `;
+      queryParams = [is_active, targetUserId, clinicId];
+    } else {
+      // التوافق القديم في حال تم استدعاء الـ endpoint بدون body
+      query = `
+        UPDATE users
+        SET is_active = NOT is_active,
+            token_version = COALESCE(token_version, 1) + 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+          AND clinic_id = $2
+          AND role IN ('Doctor', 'Receptionist')
+        RETURNING id, name, role, is_active;
+      `;
+      queryParams = [targetUserId, clinicId];
+    }
+
+    const result = await pool.query(query, queryParams);
 
     if (result.rows.length === 0) {
       return res.status(404).json({
@@ -193,9 +245,21 @@ const resetStaffPassword = async (req, res) => {
     const targetUserId = req.params.id;
     const { new_password } = req.body;
 
+    if (!isValidUuid(targetUserId)) {
+      return res.status(400).json({
+        error: "معرّف الموظف غير صالح",
+      });
+    }
+
     if (!new_password || new_password.length < 8) {
       return res.status(400).json({
         error: "كلمة المرور الجديدة يجب أن لا تقل عن 8 أحرف",
+      });
+    }
+
+    if (new_password.length > 72) {
+      return res.status(400).json({
+        error: "كلمة المرور الجديدة يجب أن لا تتجاوز 72 حرفاً",
       });
     }
 
@@ -260,10 +324,20 @@ const updateStaffName = async (req, res) => {
     const targetUserId = req.params.id;
     const { name } = req.body;
 
+    if (!isValidUuid(targetUserId)) {
+      return res.status(400).json({
+        error: "معرّف الموظف غير صالح",
+      });
+    }
+
     if (!name || name.trim().length < 2) {
       return res
         .status(400)
         .json({ error: "الاسم مطلوب ويجب أن لا يقل عن حرفين" });
+    }
+
+    if (name.trim().length > 100) {
+      return res.status(400).json({ error: "الاسم يجب ألا يتجاوز 100 حرف" });
     }
 
     const result = await pool.query(
@@ -314,6 +388,10 @@ const updateMyProfile = async (req, res) => {
         .json({ error: "الاسم مطلوب ويجب أن لا يقل عن حرفين" });
     }
 
+    if (name.trim().length > 100) {
+      return res.status(400).json({ error: "الاسم يجب ألا يتجاوز 100 حرف" });
+    }
+
     const result = await pool.query(
       `UPDATE users SET name = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING id, name, email, role;`,
       [name.trim(), userId],
@@ -346,6 +424,21 @@ const changeMyPassword = async (req, res) => {
       return res
         .status(400)
         .json({ error: "كلمة المرور الجديدة يجب أن لا تقل عن 8 أحرف" });
+    }
+
+    if (new_password.length > 72) {
+      return res
+        .status(400)
+        .json({ error: "كلمة المرور الجديدة يجب أن لا تتجاوز 72 حرفاً" });
+    }
+
+    if (current_password === new_password) {
+      return res
+        .status(400)
+        .json({
+          error:
+            "كلمة المرور الجديدة يجب أن تكون مختلفة عن كلمة المرور الحالية",
+        });
     }
 
     const userRes = await pool.query(

@@ -1,50 +1,65 @@
+const crypto = require("crypto");
 const pool = require("../db");
 const bcrypt = require("bcrypt");
 const { logActivity } = require("../utils/auditLogger");
 const { captureError } = require("../utils/errorTracker");
+const { isValidUuid } = require("../middleware/validateUuid");
 
 // ==========================================
 // 1. إنشاء عيادة جديدة مع تحديد الخطة (تجريبي / شهري / سنوي)
 // ==========================================
 const createClinic = async (req, res) => {
-  const client = await pool.connect();
+  let client;
+  let broken = false;
+
   try {
     const {
       name,
       phone_number,
       subdomain,
-      subscription_plan = "trial", // 'trial', 'monthly', 'yearly'
+      subscription_plan = "trial",
       admin_name,
       admin_email,
       admin_password,
-    } = req.body;
+    } = req.body || {};
 
-    if (!name || name.trim() === "") {
+    if (!name || typeof name !== "string" || name.trim() === "") {
       return res.status(400).json({ error: "اسم العيادة مطلوب" });
     }
 
-    let generatedSlug = name
+    const validPlans = ["trial", "monthly", "yearly"];
+    if (!validPlans.includes(subscription_plan)) {
+      return res.status(400).json({
+        error: "نوع الخطة غير صالح (trial, monthly, yearly)",
+      });
+    }
+
+    const plan = subscription_plan;
+
+    let baseSlug = name
       .toString()
       .trim()
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-+|-+$/g, "");
 
-    if (!generatedSlug || generatedSlug.length < 3) {
-      const randomSuffix = Math.random().toString(36).substring(2, 8);
-      generatedSlug = `clinic-${randomSuffix}`;
-    }
+    const randomSuffix = crypto.randomBytes(3).toString("hex");
+    let generatedSlug =
+      baseSlug && baseSlug.length >= 2
+        ? `${baseSlug}-${randomSuffix}`
+        : `clinic-${randomSuffix}`;
 
+    client = await pool.connect();
     await client.query("BEGIN");
 
     // حساب فترة الاشتراك حسب الخطة
     let planInterval = "14 days";
     let subStatus = "trial";
 
-    if (subscription_plan === "monthly") {
+    if (plan === "monthly") {
       planInterval = "1 month";
       subStatus = "active";
-    } else if (subscription_plan === "yearly") {
+    } else if (plan === "yearly") {
       planInterval = "1 year";
       subStatus = "active";
     }
@@ -52,34 +67,36 @@ const createClinic = async (req, res) => {
     // 1. إنشاء العيادة
     const clinicResult = await client.query(
       `INSERT INTO clinics (
-  name,
-  slug,
-  phone_number,
-  subdomain,
-  is_active,
-  subscription_plan,
-  subscription_status,
-  subscription_starts_at,
-  subscription_ends_at
-)
-VALUES (
-  $1,
-  $2,
-  $3,
-  $4,
-  TRUE,
-  $5,
-  $6,
-  CURRENT_TIMESTAMP,
-  (CURRENT_TIMESTAMP + ($7)::interval)
-)
-RETURNING *;`,
+        name,
+        slug,
+        phone_number,
+        subdomain,
+        is_active,
+        subscription_plan,
+        subscription_status,
+        subscription_starts_at,
+        subscription_ends_at
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4,
+        TRUE,
+        $5,
+        $6,
+        CURRENT_TIMESTAMP,
+        (CURRENT_TIMESTAMP + ($7)::interval)
+      )
+      RETURNING *;`,
       [
         name.trim(),
         generatedSlug,
-        phone_number?.trim() || null,
-        subdomain?.trim() || null,
-        subscription_plan,
+        phone_number && typeof phone_number === "string"
+          ? phone_number.trim()
+          : null,
+        subdomain && typeof subdomain === "string" ? subdomain.trim() : null,
+        plan,
         subStatus,
         planInterval,
       ],
@@ -101,6 +118,13 @@ RETURNING *;`,
         await client.query("ROLLBACK");
         return res.status(400).json({
           error: "البريد الإلكتروني للأدمن مسجل بالفعل لمستخدم آخر",
+        });
+      }
+
+      if (admin_password.length < 8) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: "كلمة مرور الأدمن يجب ألا تقل عن 8 أحرف",
         });
       }
 
@@ -130,12 +154,26 @@ RETURNING *;`,
       admin: createdAdmin,
     });
   } catch (err) {
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackErr) {
+        broken = true;
+        console.error("Rollback failed:", rollbackErr.message);
+      }
+    }
+
+    if (err.code === "23505") {
+      return res.status(400).json({
+        error: "الاسم أو رابط العيادة أو البريد الإلكتروني مسجل بالفعل",
+      });
+    }
+
     captureError(err, req);
-    await client.query("ROLLBACK");
     console.error("Error creating clinic:", err.message);
     res.status(500).json({ error: "خطأ في السيرفر أثناء إنشاء العيادة" });
   } finally {
-    client.release();
+    if (client) client.release(broken);
   }
 };
 
@@ -175,8 +213,8 @@ const getClinics = async (req, res) => {
 
     const result = await pool.query(
       `SELECT id, name, phone_number, address, bio, slug
-   FROM clinics
-   WHERE id = $1`,
+       FROM clinics
+       WHERE id = $1`,
       [req.user.clinic_id],
     );
     res.status(200).json({ clinics: result.rows });
@@ -187,16 +225,20 @@ const getClinics = async (req, res) => {
   }
 };
 
-// 3. تجديد أو ترقية الاشتراك (مع تحديث بداية الخطة وحفظ الأيام المتبقية)
+// 3. تجديد أو ترقية الاشتراك
 const renewSubscription = async (req, res) => {
   try {
     const { id } = req.params;
-    const { plan } = req.body; // 'trial', 'monthly', 'yearly'
+    const { plan } = req.body || {};
 
     if (req.user.role !== "SuperAdmin") {
       return res
         .status(403)
         .json({ error: "غير مصرح لك بتعديل اشتراكات العيادات" });
+    }
+
+    if (!isValidUuid(id)) {
+      return res.status(400).json({ error: "معرّف العيادة غير صالح" });
     }
 
     const validPlans = ["trial", "monthly", "yearly"];
@@ -217,8 +259,6 @@ const renewSubscription = async (req, res) => {
       statusStr = "active";
     }
 
-    // 1. subscription_starts_at يتحدث لتاريخ اليوم (بداية الخطة الحالية)
-    // 2. subscription_ends_at يحتفظ بالأيام المتبقية ويضيف عليها المدة الجديدة
     const result = await pool.query(
       `UPDATE clinics
        SET subscription_plan = $1,
@@ -248,12 +288,18 @@ const renewSubscription = async (req, res) => {
 };
 
 // ==========================================
-// 4. تعديل بيانات العيادة (الاسم، الهاتف، العنوان، النبذة، والرابط)
+// 4. تعديل بيانات العيادة
 // ==========================================
 const updateClinic = async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, phone_number, address, bio, slug, is_active } = req.body;
+
+    if (!isValidUuid(id)) {
+      return res.status(400).json({ error: "معرّف العيادة غير صالح" });
+    }
+
+    const { name, phone_number, address, bio, slug, is_active } =
+      req.body || {};
 
     if (req.user.role === "ClinicAdmin" && id !== req.user.clinic_id) {
       return res
@@ -279,15 +325,21 @@ const updateClinic = async (req, res) => {
     }
     if (phone_number !== undefined) {
       updates.push(`phone_number = $${pCount++}`);
-      values.push(phone_number ? phone_number.trim() : null);
+      values.push(
+        phone_number && typeof phone_number === "string"
+          ? phone_number.trim()
+          : null,
+      );
     }
     if (address !== undefined) {
       updates.push(`address = $${pCount++}`);
-      values.push(address ? address.trim() : null);
+      values.push(
+        address && typeof address === "string" ? address.trim() : null,
+      );
     }
     if (bio !== undefined) {
       updates.push(`bio = $${pCount++}`);
-      values.push(bio ? bio.trim() : null);
+      values.push(bio && typeof bio === "string" ? bio.trim() : null);
     }
     if (slug !== undefined) {
       let generatedSlug = (slug || name || "")
@@ -298,7 +350,7 @@ const updateClinic = async (req, res) => {
         .replace(/^-+|-+$/g, "");
 
       if (!generatedSlug || generatedSlug.length < 3) {
-        const randomSuffix = Math.random().toString(36).substring(2, 8);
+        const randomSuffix = crypto.randomBytes(3).toString("hex");
         generatedSlug = `clinic-${randomSuffix}`;
       }
 
@@ -332,7 +384,6 @@ const updateClinic = async (req, res) => {
 
     const updatedClinic = result.rows[0];
 
-    // توثيق التعديل في سجل الرقابة
     try {
       await logActivity({
         clinic_id: id,
@@ -382,6 +433,10 @@ const deleteClinic = async (req, res) => {
         .json({ error: "هذه الصلاحية خاصة بالسوبر أدمن فقط" });
     }
 
+    if (!isValidUuid(id)) {
+      return res.status(400).json({ error: "معرّف العيادة غير صالح" });
+    }
+
     const result = await pool.query(
       "UPDATE clinics SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *",
       [id],
@@ -404,7 +459,6 @@ const deleteClinic = async (req, res) => {
 const getOnboardingStatus = async (req, res) => {
   const clinicId = req.user?.clinic_id;
 
-  // لو سوبر أدمن ومش مرتبط بعيادة معينة
   if (!clinicId) {
     return res.status(200).json({ is_completed: true, steps: [] });
   }
@@ -415,19 +469,19 @@ const getOnboardingStatus = async (req, res) => {
       SELECT
         c.slug,
         (
-  EXISTS(SELECT 1 FROM users WHERE clinic_id = $1 AND role = 'Doctor' AND is_active = TRUE)
-  AND
-  EXISTS(SELECT 1 FROM doctor_availability WHERE clinic_id = $1 AND is_active = TRUE)
-) AS has_doctors,
+          EXISTS(SELECT 1 FROM users WHERE clinic_id = $1 AND role = 'Doctor' AND is_active = TRUE)
+          AND
+          EXISTS(SELECT 1 FROM doctor_availability WHERE clinic_id = $1 AND is_active = TRUE)
+        ) AS has_doctors,
         EXISTS(SELECT 1 FROM procedure_codes WHERE clinic_id = $1 AND is_active = TRUE) AS has_services,
         EXISTS (
-  SELECT 1
-  FROM clinics
-  WHERE id = $1
-    AND slug IS NOT NULL
-    AND NULLIF(BTRIM(address), '') IS NOT NULL
-    AND NULLIF(BTRIM(phone_number), '') IS NOT NULL
-) AS has_profile,
+          SELECT 1
+          FROM clinics
+          WHERE id = $1
+            AND slug IS NOT NULL
+            AND NULLIF(BTRIM(address), '') IS NOT NULL
+            AND NULLIF(BTRIM(phone_number), '') IS NOT NULL
+        ) AS has_profile,
         EXISTS(SELECT 1 FROM patients WHERE clinic_id = $1 AND is_active = TRUE) AS has_patients,
         EXISTS(SELECT 1 FROM appointments WHERE clinic_id = $1) AS has_appointments
       FROM clinics c

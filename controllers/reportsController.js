@@ -33,7 +33,8 @@ const getReportsSummary = async (req, res) => {
     let end = endDate;
     if (!start || !end) {
       const nowCairoRes = await pool.query(
-        "SELECT TO_CHAR(date_trunc('month', NOW() AT TIME ZONE 'Africa/Cairo'))::date AS start_date, (NOW() AT TIME ZONE 'Africa/Cairo')::date AS end_date;",
+        `SELECT TO_CHAR(date_trunc('month', NOW() AT TIME ZONE 'Africa/Cairo'), 'YYYY-MM-DD') AS start_date,
+                TO_CHAR(NOW() AT TIME ZONE 'Africa/Cairo', 'YYYY-MM-DD') AS end_date;`,
       );
       start = start || nowCairoRes.rows[0].start_date;
       end = end || nowCairoRes.rows[0].end_date;

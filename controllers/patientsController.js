@@ -107,10 +107,19 @@ const parseEgyptianDate = (rawDate) => {
 };
 
 // دالة التحقق الموحدة
-const validatePatientInput = ({ name, gender, date_of_birth }) => {
+const validatePatientInput = ({
+  name,
+  gender,
+  date_of_birth,
+  medical_alerts,
+}) => {
   // الاسم
   if (!name || typeof name !== "string" || name.trim().length < 2) {
     return "اسم المريض مطلوب ويجب أن يحتوي على حرفين على الأقل";
+  }
+
+  if (name.trim().length > 100) {
+    return "اسم المريض يجب ألا يتجاوز 100 حرف";
   }
 
   // النوع
@@ -145,6 +154,22 @@ const validatePatientInput = ({ name, gender, date_of_birth }) => {
     }
   }
 
+  // التنبيهات الطبية
+  if (
+    medical_alerts !== undefined &&
+    medical_alerts !== null &&
+    typeof medical_alerts !== "string"
+  ) {
+    return "التنبيهات الطبية يجب أن تكون نصًا";
+  }
+
+  if (
+    typeof medical_alerts === "string" &&
+    medical_alerts.trim().length > 1000
+  ) {
+    return "التنبيهات الطبية يجب ألا تتجاوز 1000 حرف";
+  }
+
   return null;
 };
 
@@ -167,6 +192,7 @@ const addPatient = async (req, res) => {
       name,
       gender,
       date_of_birth,
+      medical_alerts,
     });
 
     if (validationError) {
@@ -185,25 +211,25 @@ const addPatient = async (req, res) => {
     }
 
     const query = `
-    INSERT INTO patients (
-      clinic_id,
-      name,
-      phone_number,
-      gender,
-      date_of_birth,
-      medical_alerts,
-      is_active
-    )
-    VALUES ($1, $2, $3, $4, $5, $6, TRUE)
-    RETURNING *;
-  `;
+      INSERT INTO patients (
+        clinic_id,
+        name,
+        phone_number,
+        gender,
+        date_of_birth,
+        medical_alerts,
+        is_active
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+      RETURNING *;
+    `;
     const values = [
       clinic_id,
       name.trim(),
       normalizedPhone,
       normalizedGender,
       cleanedDob,
-      medical_alerts || null,
+      medical_alerts ? medical_alerts.trim() : null,
     ];
 
     const result = await pool.query(query, values);
@@ -229,6 +255,11 @@ const addPatient = async (req, res) => {
     if (err.code === "23505") {
       return res.status(400).json({
         error: "رقم الهاتف موجود بالفعل لمريض آخر",
+      });
+    }
+    if (err.code === "22001") {
+      return res.status(400).json({
+        error: "أحد البيانات المدخلة يتجاوز الحد الأقصى للحروف",
       });
     }
     captureError(err, req);
@@ -358,6 +389,7 @@ const updatePatient = async (req, res) => {
       name,
       gender,
       date_of_birth,
+      medical_alerts,
     });
 
     if (validationError) {
@@ -376,24 +408,24 @@ const updatePatient = async (req, res) => {
     }
 
     const query = `
-    UPDATE patients
-    SET
-      name = $1,
-      phone_number = $2,
-      gender = $3,
-      medical_alerts = $4,
-      date_of_birth = $5,
-      updated_at = CURRENT_TIMESTAMP
-    WHERE id = $6
-      AND clinic_id = $7
-      AND is_active = TRUE
-    RETURNING *;
-  `;
+      UPDATE patients
+      SET
+        name = $1,
+        phone_number = $2,
+        gender = $3,
+        medical_alerts = $4,
+        date_of_birth = $5,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $6
+        AND clinic_id = $7
+        AND is_active = TRUE
+      RETURNING *;
+    `;
     const result = await pool.query(query, [
       name.trim(),
       normalizedPhone,
       normalizedGender,
-      medical_alerts || null,
+      medical_alerts ? medical_alerts.trim() : null,
       cleanedDob,
       patientId,
       clinicId,
@@ -426,6 +458,11 @@ const updatePatient = async (req, res) => {
     if (err.code === "23505") {
       return res.status(400).json({
         error: "رقم الهاتف موجود بالفعل لمريض آخر في العيادة",
+      });
+    }
+    if (err.code === "22001") {
+      return res.status(400).json({
+        error: "أحد البيانات المدخلة يتجاوز الحد الأقصى للحروف",
       });
     }
     captureError(err, req);
@@ -623,22 +660,19 @@ const exportPatients = async (req, res) => {
 };
 
 // ==========================================
-// 8. محلل CSV القياسي المتوافق مع RFC 4180 (يدعم النصوص متعددة الأسطر داخل علامات التنصيص)
+// 8. محلل CSV القياسي المتوافق مع RFC 4180
 // ==========================================
 const parseCsvBuffer = (buffer) => {
   let text = buffer.toString("utf-8");
-  // إزالة UTF-8 BOM إن وُجد
   if (text.charCodeAt(0) === 0xfeff) {
     text = text.slice(1);
   }
 
-  // اكتشاف الفاصلة (فاصلة عادية , أو منقوطة ;) من أول سطر
   const firstLineEnd = text.search(/\r?\n/);
   const sampleHeader = firstLineEnd !== -1 ? text.slice(0, firstLineEnd) : text;
   const delimiter =
     sampleHeader.includes(";") && !sampleHeader.includes(",") ? ";" : ",";
 
-  // تجزئة الـ CSV كـ State Machine لاحترام الأسطر الجديدة داخل علامات التنصيص
   const rowsRaw = [];
   let currentRow = [];
   let currentField = "";
@@ -651,7 +685,7 @@ const parseCsvBuffer = (buffer) => {
     if (char === '"') {
       if (inQuotes && nextChar === '"') {
         currentField += '"';
-        i++; // تجاوز علامة التنصيص المهربة ""
+        i++;
       } else {
         inQuotes = !inQuotes;
       }
@@ -686,7 +720,6 @@ const parseCsvBuffer = (buffer) => {
 
   const rawHeaders = rowsRaw[0].map((h) => h.toLowerCase().trim());
 
-  // توحيد مسميات الأعمدة عربي وإنجليزي
   const headerMap = {};
   rawHeaders.forEach((h, idx) => {
     if (["name", "اسم", "اسم المريض", "الاسم"].includes(h))
@@ -759,7 +792,6 @@ const importPatientsFromCsv = async (req, res) => {
   const seenPhonesInFile = new Set();
 
   try {
-    // جلب كل أرقام الهواتف الحالية في العيادة لتفادي التكرار بسرعة
     const existingPhonesRes = await pool.query(
       "SELECT phone_number FROM patients WHERE clinic_id = $1;",
       [clinic_id],
@@ -769,7 +801,7 @@ const importPatientsFromCsv = async (req, res) => {
     );
 
     for (const row of rows) {
-      // 1. فحص الاسم
+      // 1. فحص الاسم وطوله
       const cleanName = (row.name || "").trim();
       if (cleanName.length < 2) {
         errors.push({
@@ -777,6 +809,16 @@ const importPatientsFromCsv = async (req, res) => {
           name: cleanName || "غير محدد",
           phone: row.phone,
           reason: "اسم المريض يجب أن يكون حرفين على الأقل",
+        });
+        continue;
+      }
+
+      if (cleanName.length > 100) {
+        errors.push({
+          row: row.rowNumber,
+          name: cleanName.slice(0, 30) + "...",
+          phone: row.phone,
+          reason: "اسم المريض يتجاوز الحد الأقصى المسموح به (100 حرف)",
         });
         continue;
       }
@@ -866,10 +908,20 @@ const importPatientsFromCsv = async (req, res) => {
       }
 
       const alerts = (row.alerts || "").trim();
-      const cleanAlerts =
+      let cleanAlerts =
         !alerts || ["-", "لا يوجد", "لا توجد"].includes(alerts.toLowerCase())
           ? null
           : alerts;
+
+      if (cleanAlerts && cleanAlerts.length > 1000) {
+        errors.push({
+          row: row.rowNumber,
+          name: cleanName,
+          phone: row.phone,
+          reason: "التنبيهات الطبية تتجاوز الحد الأقصى المسموح به (1000 حرف)",
+        });
+        continue;
+      }
 
       seenPhonesInFile.add(normalizedPhone);
 
@@ -882,7 +934,7 @@ const importPatientsFromCsv = async (req, res) => {
       });
     }
 
-    // 🚀 7. إدخال المرضى بتقنية الـ Bulk Batch Insert (حزم كل 100 مريض) لتفادي الـ Timeout
+    // 🚀 7. إدخال المرضى بتقنية الـ Bulk Batch Insert (حزم كل 100 مريض)
     if (importedPatients.length > 0) {
       let client;
       try {
@@ -920,7 +972,6 @@ const importPatientsFromCsv = async (req, res) => {
 
         await client.query("COMMIT");
 
-        // تسجيل العملية في سجل الرقابة
         try {
           await logActivity({
             clinic_id,
@@ -940,7 +991,13 @@ const importPatientsFromCsv = async (req, res) => {
           console.error("Audit log failed:", auditErr.message);
         }
       } catch (dbErr) {
-        if (client) await client.query("ROLLBACK");
+        if (client) {
+          try {
+            await client.query("ROLLBACK");
+          } catch (rollbackErr) {
+            console.error("Rollback failed:", rollbackErr.message);
+          }
+        }
         captureError(dbErr, req);
         console.error("Error bulk inserting patients:", dbErr.message);
         return res
