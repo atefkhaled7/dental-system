@@ -8,6 +8,8 @@ const {
   updateProfile,
   changePassword,
   getMe,
+  forgotPassword,
+  resetPassword,
 } = require("../controllers/authController");
 const authMiddleware = require("../middleware/authMiddleware");
 const authorizeRoles = require("../middleware/roleMiddleware");
@@ -21,6 +23,8 @@ router.post(
   registerUser,
 );
 router.post("/login", loginUser);
+router.post("/forgot-password", forgotPassword);
+router.post("/reset-password", resetPassword);
 // router.post("/register-clinic", registerClinic);
 router.patch("/profile", authMiddleware, updateProfile);
 router.patch("/change-password", authMiddleware, changePassword);

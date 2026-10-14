@@ -8,6 +8,7 @@ const authMiddleware = async (req, res, next) => {
   if (!token) {
     return res.status(401).json({
       error: "Access Denied: No Token Provided!",
+      code: "NO_TOKEN",
     });
   }
 
@@ -25,13 +26,14 @@ const authMiddleware = async (req, res, next) => {
   } catch (error) {
     return res.status(401).json({
       error: "Invalid Token",
+      code: "INVALID_TOKEN",
     });
   }
-
   // لازم يكون فيه id للمستخدم داخل التوكن
   if (!verified.id) {
     return res.status(401).json({
       error: "Invalid Token",
+      code: "INVALID_TOKEN",
     });
   }
 
@@ -79,6 +81,7 @@ const authMiddleware = async (req, res, next) => {
     if (!currentUser.is_active) {
       return res.status(403).json({
         error: "تم إيقاف حسابك من قبل إدارة العيادة.",
+        code: "USER_DEACTIVATED",
       });
     }
 

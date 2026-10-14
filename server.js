@@ -124,6 +124,7 @@ app.use("/api/booking-requests", require("./routes/bookingRequestsRoutes"));
 app.use("/api/support", require("./routes/supportRoutes"));
 app.use("/api/reports", require("./routes/reportsRoutes"));
 app.use("/api", require("./routes/prescriptionsRoutes"));
+app.use("/api", require("./routes/visitsRoutes"));
 
 // 8. مسار 404 (الآن سيعمل بدقة لأي مسار غير موجود دون اعتراض من الـ Auth)
 app.use((req, res) => {
@@ -163,8 +164,12 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}... Ready for Cash!`);
-});
+
+// تشغيل السيرفر محلياً فقط في بيئة التطوير، وتفادي تشغيله في Vercel Serverless
+if (!process.env.VERCEL && process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log(`Server is running locally on port ${PORT}...`);
+  });
+}
 
 module.exports = app;

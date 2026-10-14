@@ -202,7 +202,63 @@ const createPrescription = async (req, res) => {
       console.warn("Audit log failed for prescription:", auditErr.message);
     }
 
-    res.status(201).json(result.rows[0]);
+    // ⚠️ فحص الحساسية الدوائية للمريض وإرجاع قائمة التحذيرات قبل الطباعة
+    const warnings = [];
+    const allergiesRes = await pool.query(
+      `SELECT substance, reaction, severity FROM patient_allergies WHERE patient_id = $1 AND clinic_id = $2`,
+      [patientId, clinicId],
+    );
+
+    if (allergiesRes.rows.length > 0) {
+      const penicillinGroup = [
+        "penicillin",
+        "بنسلين",
+        "augmentin",
+        "اوجمنتين",
+        "أوجمنتين",
+        "amoxil",
+        "amoxicillin",
+        "اموكسيسيلين",
+        "hibiotic",
+        "هاي بيوتك",
+        "curam",
+        "كيورام",
+        "megamox",
+        "ميجاموكس",
+      ];
+
+      for (const med of cleanMedications) {
+        const medNameLower = med.name.toLowerCase();
+        for (const alg of allergiesRes.rows) {
+          const subLower = (alg.substance || "").trim().toLowerCase();
+          if (!subLower) continue;
+
+          const isDirectMatch =
+            medNameLower.includes(subLower) || subLower.includes(medNameLower);
+
+          const isPenicillinCrossMatch =
+            (subLower.includes("penicillin") || subLower.includes("بنسلين")) &&
+            penicillinGroup.some((p) => medNameLower.includes(p));
+
+          if (isDirectMatch || isPenicillinCrossMatch) {
+            warnings.push({
+              medication: med.name,
+              allergy_substance: alg.substance,
+              severity: alg.severity,
+              reaction: alg.reaction,
+              message: `تحذير: الدواء (${med.name}) قد يتعارض مع حساسية مسجلة للمريض تجاه (${alg.substance})${
+                alg.reaction ? ` - التفاعل: ${alg.reaction}` : ""
+              }`,
+            });
+          }
+        }
+      }
+    }
+
+    res.status(201).json({
+      ...result.rows[0],
+      warnings,
+    });
   } catch (error) {
     if (error.code === "22008") {
       return res

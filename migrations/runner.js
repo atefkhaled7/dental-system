@@ -77,13 +77,13 @@ async function runMigrations() {
         await client.query("BEGIN");
 
         // ضبط مسار البحث قبل تشغيل ملف المايجريشن
-        await client.query("SET search_path TO pg_catalog, public;");
+        await client.query("SET LOCAL search_path TO public;");
 
         // تشغيل كود المايجريشن
         await client.query(sql);
 
         // إعادة ضبط المسار بعد الملف أيضًا
-        await client.query("SET search_path TO pg_catalog, public;");
+        await client.query("SET LOCAL search_path TO public;");
 
         // تسجيل الملف بعد نجاح تنفيذه
         await client.query(

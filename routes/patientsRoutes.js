@@ -15,6 +15,10 @@ const {
   restorePatient,
   exportPatients,
   importPatientsFromCsv,
+  checkDuplicatePhone,
+  saveMedicalHistory,
+  addAllergy,
+  deleteAllergy,
 } = require("../controllers/patientsController");
 
 const authMiddleware = require("../middleware/authMiddleware");
@@ -28,14 +32,14 @@ router.post(
   "/",
   authMiddleware,
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
-  addPatient
+  addPatient,
 );
 
 router.get(
   "/",
   authMiddleware,
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
-  getPatients
+  getPatients,
 );
 
 // تصدير بيانات المرضى - ClinicAdmin فقط
@@ -43,7 +47,7 @@ router.get(
   "/export",
   authMiddleware,
   authorizeRole("ClinicAdmin"),
-  exportPatients
+  exportPatients,
 );
 
 router.post(
@@ -51,35 +55,72 @@ router.post(
   authMiddleware,
   authorizeRole("ClinicAdmin"),
   uploadCsv.single("file"),
-  importPatientsFromCsv
+  importPatientsFromCsv,
+);
+
+// فحص تكرار الهاتف (لازم يتحط قبل /:id)
+router.get(
+  "/check-phone",
+  authMiddleware,
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  checkDuplicatePhone,
+);
+
+// مسارات التاريخ الطبي والحساسية
+router.post(
+  "/:id/medical-history",
+  authMiddleware,
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  saveMedicalHistory,
+);
+
+router.put(
+  "/:id/medical-history",
+  authMiddleware,
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  saveMedicalHistory,
+);
+
+router.post(
+  "/:id/allergies",
+  authMiddleware,
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  addAllergy,
+);
+
+router.delete(
+  "/:id/allergies/:allergyId",
+  authMiddleware,
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  deleteAllergy,
 );
 
 router.get(
   "/:id",
   authMiddleware,
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
-  getPatientById
+  getPatientById,
 );
 
 router.put(
   "/:id",
   authMiddleware,
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
-  updatePatient
+  updatePatient,
 );
 
 router.delete(
   "/:id",
   authMiddleware,
   authorizeRole("ClinicAdmin"),
-  deletePatient
+  deletePatient,
 );
 
 router.patch(
   "/:id/restore",
   authMiddleware,
   authorizeRole("ClinicAdmin"),
-  restorePatient
+  restorePatient,
 );
 
 module.exports = router;

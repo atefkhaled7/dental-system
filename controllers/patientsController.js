@@ -8,7 +8,6 @@ const normalizeAndValidatePhone = (phone_number) => {
   if (!phone_number || typeof phone_number !== "string") {
     return null;
   }
-
   return normalizeEgyptianPhone(phone_number.trim());
 };
 
@@ -27,12 +26,26 @@ const getTodayCairoISODate = () => {
   return `${values.year}-${values.month}-${values.day}`;
 };
 
-// 🌟 دالة ذكية لتحليل تواريخ الميلاد المصرية (تدعم DD/MM/YYYY و YYYY-MM-DD والشرطات)
+// حساب العمر بالسنوات
+const calculateAgeInYears = (dobString) => {
+  if (!dobString) return null;
+  const dob = new Date(dobString);
+  if (isNaN(dob.getTime())) return null;
+
+  const today = new Date();
+  let age = today.getFullYear() - dob.getFullYear();
+  const monthDiff = today.getMonth() - dob.getMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < dob.getDate())) {
+    age--;
+  }
+  return age;
+};
+
+// 🌟 دالة ذكية لتحليل تواريخ الميلاد المصرية
 const parseEgyptianDate = (rawDate) => {
   if (!rawDate || typeof rawDate !== "string") return null;
   const cleaned = rawDate.trim();
 
-  // لو الخانة فاضية أو فيها شرطة تصدير
   if (
     !cleaned ||
     ["-", "--", "null", "undefined", "لا يوجد", "لا توجد"].includes(
@@ -42,7 +55,6 @@ const parseEgyptianDate = (rawDate) => {
     return null;
   }
 
-  // 1. صيغة اليوم/الشهر/السنة (المعتادة في مصر: DD/MM/YYYY أو DD-MM-YYYY)
   const dmyMatch = cleaned.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})$/);
   if (dmyMatch) {
     const day = parseInt(dmyMatch[1], 10);
@@ -67,7 +79,6 @@ const parseEgyptianDate = (rawDate) => {
     }
   }
 
-  // 2. صيغة السنة/الشهر/اليوم القياسية (YYYY-MM-DD)
   const ymdMatch = cleaned.match(/^(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})$/);
   if (ymdMatch) {
     const year = parseInt(ymdMatch[1], 10);
@@ -92,7 +103,6 @@ const parseEgyptianDate = (rawDate) => {
     }
   }
 
-  // 3. Fallback للتواريخ القياسية والأمريكية (MM/DD/YYYY)
   const d = new Date(cleaned);
   if (isNaN(d.getTime())) return "INVALID";
 
@@ -106,14 +116,15 @@ const parseEgyptianDate = (rawDate) => {
   return formattedFallback;
 };
 
-// دالة التحقق الموحدة
+// دالة التحقق الموحدة من بيانات المريض الموسعة
 const validatePatientInput = ({
   name,
   gender,
   date_of_birth,
   medical_alerts,
+  guardian_name,
+  guardian_phone,
 }) => {
-  // الاسم
   if (!name || typeof name !== "string" || name.trim().length < 2) {
     return "اسم المريض مطلوب ويجب أن يحتوي على حرفين على الأقل";
   }
@@ -122,7 +133,6 @@ const validatePatientInput = ({
     return "اسم المريض يجب ألا يتجاوز 100 حرف";
   }
 
-  // النوع
   if (gender) {
     if (typeof gender !== "string") {
       return "النوع يجب أن يكون Male أو Female";
@@ -133,7 +143,6 @@ const validatePatientInput = ({
     }
   }
 
-  // تاريخ الميلاد
   if (
     date_of_birth !== undefined &&
     date_of_birth !== null &&
@@ -144,7 +153,6 @@ const validatePatientInput = ({
     }
 
     const dob = new Date(date_of_birth);
-
     if (isNaN(dob.getTime())) {
       return "تاريخ الميلاد غير صالح";
     }
@@ -152,15 +160,25 @@ const validatePatientInput = ({
     if (dob.toISOString().slice(0, 10) >= getTodayCairoISODate()) {
       return "تاريخ الميلاد لا يمكن أن يكون اليوم أو في المستقبل";
     }
+
+    // شرط حاسم: ولي الأمر إلزامي لمن هم دون 18 عاماً
+    const age = calculateAgeInYears(date_of_birth);
+    if (age !== null && age < 18) {
+      if (!guardian_name || !guardian_name.trim()) {
+        return "اسم ولي الأمر إلزامي لأن عمر المريض أقل من 18 عاماً";
+      }
+      if (!guardian_phone || !guardian_phone.trim()) {
+        return "رقم هاتف ولي الأمر إلزامي لأن عمر المريض أقل من 18 عاماً";
+      }
+    }
   }
 
-  // التنبيهات الطبية
   if (
     medical_alerts !== undefined &&
     medical_alerts !== null &&
     typeof medical_alerts !== "string"
   ) {
-    return "التنبيهات الطبية يجب أن تكون نصًا";
+    return "التنبيهات الطبية يجب أن تكون نصاً";
   }
 
   if (
@@ -173,15 +191,93 @@ const validatePatientInput = ({
   return null;
 };
 
-// 1. إضافة مريض
+// حساب مستوى الخطر والتصنيفات (alert_summary) برمجياً
+const computeAlertSummary = (answers = {}, allergies = []) => {
+  const tags = [];
+  let isCritical = false;
+  let isModerate = false;
+
+  // فحص الحالات الحرجة في استبيان التاريخ الطبي
+  if (answers.blood_thinners) {
+    isCritical = true;
+    tags.push("مميعات دم");
+  }
+  if (answers.heart_disease) {
+    isCritical = true;
+    tags.push("أمراض قلب");
+  }
+  if (answers.bleeding_disorder) {
+    isCritical = true;
+    tags.push("سيولة دم");
+  }
+  if (answers.pregnancy) {
+    isCritical = true;
+    tags.push("حمل");
+  }
+
+  // فحص الحالات المتوسطة
+  if (answers.diabetes) {
+    isModerate = true;
+    tags.push("سكري");
+  }
+  if (answers.hypertension) {
+    isModerate = true;
+    tags.push("ضغط دم");
+  }
+  if (answers.asthma) {
+    isModerate = true;
+    tags.push("ربو");
+  }
+  if (answers.hepatitis) {
+    isModerate = true;
+    tags.push("كبد");
+  }
+  if (answers.kidney_disease) {
+    isModerate = true;
+    tags.push("كلى");
+  }
+
+  // فحص الحساسية
+  if (Array.isArray(allergies) && allergies.length > 0) {
+    allergies.forEach((alg) => {
+      tags.push(`حساسية: ${alg.substance}`);
+      if (
+        alg.severity === "severe" ||
+        alg.substance?.toLowerCase().includes("penicillin")
+      ) {
+        isCritical = true;
+      } else {
+        isModerate = true;
+      }
+    });
+  }
+
+  const level = isCritical ? "critical" : isModerate ? "moderate" : "none";
+  return { level, tags };
+};
+
+// 1. إضافة مريض موسع
 const addPatient = async (req, res) => {
   try {
     const clinic_id = req.user.clinic_id;
-    const { name, phone_number, gender, date_of_birth, medical_alerts } =
-      req.body || {};
+    const {
+      name,
+      phone_number,
+      gender,
+      date_of_birth,
+      medical_alerts,
+      address,
+      email,
+      emergency_contact_name,
+      emergency_contact_phone,
+      guardian_name,
+      guardian_phone,
+      guardian_relation,
+      referral_source,
+      referral_note,
+    } = req.body || {};
 
     const normalizedPhone = normalizeAndValidatePhone(phone_number);
-
     if (!normalizedPhone) {
       return res.status(400).json({
         error: "رقم الهاتف المصري غير صحيح",
@@ -193,6 +289,8 @@ const addPatient = async (req, res) => {
       gender,
       date_of_birth,
       medical_alerts,
+      guardian_name,
+      guardian_phone,
     });
 
     if (validationError) {
@@ -218,9 +316,18 @@ const addPatient = async (req, res) => {
         gender,
         date_of_birth,
         medical_alerts,
+        address,
+        email,
+        emergency_contact_name,
+        emergency_contact_phone,
+        guardian_name,
+        guardian_phone,
+        guardian_relation,
+        referral_source,
+        referral_note,
         is_active
       )
-      VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, TRUE)
       RETURNING *;
     `;
     const values = [
@@ -230,6 +337,15 @@ const addPatient = async (req, res) => {
       normalizedGender,
       cleanedDob,
       medical_alerts ? medical_alerts.trim() : null,
+      address?.trim() || null,
+      email?.trim()?.toLowerCase() || null,
+      emergency_contact_name?.trim() || null,
+      emergency_contact_phone?.trim() || null,
+      guardian_name?.trim() || null,
+      guardian_phone?.trim() || null,
+      guardian_relation?.trim() || null,
+      referral_source?.trim() || null,
+      referral_note?.trim() || null,
     ];
 
     const result = await pool.query(query, values);
@@ -254,7 +370,7 @@ const addPatient = async (req, res) => {
   } catch (err) {
     if (err.code === "23505") {
       return res.status(400).json({
-        error: "رقم الهاتف موجود بالفعل لمريض آخر",
+        error: "رقم الهاتف موجود بالفعل لمريض آخر في العيادة",
       });
     }
     if (err.code === "22001") {
@@ -271,7 +387,51 @@ const addPatient = async (req, res) => {
   }
 };
 
-// 2. جلب قائمة المرضى مع الـ Pagination والبحث
+// 2. فحص تكرار رقم الهاتف لحظياً (Instant Duplicate Check)
+const checkDuplicatePhone = async (req, res) => {
+  try {
+    const clinicId = req.user.clinic_id;
+    const { phone, exclude_id } = req.query;
+
+    if (!phone) {
+      return res.status(200).json({ exists: false });
+    }
+
+    const normalizedPhone = normalizeEgyptianPhone(phone.trim());
+    if (!normalizedPhone) {
+      return res.status(200).json({ exists: false });
+    }
+
+    let query = `
+  SELECT id, name, phone_number, is_active
+  FROM patients
+  WHERE clinic_id = $1 AND phone_number = $2
+`;
+    const params = [clinicId, normalizedPhone];
+
+    if (exclude_id && isValidUuid(exclude_id)) {
+      query += ` AND id != $3`;
+      params.push(exclude_id);
+    }
+
+    const result = await pool.query(query, params);
+
+    if (result.rows.length > 0) {
+      return res.status(200).json({
+        exists: true,
+        patient: result.rows[0],
+      });
+    }
+
+    return res.status(200).json({ exists: false });
+  } catch (err) {
+    captureError(err, req);
+    console.error("Error checking duplicate phone:", err.message);
+    res.status(500).json({ error: "خطأ في السيرفر" });
+  }
+};
+
+// 3. جلب قائمة المرضى مع الـ Pagination والبحث و alert_level
 const getPatients = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
@@ -285,42 +445,45 @@ const getPatients = async (req, res) => {
 
     let query = `
       SELECT 
-        id, 
-        clinic_id, 
-        name, 
-        phone_number, 
-        gender, 
-        date_of_birth, 
-        medical_alerts, 
-        is_active, 
-        created_at, 
-        updated_at,
+        p.id, 
+        p.clinic_id, 
+        p.name, 
+        p.phone_number, 
+        p.gender, 
+        p.date_of_birth, 
+        p.medical_alerts,
+        p.guardian_name,
+        p.guardian_phone,
+        p.is_active, 
+        p.created_at, 
+        p.updated_at,
+        COALESCE(pmh.alert_level, 'none') AS alert_level,
         COUNT(*) OVER() AS full_count
-      FROM patients
-      WHERE clinic_id = $1 AND is_active = $2
+      FROM patients p
+      LEFT JOIN patient_medical_history pmh ON p.id = pmh.patient_id AND p.clinic_id = pmh.clinic_id
+      WHERE p.clinic_id = $1 AND p.is_active = $2
     `;
 
     const params = [clinicId, isActive];
     let paramCounter = 3;
 
     if (search && search.trim() !== "") {
-      query += ` AND (name ILIKE $${paramCounter} OR phone_number ILIKE $${paramCounter})`;
+      query += ` AND (p.name ILIKE $${paramCounter} OR p.phone_number ILIKE $${paramCounter})`;
       params.push(`%${search.trim()}%`);
       paramCounter++;
     }
 
-    query += ` ORDER BY created_at DESC LIMIT $${paramCounter} OFFSET $${
+    query += ` ORDER BY p.created_at DESC LIMIT $${paramCounter} OFFSET $${
       paramCounter + 1
     };`;
     params.push(limitNum, offset);
 
     const result = await pool.query(query, params);
-
     const total =
       result.rows.length > 0 ? Number(result.rows[0].full_count) : 0;
-
     const patients = result.rows.map(({ full_count, ...patient }) => patient);
     const totalPages = Math.ceil(total / limitNum) || 1;
+
     res.status(200).json({
       patients,
       pagination: {
@@ -337,7 +500,7 @@ const getPatients = async (req, res) => {
   }
 };
 
-// 3. جلب بيانات مريض محدد
+// 4. جلب بيانات مريض محدد مع التاريخ الطبي والحساسية و alert_summary
 const getPatientById = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
@@ -347,16 +510,45 @@ const getPatientById = async (req, res) => {
       return res.status(400).json({ error: "معرّف المريض غير صالح" });
     }
 
-    const result = await pool.query(
+    const patientRes = await pool.query(
       "SELECT * FROM patients WHERE id = $1 AND clinic_id = $2",
       [patientId, clinicId],
     );
 
-    if (result.rows.length === 0) {
+    if (patientRes.rows.length === 0) {
       return res.status(404).json({ error: "المريض غير موجود" });
     }
 
-    res.status(200).json({ patient: result.rows[0] });
+    const patient = patientRes.rows[0];
+
+    // جلب التاريخ الطبي والحساسية بالتوازي
+    const [historyRes, allergiesRes] = await Promise.all([
+      pool.query(
+        "SELECT * FROM patient_medical_history WHERE patient_id = $1 AND clinic_id = $2",
+        [patientId, clinicId],
+      ),
+      pool.query(
+        "SELECT * FROM patient_allergies WHERE patient_id = $1 AND clinic_id = $2 ORDER BY created_at DESC",
+        [patientId, clinicId],
+      ),
+    ]);
+
+    const medical_history = historyRes.rows[0] || null;
+    const allergies = allergiesRes.rows;
+
+    const alert_summary = computeAlertSummary(
+      medical_history?.answers || {},
+      allergies,
+    );
+
+    res.status(200).json({
+      patient: {
+        ...patient,
+        medical_history,
+        allergies,
+        alert_summary,
+      },
+    });
   } catch (err) {
     captureError(err, req);
     console.error("Error fetching patient by ID:", err.message);
@@ -364,7 +556,269 @@ const getPatientById = async (req, res) => {
   }
 };
 
-// 4. تعديل مريض
+// 5. حفظ أو تحديث التاريخ الطبي للمريض
+const saveMedicalHistory = async (req, res) => {
+  try {
+    const clinicId = req.user.clinic_id;
+    const patientId = req.params.id;
+    const { answers, notes } = req.body || {};
+
+    if (!isValidUuid(patientId)) {
+      return res.status(400).json({ error: "معرّف المريض غير صالح" });
+    }
+
+    // جلب الحساسيات الحالية لإعادة احتساب مستوى الخطر الإجمالي
+    const allergiesRes = await pool.query(
+      "SELECT * FROM patient_allergies WHERE patient_id = $1 AND clinic_id = $2",
+      [patientId, clinicId],
+    );
+
+    const { level } = computeAlertSummary(answers || {}, allergiesRes.rows);
+
+    const query = `
+      INSERT INTO patient_medical_history (
+        clinic_id,
+        patient_id,
+        answers,
+        alert_level,
+        notes,
+        reviewed_at,
+        reviewed_by,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, $6, CURRENT_TIMESTAMP)
+      ON CONFLICT (clinic_id, patient_id)
+      DO UPDATE SET
+        answers = EXCLUDED.answers,
+        alert_level = EXCLUDED.alert_level,
+        notes = EXCLUDED.notes,
+        reviewed_at = CURRENT_TIMESTAMP,
+        reviewed_by = EXCLUDED.reviewed_by,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING *;
+    `;
+
+    const values = [
+      clinicId,
+      patientId,
+      JSON.stringify(answers || {}),
+      level,
+      notes?.trim() || null,
+      req.user.id,
+    ];
+
+    const result = await pool.query(query, values);
+
+    try {
+      await logActivity({
+        clinic_id: clinicId,
+        user_id: req.user.id,
+        action: "SAVE_MEDICAL_HISTORY",
+        entity_type: "patient",
+        entity_id: patientId,
+        description: "تم حفظ أو تحديث التاريخ الطبي للمريض",
+      });
+    } catch (auditErr) {
+      console.error(
+        "Audit log failed for saveMedicalHistory:",
+        auditErr.message,
+      );
+    }
+
+    return res.status(200).json({
+      message: "تم حفظ التاريخ الطبي بنجاح",
+      medical_history: result.rows[0],
+      alert_level: level,
+    });
+  } catch (err) {
+    captureError(err, req);
+    console.error("Error saving medical history:", err.message);
+    res.status(500).json({ error: "خطأ في السيرفر أثناء حفظ التاريخ الطبي" });
+  }
+};
+
+// 6. إضافة حساسية جديدة لمريض
+const addAllergy = async (req, res) => {
+  try {
+    const clinicId = req.user.clinic_id;
+    const patientId = req.params.id;
+    const { category, substance, reaction, severity } = req.body || {};
+
+    if (!isValidUuid(patientId)) {
+      return res.status(400).json({ error: "معرّف المريض غير صالح" });
+    }
+
+    if (!substance || !substance.trim()) {
+      return res
+        .status(400)
+        .json({ error: "اسم المادة المسببة للحساسية مطلوب" });
+    }
+
+    const query = `
+      INSERT INTO patient_allergies (
+        clinic_id,
+        patient_id,
+        category,
+        substance,
+        reaction,
+        severity
+      )
+      VALUES ($1, $2, $3, $4, $5, $6)
+      RETURNING *;
+    `;
+
+    const values = [
+      clinicId,
+      patientId,
+      category || "medication",
+      substance.trim(),
+      reaction?.trim() || null,
+      severity || "moderate",
+    ];
+
+    const result = await pool.query(query, values);
+
+    // تحديث alert_level في جدول التاريخ الطبي تلقائياً
+    const [historyRes, allAllergies] = await Promise.all([
+      pool.query(
+        "SELECT answers FROM patient_medical_history WHERE patient_id = $1 AND clinic_id = $2",
+        [patientId, clinicId],
+      ),
+      pool.query(
+        "SELECT * FROM patient_allergies WHERE patient_id = $1 AND clinic_id = $2",
+        [patientId, clinicId],
+      ),
+    ]);
+
+    const { level } = computeAlertSummary(
+      historyRes.rows[0]?.answers || {},
+      allAllergies.rows,
+    );
+
+    await pool.query(
+      `INSERT INTO patient_medical_history (
+     clinic_id, 
+     patient_id, 
+     alert_level, 
+     answers, 
+     updated_at
+   )
+   VALUES ($1, $2, $3, '{}'::jsonb, CURRENT_TIMESTAMP)
+   ON CONFLICT (clinic_id, patient_id)
+   DO UPDATE SET 
+     alert_level = EXCLUDED.alert_level, 
+     updated_at = CURRENT_TIMESTAMP`,
+      [clinicId, patientId, level],
+    );
+
+    try {
+      await logActivity({
+        clinic_id: clinicId,
+        user_id: req.user.id,
+        action: "ADD_PATIENT_ALLERGY",
+        entity_type: "patient",
+        entity_id: patientId,
+        description: "تمت إضافة سجل حساسية للمريض",
+        metadata: {
+          allergy_id: result.rows[0].id,
+        },
+      });
+    } catch (auditErr) {
+      console.error("Audit log failed for addAllergy:", auditErr.message);
+    }
+
+    return res.status(201).json({
+      message: "تم إضافة الحساسية بنجاح",
+      allergy: result.rows[0],
+      alert_level: level,
+    });
+  } catch (err) {
+    captureError(err, req);
+    console.error("Error adding allergy:", err.message);
+    res.status(500).json({ error: "خطأ في السيرفر أثناء تسجيل الحساسية" });
+  }
+};
+
+// 7. حذف حساسية لمريض
+const deleteAllergy = async (req, res) => {
+  try {
+    const clinicId = req.user.clinic_id;
+    const { id: patientId, allergyId } = req.params;
+
+    if (!isValidUuid(patientId) || !isValidUuid(allergyId)) {
+      return res.status(400).json({ error: "معرّف غير صالح" });
+    }
+
+    const result = await pool.query(
+      "DELETE FROM patient_allergies WHERE id = $1 AND patient_id = $2 AND clinic_id = $3 RETURNING id",
+      [allergyId, patientId, clinicId],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "سجل الحساسية غير موجود" });
+    }
+
+    // إعادة احتساب الـ alert_level
+    const [historyRes, allAllergies] = await Promise.all([
+      pool.query(
+        "SELECT answers FROM patient_medical_history WHERE patient_id = $1 AND clinic_id = $2",
+        [patientId, clinicId],
+      ),
+      pool.query(
+        "SELECT * FROM patient_allergies WHERE patient_id = $1 AND clinic_id = $2",
+        [patientId, clinicId],
+      ),
+    ]);
+
+    const { level } = computeAlertSummary(
+      historyRes.rows[0]?.answers || {},
+      allAllergies.rows,
+    );
+
+    await pool.query(
+      `INSERT INTO patient_medical_history (
+     clinic_id, 
+     patient_id, 
+     alert_level, 
+     answers, 
+     updated_at
+   )
+   VALUES ($1, $2, $3, '{}'::jsonb, CURRENT_TIMESTAMP)
+   ON CONFLICT (clinic_id, patient_id)
+   DO UPDATE SET 
+     alert_level = EXCLUDED.alert_level, 
+     updated_at = CURRENT_TIMESTAMP`,
+      [clinicId, patientId, level],
+    );
+
+    try {
+      await logActivity({
+        clinic_id: clinicId,
+        user_id: req.user.id,
+        action: "DELETE_PATIENT_ALLERGY",
+        entity_type: "patient",
+        entity_id: patientId,
+        description: "تم حذف سجل حساسية للمريض",
+        metadata: {
+          allergy_id: result.rows[0].id,
+        },
+      });
+    } catch (auditErr) {
+      console.error("Audit log failed for deleteAllergy:", auditErr.message);
+    }
+
+    return res.status(200).json({
+      message: "تم حذف الحساسية بنجاح",
+      alert_level: level,
+    });
+  } catch (err) {
+    captureError(err, req);
+    console.error("Error deleting allergy:", err.message);
+    res.status(500).json({ error: "خطأ في السيرفر أثناء حذف الحساسية" });
+  }
+};
+
+// 8. تعديل مريض موسع
 const updatePatient = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
@@ -374,11 +828,24 @@ const updatePatient = async (req, res) => {
       return res.status(400).json({ error: "معرّف المريض غير صالح" });
     }
 
-    const { name, phone_number, gender, medical_alerts, date_of_birth } =
-      req.body || {};
+    const {
+      name,
+      phone_number,
+      gender,
+      medical_alerts,
+      date_of_birth,
+      address,
+      email,
+      emergency_contact_name,
+      emergency_contact_phone,
+      guardian_name,
+      guardian_phone,
+      guardian_relation,
+      referral_source,
+      referral_note,
+    } = req.body || {};
 
     const normalizedPhone = normalizeAndValidatePhone(phone_number);
-
     if (!normalizedPhone) {
       return res.status(400).json({
         error: "رقم الهاتف المصري غير صحيح",
@@ -390,6 +857,8 @@ const updatePatient = async (req, res) => {
       gender,
       date_of_birth,
       medical_alerts,
+      guardian_name,
+      guardian_phone,
     });
 
     if (validationError) {
@@ -415,9 +884,18 @@ const updatePatient = async (req, res) => {
         gender = $3,
         medical_alerts = $4,
         date_of_birth = $5,
+        address = $6,
+        email = $7,
+        emergency_contact_name = $8,
+        emergency_contact_phone = $9,
+        guardian_name = $10,
+        guardian_phone = $11,
+        guardian_relation = $12,
+        referral_source = $13,
+        referral_note = $14,
         updated_at = CURRENT_TIMESTAMP
-      WHERE id = $6
-        AND clinic_id = $7
+      WHERE id = $15
+        AND clinic_id = $16
         AND is_active = TRUE
       RETURNING *;
     `;
@@ -427,6 +905,15 @@ const updatePatient = async (req, res) => {
       normalizedGender,
       medical_alerts ? medical_alerts.trim() : null,
       cleanedDob,
+      address?.trim() || null,
+      email?.trim()?.toLowerCase() || null,
+      emergency_contact_name?.trim() || null,
+      emergency_contact_phone?.trim() || null,
+      guardian_name?.trim() || null,
+      guardian_phone?.trim() || null,
+      guardian_relation?.trim() || null,
+      referral_source?.trim() || null,
+      referral_note?.trim() || null,
       patientId,
       clinicId,
     ]);
@@ -474,7 +961,7 @@ const updatePatient = async (req, res) => {
   }
 };
 
-// 5. أرشفة مريض (Soft Delete) مع حماية الصلاحيات
+// 9. أرشفة مريض (Soft Delete)
 const deletePatient = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
@@ -523,7 +1010,7 @@ const deletePatient = async (req, res) => {
   }
 };
 
-// 6. استعادة مريض من الأرشيف
+// 10. استعادة مريض من الأرشيف
 const restorePatient = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
@@ -566,9 +1053,7 @@ const restorePatient = async (req, res) => {
   }
 };
 
-// ==========================================
-// 7. تصدير قائمة المرضى لملف Excel / CSV
-// ==========================================
+// 11. تصدير قائمة المرضى لملف Excel / CSV
 const exportPatients = async (req, res) => {
   try {
     const { clinic_id, role } = req.user;
@@ -586,6 +1071,11 @@ const exportPatients = async (req, res) => {
         gender,
         TO_CHAR(date_of_birth, 'DD/MM/YYYY') AS date_of_birth,
         medical_alerts,
+        guardian_name,
+        guardian_phone,
+        emergency_contact_name,
+        emergency_contact_phone,
+        referral_source,
         TO_CHAR(
           created_at AT TIME ZONE 'Africa/Cairo',
           'DD/MM/YYYY'
@@ -600,29 +1090,30 @@ const exportPatients = async (req, res) => {
 
     const escapeCsvValue = (value) => {
       const stringValue = String(value ?? "");
-
       const safeValue = /^[=+\-@]/.test(stringValue)
         ? `'${stringValue}`
         : stringValue;
-
       return `"${safeValue.replace(/"/g, '""')}"`;
     };
 
     let csv =
-      "\uFEFFاسم المريض,رقم الهاتف,النوع,تاريخ الميلاد,التنبيهات الطبية,تاريخ التسجيل\n";
+      "\uFEFFاسم المريض,رقم الهاتف,النوع,تاريخ الميلاد,التنبيهات الطبية,ولي الأمر,هاتف ولي الأمر,جهة الطوارئ,هاتف الطوارئ,المصدر,تاريخ التسجيل\n";
 
     result.rows.forEach((p) => {
       const name = escapeCsvValue(p.name);
       const phone = escapeCsvValue(p.phone_number);
-
       const gender =
         p.gender === "Female" ? "أنثى" : p.gender === "Male" ? "ذكر" : "-";
-
       const dob = escapeCsvValue(p.date_of_birth || "-");
-      const alerts = escapeCsvValue(p.medical_alerts || "");
+      const alerts = escapeCsvValue(p.medical_alerts || "-");
+      const guardian = escapeCsvValue(p.guardian_name || "-");
+      const guardianPhone = escapeCsvValue(p.guardian_phone || "-");
+      const emergency = escapeCsvValue(p.emergency_contact_name || "-");
+      const emergencyPhone = escapeCsvValue(p.emergency_contact_phone || "-");
+      const source = escapeCsvValue(p.referral_source || "-");
       const createdAt = escapeCsvValue(p.created_at || "-");
 
-      csv += `${name},${phone},${gender},${dob},${alerts},${createdAt}\n`;
+      csv += `${name},${phone},${gender},${dob},${alerts},${guardian},${guardianPhone},${emergency},${emergencyPhone},${source},${createdAt}\n`;
     });
 
     try {
@@ -652,16 +1143,13 @@ const exportPatients = async (req, res) => {
   } catch (err) {
     captureError(err, req);
     console.error("Error exporting patients:", err.message);
-
     return res.status(500).json({
       error: "خطأ في السيرفر أثناء تصدير المرضى",
     });
   }
 };
 
-// ==========================================
-// 8. محلل CSV القياسي المتوافق مع RFC 4180
-// ==========================================
+// 12. محلل واستيراد CSV
 const parseCsvBuffer = (buffer) => {
   let text = buffer.toString("utf-8");
   if (text.charCodeAt(0) === 0xfeff) {
@@ -719,7 +1207,6 @@ const parseCsvBuffer = (buffer) => {
   }
 
   const rawHeaders = rowsRaw[0].map((h) => h.toLowerCase().trim());
-
   const headerMap = {};
   rawHeaders.forEach((h, idx) => {
     if (["name", "اسم", "اسم المريض", "الاسم"].includes(h))
@@ -801,7 +1288,6 @@ const importPatientsFromCsv = async (req, res) => {
     );
 
     for (const row of rows) {
-      // 1. فحص الاسم وطوله
       const cleanName = (row.name || "").trim();
       if (cleanName.length < 2) {
         errors.push({
@@ -823,7 +1309,6 @@ const importPatientsFromCsv = async (req, res) => {
         continue;
       }
 
-      // 2. تطبيع وفحص رقم الهاتف
       const normalizedPhone = normalizeEgyptianPhone(row.phone);
       if (!normalizedPhone) {
         errors.push({
@@ -835,7 +1320,6 @@ const importPatientsFromCsv = async (req, res) => {
         continue;
       }
 
-      // 3. فحص التكرار داخل نفس الملف
       if (seenPhonesInFile.has(normalizedPhone)) {
         errors.push({
           row: row.rowNumber,
@@ -846,7 +1330,6 @@ const importPatientsFromCsv = async (req, res) => {
         continue;
       }
 
-      // 4. فحص التكرار مع قاعدة البيانات
       if (existingPhones.has(normalizedPhone)) {
         errors.push({
           row: row.rowNumber,
@@ -857,11 +1340,9 @@ const importPatientsFromCsv = async (req, res) => {
         continue;
       }
 
-      // 5. فحص وتوحيد النوع
       let normalizedGender = null;
       if (row.gender && row.gender.trim() !== "") {
         const g = row.gender.trim().toLowerCase();
-
         if (["-", "--", "غير محدد", "none", "null"].includes(g)) {
           normalizedGender = null;
         } else if (["أنثى", "انثى", "female", "f", "ست", "سيدة"].includes(g)) {
@@ -880,11 +1361,9 @@ const importPatientsFromCsv = async (req, res) => {
         }
       }
 
-      // 6. فحص تاريخ الميلاد الذكي
       let validDob = null;
       if (row.dob && row.dob.trim() !== "") {
         const parsedDate = parseEgyptianDate(row.dob);
-
         if (parsedDate === "INVALID") {
           errors.push({
             row: row.rowNumber,
@@ -903,7 +1382,6 @@ const importPatientsFromCsv = async (req, res) => {
           });
           continue;
         }
-
         validDob = parsedDate;
       }
 
@@ -934,7 +1412,6 @@ const importPatientsFromCsv = async (req, res) => {
       });
     }
 
-    // 🚀 7. إدخال المرضى بتقنية الـ Bulk Batch Insert (حزم كل 100 مريض)
     if (importedPatients.length > 0) {
       let client;
       try {
@@ -1035,4 +1512,8 @@ module.exports = {
   restorePatient,
   exportPatients,
   importPatientsFromCsv,
+  checkDuplicatePhone,
+  saveMedicalHistory,
+  addAllergy,
+  deleteAllergy,
 };
