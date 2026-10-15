@@ -158,54 +158,13 @@ const createPrescription = async (req, res) => {
     }
 
     // ✅ استخدام توقيت القاهرة في حال لم يتم تحديد تاريخ الروشتة
-    const result = await pool.query(
-      `
-      INSERT INTO prescriptions (
-        clinic_id,
-        patient_id,
-        doctor_id,
-        prescription_date,
-        diagnosis,
-        medications,
-        instructions
-      )
-      VALUES ($1, $2, $3, COALESCE($4, (NOW() AT TIME ZONE 'Africa/Cairo')::date), $5, $6, $7)
-      RETURNING *;
-      `,
-      [
-        clinicId,
-        patientId,
-        assignedDoctorId,
-        safeDate,
-        safeDiagnosis,
-        JSON.stringify(cleanMedications),
-        instructions && typeof instructions === "string"
-          ? instructions.trim().slice(0, 1000)
-          : null,
-      ],
-    );
-
-    try {
-      await logActivity({
-        clinic_id: clinicId,
-        user_id: req.user.id,
-        action: "CREATE_PRESCRIPTION",
-        entity_type: "prescription",
-        entity_id: result.rows[0].id,
-        description: `قام ${req.user.name || "المستخدم"} بإصدار روشتة طبية للمريض (${patientCheck.rows[0].name})`,
-        metadata: {
-          doctor_id: assignedDoctorId,
-          medications_count: cleanMedications.length,
-        },
-      });
-    } catch (auditErr) {
-      console.warn("Audit log failed for prescription:", auditErr.message);
-    }
-
-    // ⚠️ فحص الحساسية الدوائية للمريض وإرجاع قائمة التحذيرات قبل الطباعة
+    // ⚠️ فحص الحساسية قبل حفظ الروشتة
     const warnings = [];
+
     const allergiesRes = await pool.query(
-      `SELECT substance, reaction, severity FROM patient_allergies WHERE patient_id = $1 AND clinic_id = $2`,
+      `SELECT substance, reaction, severity
+       FROM patient_allergies
+       WHERE patient_id = $1 AND clinic_id = $2`,
       [patientId, clinicId],
     );
 
@@ -229,6 +188,7 @@ const createPrescription = async (req, res) => {
 
       for (const med of cleanMedications) {
         const medNameLower = med.name.toLowerCase();
+
         for (const alg of allergiesRes.rows) {
           const subLower = (alg.substance || "").trim().toLowerCase();
           if (!subLower) continue;
@@ -255,9 +215,75 @@ const createPrescription = async (req, res) => {
       }
     }
 
+    // لا نحفظ الروشتة عند وجود تحذيرات إلا بعد تأكيد الطبيب صراحةً
+    const allergyWarningConfirmed = req.body?.confirm_allergy_warnings === true;
+
+    if (warnings.length > 0 && !allergyWarningConfirmed) {
+      return res.status(409).json({
+        error:
+          "تم اكتشاف تحذيرات حساسية دوائية. راجع التحذيرات قبل حفظ الروشتة.",
+        code: "PRESCRIPTION_ALLERGY_WARNING",
+        requires_allergy_confirmation: true,
+        warnings,
+      });
+    }
+
+    // ✅ لا نصل إلى الحفظ إلا بعد اجتياز فحص الحساسية أو تأكيد الطبيب
+    const result = await pool.query(
+      `
+      INSERT INTO prescriptions (
+        clinic_id,
+        patient_id,
+        doctor_id,
+        prescription_date,
+        diagnosis,
+        medications,
+        instructions
+      )
+      VALUES (
+        $1, $2, $3,
+        COALESCE($4, (NOW() AT TIME ZONE 'Africa/Cairo')::date),
+        $5, $6, $7
+      )
+      RETURNING *;
+      `,
+      [
+        clinicId,
+        patientId,
+        assignedDoctorId,
+        safeDate,
+        safeDiagnosis,
+        JSON.stringify(cleanMedications),
+        instructions && typeof instructions === "string"
+          ? instructions.trim().slice(0, 1000)
+          : null,
+      ],
+    );
+
+    try {
+      await logActivity({
+        clinic_id: clinicId,
+        user_id: req.user.id,
+        action: "CREATE_PRESCRIPTION",
+        entity_type: "prescription",
+        entity_id: result.rows[0].id,
+        description: `قام ${req.user.name || "المستخدم"} بإصدار روشتة طبية للمريض (${patientCheck.rows[0].name})`,
+        metadata: {
+          doctor_id: assignedDoctorId,
+          medications_count: cleanMedications.length,
+          allergy_warning_count: warnings.length,
+          allergy_warning_confirmed:
+            warnings.length > 0 && allergyWarningConfirmed,
+        },
+      });
+    } catch (auditErr) {
+      console.warn("Audit log failed for prescription:", auditErr.message);
+    }
+
     res.status(201).json({
       ...result.rows[0],
       warnings,
+      allergy_warning_confirmed: warnings.length > 0 && allergyWarningConfirmed,
     });
   } catch (error) {
     if (error.code === "22008") {
