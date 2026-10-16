@@ -6,50 +6,95 @@ const { logActivity } = require("../utils/auditLogger");
 const { isValidUuid } = require("../middleware/validateUuid");
 const { captureError } = require("../utils/errorTracker");
 
+const VALID_MANUAL_METHODS = [
+  "cash",
+  "card",
+  "bank_transfer",
+  "vodafone_cash",
+  "instapay",
+  "cheque",
+  "other",
+];
+
+const normalizePaymentMethod = (raw) => {
+  let m = String(raw || "")
+    .toLowerCase()
+    .trim();
+  if (m === "transfer") m = "bank_transfer";
+  if (m === "vodafonecash") m = "vodafone_cash";
+  if (m === "insta_pay" || m === "insta-pay") m = "instapay";
+  if (m === "check") m = "cheque";
+  return m;
+};
+
+
+
+
+
+/**
+ * إلغاء ربط القسط بالدفعة الملغاة وإعادته إلى «مستحق» فقط دون لمس أي قسط آخر
+ * @param {object} client - pg client داخل المعاملة
+ * @param {object} params
+ * @returns {Promise<object|null>} القسط الذي أُعيد إلى مستحق أو null
+ */
+const revertVoidedPaymentFromInstallment = async (
+  client,
+  { clinic_id, payment_id },
+) => {
+  const updateRes = await client.query(
+    `UPDATE installments
+     SET paid_amount = 0.00,
+         status = 'pending',
+         payment_id = NULL,
+         paid_at = NULL,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE payment_id = $1
+  AND clinic_id = $2
+  AND status = 'paid'
+     RETURNING id, installment_number, title, amount;`,
+    [payment_id, clinic_id],
+  );
+
+  return updateRes.rows[0] || null;
+};
+
 // ==========================================
-// 1. تسجيل دفعة يدوية (Manual Payment)
+// 1. تسجيل دفعة يدوية (Manual Payment + Installment Settlement)
 // ==========================================
 const recordPayment = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const user_id = req.user.id;
-  const { invoice_id, amount, payment_method, notes } = req.body;
+  const {
+    invoice_id,
+    installment_id,
+    amount,
+    payment_method,
+    reference_number,
+    notes,
+  } = req.body;
 
   if (!invoice_id || !isValidUuid(invoice_id)) {
     return res.status(400).json({ error: "معرّف الفاتورة غير صالح" });
   }
 
-  const payingAmount = parseFloat(amount);
+  if (installment_id && !isValidUuid(installment_id)) {
+    return res.status(400).json({ error: "معرّف القسط غير صالح" });
+  }
 
-  if (isNaN(payingAmount) || payingAmount < 0.01) {
+  const payingAmount = Number(amount);
+
+  if (
+    amount === "" ||
+    amount === null ||
+    amount === undefined ||
+    !Number.isFinite(payingAmount) ||
+    payingAmount < 0.01
+  ) {
     return res.status(400).json({
       error:
         "المبلغ المدفوع يجب أن يكون رقماً صالحاً ولا يقل عن 0.01 ج.م (قرش واحد)",
     });
   }
-
-  if (notes && typeof notes === "string" && notes.trim().length > 1000) {
-    return res.status(400).json({
-      error: "الملاحظات يجب ألا تتجاوز 1000 حرف",
-    });
-  }
-
-  const validMethods = [
-    "cash",
-    "card",
-    "bank_transfer",
-    "vodafone_cash",
-    "other",
-  ];
-  let normalizedMethod = (payment_method || "").toLowerCase().trim();
-  if (normalizedMethod === "transfer") normalizedMethod = "bank_transfer";
-  if (normalizedMethod === "vodafonecash") normalizedMethod = "vodafone_cash";
-
-  if (!validMethods.includes(normalizedMethod)) {
-    return res.status(400).json({ error: "طريقة الدفع غير صالحة" });
-  }
-
-  const payingAmountCents = Math.round(payingAmount * 100);
-  const cleanPayingAmount = payingAmountCents / 100;
 
   if (notes !== undefined && notes !== null && typeof notes !== "string") {
     return res.status(400).json({
@@ -62,6 +107,27 @@ const recordPayment = async (req, res) => {
       error: "الملاحظات يجب ألا تتجاوز 1000 حرف",
     });
   }
+
+  if (
+    reference_number !== undefined &&
+    reference_number !== null &&
+    typeof reference_number === "string" &&
+    reference_number.trim().length > 100
+  ) {
+    return res.status(400).json({
+      error: "رقم المرجع يجب ألا يتجاوز 100 حرف",
+    });
+  }
+
+  const normalizedMethod = normalizePaymentMethod(payment_method);
+
+  if (!VALID_MANUAL_METHODS.includes(normalizedMethod)) {
+    return res.status(400).json({ error: "طريقة الدفع غير صالحة" });
+  }
+
+  const payingAmountCents = Math.round(payingAmount * 100);
+  const cleanPayingAmount = payingAmountCents / 100;
+
   let client;
   try {
     client = await pool.connect();
@@ -93,17 +159,83 @@ const recordPayment = async (req, res) => {
         .json({ error: "لا يمكن الدفع لفاتورة ملغاة أو مؤرشفة" });
     }
 
-    // حساب المدفوع مسبقاً بدقة القروش (الدفعات الناجحة فقط)
+    // 3. فحص الأقساط بدقة (1:1 Payment to Installment)
+    let targetInstallment = null;
+
+    const existingInstRes = await client.query(
+      `SELECT id, installment_number, title, amount, paid_amount, status, due_date
+       FROM installments
+       WHERE clinic_id = $1 AND invoice_id = $2 AND status <> 'cancelled'
+       ORDER BY due_date ASC, installment_number ASC
+       FOR UPDATE;`,
+      [clinic_id, invoice_id],
+    );
+
+    if (existingInstRes.rows.length > 0) {
+      if (installment_id) {
+        targetInstallment = existingInstRes.rows.find(
+          (i) => i.id === installment_id,
+        );
+        if (!targetInstallment) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({
+            error: "القسط المحدد غير موجود أو لا يخص هذه الفاتورة",
+          });
+        }
+      } else {
+        const nextPending = existingInstRes.rows.find(
+          (i) => i.status === "pending",
+        );
+        if (!nextPending) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error: "جميع أقساط هذه الفاتورة مسددة بالكامل بالفعل",
+          });
+        }
+        targetInstallment = nextPending;
+      }
+
+      if (targetInstallment.status === "cancelled") {
+        await client.query("ROLLBACK");
+        return res
+          .status(400)
+          .json({ error: "لا يمكن تسجيل دفعة على قسط ملغي" });
+      }
+
+      if (targetInstallment.status === "paid") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: `القسط #${targetInstallment.installment_number} مسدد بالكامل بالفعل`,
+        });
+      }
+
+      const instAmountCents = Math.round(
+        Number(targetInstallment.amount) * 100,
+      );
+
+      // تطبيق القواعد الصارمة: مفيش سداد جزئي ولا توزيع على عدة أقساط
+      if (payingAmountCents !== instAmountCents) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: `قيمة الدفعة (${cleanPayingAmount} ج.م) يجب أن تطابق تماماً قيمة القسط #${targetInstallment.installment_number} (${Number(targetInstallment.amount)} ج.م). النظام لا يدعم السداد الجزئي أو الموزع للأقساط.`,
+        });
+      }
+    } else if (installment_id) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        error: "القسط المحدد غير موجود أو لا يخص هذه الفاتورة",
+      });
+    }
+
+    // حساب المدفوع مسبقاً بدقة القروش
     const paidResult = await client.query(
       "SELECT COALESCE(SUM(amount), 0) AS total_paid FROM payments WHERE invoice_id = $1 AND clinic_id = $2 AND status = 'paid';",
       [invoice_id, clinic_id],
     );
 
-    const invoiceTotalCents = Math.round(
-      parseFloat(invoice.total_amount) * 100,
-    );
+    const invoiceTotalCents = Math.round(Number(invoice.total_amount) * 100);
     const alreadyPaidCents = Math.round(
-      parseFloat(paidResult.rows[0].total_paid) * 100,
+      Number(paidResult.rows[0].total_paid) * 100,
     );
     const newTotalPaidCents = alreadyPaidCents + payingAmountCents;
 
@@ -115,21 +247,33 @@ const recordPayment = async (req, res) => {
       });
     }
 
-    // إضافة الدفعة بالقيمة الموحدة النظيفة
+    const cleanReferenceNumber =
+      typeof reference_number === "string" && reference_number.trim() !== ""
+        ? reference_number.trim()
+        : null;
+
+    // 1. تسجيل الدفعة
     const paymentResult = await client.query(
-      `INSERT INTO payments (clinic_id, invoice_id, amount, payment_method, status, notes, created_by, paid_at)
-       VALUES ($1, $2, $3, $4, 'paid', $5, $6, CURRENT_TIMESTAMP)
+      `INSERT INTO payments (
+         clinic_id, invoice_id, amount, payment_method,
+         reference_number, status, notes, created_by, paid_at
+       )
+       VALUES ($1, $2, $3, $4, $5, 'paid', $6, $7, CURRENT_TIMESTAMP)
        RETURNING *;`,
       [
         clinic_id,
         invoice_id,
         cleanPayingAmount,
         normalizedMethod,
+        cleanReferenceNumber,
         notes?.trim() || null,
-        user_id,
+        req.user.clinic_id ? user_id : null,
       ],
     );
 
+    const newPayment = paymentResult.rows[0];
+
+    // 2. تحديث حالة الفاتورة
     const newStatus =
       newTotalPaidCents >= invoiceTotalCents ? "paid" : "partially_paid";
 
@@ -138,6 +282,23 @@ const recordPayment = async (req, res) => {
       [newStatus, invoice_id, clinic_id],
     );
 
+    // 3. تسوية القسط المرتبط بالكامل دون المساس بأي قسط آخر (1:1)
+    let settledInstallment = null;
+    if (targetInstallment) {
+      const instUpd = await client.query(
+        `UPDATE installments
+         SET paid_amount = amount,
+             status = 'paid',
+             payment_id = $1,
+             paid_at = CURRENT_TIMESTAMP,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2 AND clinic_id = $3
+         RETURNING *;`,
+        [newPayment.id, targetInstallment.id, clinic_id],
+      );
+      settledInstallment = instUpd.rows[0];
+    }
+
     await client.query("COMMIT");
 
     const remainingFinal = Math.max(
@@ -145,7 +306,6 @@ const recordPayment = async (req, res) => {
       (invoiceTotalCents - newTotalPaidCents) / 100,
     );
 
-    // تسجيل العملية في سجل الرقابة
     try {
       await logActivity({
         clinic_id,
@@ -158,11 +318,19 @@ const recordPayment = async (req, res) => {
         } بتحصيل دفعة بقيمة ${cleanPayingAmount} ج.م للفاتورة #${invoice_id.slice(
           0,
           8,
-        )}`,
+        )}${
+          settledInstallment
+            ? ` (سداد كامل للقسط #${settledInstallment.installment_number})`
+            : ""
+        }`,
         metadata: {
           amount: cleanPayingAmount,
           payment_method: normalizedMethod,
+          reference_number: cleanReferenceNumber,
           remaining_amount: remainingFinal,
+          settled_installment_id: settledInstallment?.id || null,
+          settled_installment_number:
+            settledInstallment?.installment_number || null,
         },
       });
     } catch (auditError) {
@@ -170,10 +338,14 @@ const recordPayment = async (req, res) => {
     }
 
     res.status(201).json({
-      message: "تم تسجيل الدفعة وتحديث الفاتورة بنجاح",
-      payment: paymentResult.rows[0],
+      message: settledInstallment
+        ? `تم تسجيل الدفعة وسداد القسط #${settledInstallment.installment_number} بالكامل بنجاح`
+        : "تم تسجيل الدفعة وتحديث الفاتورة بنجاح",
+      payment: newPayment,
       invoice_status: newStatus,
       remaining_amount: remainingFinal,
+      settled_installment: settledInstallment,
+      settled_installments: settledInstallment ? [settledInstallment] : [],
     });
   } catch (error) {
     if (client) {
@@ -182,6 +354,9 @@ const recordPayment = async (req, res) => {
       } catch (rollbackErr) {
         console.error("Rollback error:", rollbackErr.message);
       }
+    }
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ error: error.message });
     }
     captureError(error, req);
     console.error("Error recording payment:", error.message);
@@ -198,10 +373,20 @@ const createOnlinePayment = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const user_id = req.user.id;
   const clinic_email = req.user.email;
-  const { invoice_id, amount, notes, expires_hours = 24 } = req.body;
+  const {
+    invoice_id,
+    installment_id,
+    amount,
+    notes,
+    expires_hours = 24,
+  } = req.body;
 
   if (!invoice_id || !isValidUuid(invoice_id)) {
     return res.status(400).json({ error: "معرّف الفاتورة غير صالح" });
+  }
+
+  if (installment_id && !isValidUuid(installment_id)) {
+    return res.status(400).json({ error: "معرّف القسط غير صالح" });
   }
 
   const parsedHours = parseInt(expires_hours, 10);
@@ -266,17 +451,14 @@ const createOnlinePayment = async (req, res) => {
         .json({ error: "لا يمكن إنشاء رابط دفع لهذه الفاتورة" });
     }
 
-    // حساب المتبقي على الفاتورة
     const paidResult = await client.query(
       "SELECT COALESCE(SUM(amount), 0) AS total_paid FROM payments WHERE invoice_id = $1 AND clinic_id = $2 AND status = 'paid';",
       [invoice_id, clinic_id],
     );
 
-    const invoiceTotalCents = Math.round(
-      parseFloat(invoice.total_amount) * 100,
-    );
+    const invoiceTotalCents = Math.round(Number(invoice.total_amount) * 100);
     const alreadyPaidCents = Math.round(
-      parseFloat(paidResult.rows[0].total_paid) * 100,
+      Number(paidResult.rows[0].total_paid) * 100,
     );
     const remainingCents = invoiceTotalCents - alreadyPaidCents;
 
@@ -287,28 +469,74 @@ const createOnlinePayment = async (req, res) => {
       });
     }
 
+    const installmentsRes = await client.query(
+      `SELECT id, installment_number, amount, status
+   FROM installments
+   WHERE clinic_id = $1
+     AND invoice_id = $2
+     AND status <> 'cancelled'
+   ORDER BY due_date ASC, installment_number ASC
+   FOR UPDATE`,
+      [clinic_id, invoice_id],
+    );
+
+    let targetOnlineInstallment = null;
     let requestedAmountCents = remainingCents;
-    if (amount !== undefined && amount !== null && amount !== "") {
-      const parsedAmount = parseFloat(amount);
-      if (isNaN(parsedAmount) || parsedAmount < 0.01) {
+
+    if (installmentsRes.rows.length > 0) {
+      targetOnlineInstallment = installment_id
+        ? installmentsRes.rows.find((i) => i.id === installment_id)
+        : installmentsRes.rows.find((i) => i.status === "pending");
+
+      if (!targetOnlineInstallment) {
         await client.query("ROLLBACK");
-        return res
-          .status(400)
-          .json({ error: "المبلغ المطلوب يجب ألا يقل عن 0.01 ج.م" });
+        return res.status(400).json({
+          error: installment_id
+            ? "القسط المحدد غير موجود أو لا يخص هذه الفاتورة"
+            : "لا يوجد قسط مستحق للدفع",
+        });
       }
-      requestedAmountCents = Math.round(parsedAmount * 100);
+
+      if (targetOnlineInstallment.status !== "pending") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          error: "لا يمكن إنشاء رابط دفع إلا لقسط مستحق بالكامل",
+        });
+      }
+
+      // الرابط يسدد القسط المختار بالكامل فقط
+      requestedAmountCents = Math.round(
+        Number(targetOnlineInstallment.amount) * 100,
+      );
+    } else {
+      if (installment_id) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          error: "القسط المحدد غير موجود أو لا يخص هذه الفاتورة",
+        });
+      }
+
+      if (amount !== undefined && amount !== null && amount !== "") {
+        const parsedAmount = Number(amount);
+
+        if (!Number.isFinite(parsedAmount) || parsedAmount < 0.01) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error: "المبلغ المطلوب يجب ألا يقل عن 0.01 ج.م",
+          });
+        }
+
+        requestedAmountCents = Math.round(parsedAmount * 100);
+      }
     }
 
     if (requestedAmountCents > remainingCents) {
       await client.query("ROLLBACK");
       return res.status(400).json({
-        error: `المبلغ المطلوب (${
-          requestedAmountCents / 100
-        }) يتجاوز المتبقي من الفاتورة (${remainingCents / 100} جنيه)`,
+        error: `المبلغ المطلوب (${requestedAmountCents / 100}) يتجاوز المتبقي من الفاتورة (${remainingCents / 100} جنيه)`,
       });
     }
 
-    // جلب بيانات المريض
     const patientResult = await client.query(
       "SELECT name, phone_number FROM patients WHERE id = $1 AND clinic_id = $2;",
       [invoice.patient_id, clinic_id],
@@ -335,19 +563,23 @@ const createOnlinePayment = async (req, res) => {
         .json({ error: "رقم هاتف المريض غير مسجل بصيغة مصرية صحيحة" });
     }
 
-    // إلغاء أي روابط دفع سابقة لنفس الفاتورة ما زالت pending
+    // نلغي فقط الروابط المعلقة لنفس القسط (أو كل الروابط لو الفاتورة بدون أقساط)
+    const installmentMarker = targetOnlineInstallment
+      ? `%[installment_id:${targetOnlineInstallment.id}]%`
+      : null;
+
     await client.query(
       `UPDATE payments 
        SET status = 'cancelled', 
            notes = COALESCE(notes, '') || ' [ملغى: تم استبداله برابط دفع جديد]'
-       WHERE invoice_id = $1 AND clinic_id = $2 AND status = 'pending';`,
-      [invoice_id, clinic_id],
+       WHERE invoice_id = $1 AND clinic_id = $2 AND status = 'pending'
+         AND ($3::text IS NULL OR notes LIKE $3);`,
+      [invoice_id, clinic_id, installmentMarker],
     );
 
     const expiresAt = new Date(Date.now() + validHours * 60 * 60 * 1000);
     const finalAmountEGP = requestedAmountCents / 100;
 
-    // تسجيل الدفعة الجديدة بحالة pending
     const paymentResult = await client.query(
       `INSERT INTO payments (
         clinic_id, invoice_id, amount, payment_method, 
@@ -360,8 +592,15 @@ const createOnlinePayment = async (req, res) => {
         invoice_id,
         finalAmountEGP,
         expiresAt,
-        user_id,
-        notes?.trim() || null,
+        req.user.clinic_id ? user_id : null,
+        [
+          notes?.trim() || null,
+          targetOnlineInstallment
+            ? `[installment_id:${targetOnlineInstallment.id}]`
+            : null,
+        ]
+          .filter(Boolean)
+          .join(" ") || null,
       ],
     );
 
@@ -369,7 +608,6 @@ const createOnlinePayment = async (req, res) => {
     pendingPaymentId = pendingPayment.id;
     await client.query("COMMIT");
 
-    // طلب الجلسة من Paymob
     try {
       const session = await provider.createPaymentSession({
         amount: finalAmountEGP,
@@ -463,12 +701,15 @@ const handlePaymobWebhook = async (req, res) => {
     client = await pool.connect();
     await client.query("BEGIN");
 
-    let paymentLookupQuery = "SELECT * FROM payments WHERE id = $1;";
+    let paymentLookupQuery =
+      "SELECT * FROM payments WHERE id = $1 AND provider = 'paymob' AND payment_method = 'online';";
+
     let paymentLookupParams = [paymentId];
 
     if (!paymentId && orderId) {
       paymentLookupQuery =
-        "SELECT * FROM payments WHERE provider_order_id = $1;";
+        "SELECT * FROM payments WHERE provider_order_id = $1 AND provider = 'paymob' AND payment_method = 'online';";
+
       paymentLookupParams = [orderId];
     }
 
@@ -479,13 +720,6 @@ const handlePaymobWebhook = async (req, res) => {
 
     if (paymentLookupResult.rows.length === 0) {
       await client.query("ROLLBACK");
-
-      console.warn(
-        `Paymob Webhook: Payment not found for reference: ${
-          paymentId || orderId
-        }`,
-      );
-
       return res.status(200).json({
         message: "Payment record not found, ignored.",
       });
@@ -500,7 +734,6 @@ const handlePaymobWebhook = async (req, res) => {
 
     if (invoiceResult.rows.length === 0) {
       await client.query("ROLLBACK");
-
       const errMessage = `Paymob Webhook: Invoice ${paymentRef.invoice_id} not found for payment ${paymentRef.id}`;
       console.error(errMessage);
       captureError(new Error(errMessage), req);
@@ -518,9 +751,6 @@ const handlePaymobWebhook = async (req, res) => {
 
     if (paymentResult.rows.length === 0) {
       await client.query("ROLLBACK");
-      const errMessage = `Payment record disappeared during webhook processing for payment ${paymentRef.id}`;
-      console.error(errMessage);
-      captureError(new Error(errMessage), req);
       return res.status(500).json({
         error: "Payment record disappeared during webhook processing",
       });
@@ -528,7 +758,6 @@ const handlePaymobWebhook = async (req, res) => {
 
     const payment = paymentResult.rows[0];
 
-    // 1) إذا كانت الدفعة مسددة بالفعل
     if (payment.status === "paid") {
       await client.query("ROLLBACK");
       return res.status(200).json({
@@ -536,7 +765,6 @@ const handlePaymobWebhook = async (req, res) => {
       });
     }
 
-    // 2) إذا كانت الدفعة محالة للمراجعة اليدوية بالفعل
     if (payment.status === "needs_review") {
       await client.query("ROLLBACK");
       return res.status(200).json({
@@ -544,7 +772,6 @@ const handlePaymobWebhook = async (req, res) => {
       });
     }
 
-    // 3) إذا ألغت العيادة رابط الدفع يدوياً وحصل دفع بعدها
     if (payment.status === "cancelled" && isSuccess) {
       await client.query(
         `UPDATE payments
@@ -557,15 +784,18 @@ const handlePaymobWebhook = async (req, res) => {
       );
 
       await client.query("COMMIT");
-      console.warn(
-        `⚠ Paymob Webhook: Payment ${payment.id} succeeded on a CANCELLED payment link.`,
-      );
       return res.status(200).json({
         message: "Payment received on cancelled record, marked for review.",
       });
     }
 
-    // 4) لا يزال Pending
+    if (payment.status === "cancelled" && !isSuccess) {
+      await client.query("ROLLBACK");
+      return res.status(200).json({
+        message: "Payment was cancelled by the clinic, event ignored.",
+      });
+    }
+
     if (isPending) {
       await client.query(
         `UPDATE payments
@@ -575,13 +805,11 @@ const handlePaymobWebhook = async (req, res) => {
       );
 
       await client.query("COMMIT");
-
       return res.status(200).json({
         message: "Payment is still pending confirmation.",
       });
     }
 
-    // 5) فشل محاولة الدفع الحالية
     if (!isSuccess) {
       await client.query(
         `UPDATE payments
@@ -593,14 +821,12 @@ const handlePaymobWebhook = async (req, res) => {
       );
 
       await client.query("COMMIT");
-
       return res.status(200).json({
         message: "Payment marked as failed.",
       });
     }
 
-    // 6) في حال النجاح (isSuccess === true)
-    const expectedAmountCents = Math.round(parseFloat(payment.amount) * 100);
+    const expectedAmountCents = Math.round(Number(payment.amount) * 100);
 
     if (Number(amountCents) !== expectedAmountCents) {
       await client.query(
@@ -614,11 +840,6 @@ const handlePaymobWebhook = async (req, res) => {
       );
 
       await client.query("COMMIT");
-
-      console.warn(
-        `⚠ Paymob Webhook: Amount mismatch for payment ${payment.id}. Expected: ${expectedAmountCents}, Received: ${amountCents}`,
-      );
-
       return res.status(200).json({
         message: "Payment received but marked for manual review.",
       });
@@ -636,11 +857,6 @@ const handlePaymobWebhook = async (req, res) => {
       );
 
       await client.query("COMMIT");
-
-      console.warn(
-        `⚠ Paymob Webhook: Payment ${payment.id} succeeded for cancelled/archived invoice ${invoice.id}.`,
-      );
-
       return res.status(200).json({
         message: "Payment received and marked for manual review.",
       });
@@ -655,14 +871,10 @@ const handlePaymobWebhook = async (req, res) => {
       [payment.invoice_id, payment.clinic_id],
     );
 
-    const invoiceTotalCents = Math.round(
-      parseFloat(invoice.total_amount) * 100,
-    );
-
+    const invoiceTotalCents = Math.round(Number(invoice.total_amount) * 100);
     const alreadyPaidCents = Math.round(
-      parseFloat(totalPaidResult.rows[0].total_paid) * 100,
+      Number(totalPaidResult.rows[0].total_paid) * 100,
     );
-
     const newTotalPaidCents = alreadyPaidCents + expectedAmountCents;
 
     if (newTotalPaidCents > invoiceTotalCents) {
@@ -677,14 +889,63 @@ const handlePaymobWebhook = async (req, res) => {
       );
 
       await client.query("COMMIT");
-
-      console.warn(
-        `⚠ Paymob Webhook: Overpayment detected for payment ${payment.id}, invoice ${invoice.id}.`,
-      );
-
       return res.status(200).json({
         message: "Payment received but marked for manual review.",
       });
+    }
+
+    let installmentToSettle = null;
+
+    const activeInstallmentsResult = await client.query(
+      `SELECT id, installment_number, amount, status
+   FROM installments
+   WHERE clinic_id = $1
+     AND invoice_id = $2
+     AND status <> 'cancelled'
+   ORDER BY due_date ASC, installment_number ASC
+   FOR UPDATE`,
+      [payment.clinic_id, invoice.id],
+    );
+
+    if (activeInstallmentsResult.rows.length > 0) {
+      const markerMatches = [
+        ...String(payment.notes || "").matchAll(
+          /\[installment_id:([0-9a-f-]{36})\]/gi,
+        ),
+      ];
+
+      // نستخدم آخر معرّف، لأن الملاحظات قد تحتوي على نصوص أو علامات أقدم
+      const marker = markerMatches.at(-1);
+
+      installmentToSettle = marker
+        ? activeInstallmentsResult.rows.find(
+            (inst) => inst.id.toLowerCase() === marker[1].toLowerCase(),
+          )
+        : null;
+
+      if (
+        !installmentToSettle ||
+        installmentToSettle.status !== "pending" ||
+        Math.round(Number(installmentToSettle.amount) * 100) !==
+          expectedAmountCents
+      ) {
+        await client.query(
+          `UPDATE payments
+       SET status = 'needs_review',
+           provider_transaction_id =
+             COALESCE($1, provider_transaction_id),
+           notes = COALESCE(notes, '') ||
+             ' [مراجعة مطلوبة: تعذر مطابقة الدفعة مع القسط المحدد]'
+       WHERE id = $2`,
+          [transactionId, payment.id],
+        );
+
+        await client.query("COMMIT");
+
+        return res.status(200).json({
+          message: "Payment requires manual review.",
+        });
+      }
     }
 
     const retryNote =
@@ -714,6 +975,21 @@ const handlePaymobWebhook = async (req, res) => {
       [newInvoiceStatus, invoice.id, invoice.clinic_id],
     );
 
+    if (installmentToSettle) {
+      await client.query(
+        `UPDATE installments
+     SET paid_amount = amount,
+         status = 'paid',
+         payment_id = $1,
+         paid_at = CURRENT_TIMESTAMP,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = $2
+       AND clinic_id = $3
+       AND status = 'pending'`,
+        [payment.id, installmentToSettle.id, payment.clinic_id],
+      );
+    }
+
     await client.query("COMMIT");
 
     try {
@@ -732,7 +1008,6 @@ const handlePaymobWebhook = async (req, res) => {
           amount: payment.amount,
           provider: "paymob",
           invoice_status: newInvoiceStatus,
-          recovered_from_failed: payment.status === "failed",
         },
       });
     } catch (auditError) {
@@ -764,7 +1039,7 @@ const handlePaymobWebhook = async (req, res) => {
 };
 
 // ==========================================
-// 4. إلغاء / تصحيح دفعة مالية (Void Payment)
+// 4. إلغاء / تصحيح دفعة مالية (Void Payment + Installment Rollback)
 // ==========================================
 const voidPayment = async (req, res) => {
   const clinic_id = req.user.clinic_id;
@@ -860,6 +1135,15 @@ const voidPayment = async (req, res) => {
       [voidNote, payment_id, clinic_id],
     );
 
+    // إلغاء تسوية القسط المرتبط بهذه الدفعة مباشرة (إن وجد) وإعادته إلى «مستحق» فقط
+    const revertedInstallment = await revertVoidedPaymentFromInstallment(
+      client,
+      {
+        clinic_id,
+        payment_id: payment.id,
+      },
+    );
+
     const totalPaidResult = await client.query(
       `SELECT COALESCE(SUM(amount), 0) AS total_paid 
        FROM payments 
@@ -867,22 +1151,23 @@ const voidPayment = async (req, res) => {
       [invoice.id, clinic_id],
     );
 
-    const invoiceTotalCents = Math.round(
-      parseFloat(invoice.total_amount) * 100,
-    );
+    const invoiceTotalCents = Math.round(Number(invoice.total_amount) * 100);
     const newPaidCents = Math.round(
-      parseFloat(totalPaidResult.rows[0].total_paid) * 100,
+      Number(totalPaidResult.rows[0].total_paid) * 100,
     );
 
-    let newInvoiceStatus = "unpaid";
-    if (newPaidCents >= invoiceTotalCents) {
+    let newInvoiceStatus =
+      invoice.status === "cancelled" ? "cancelled" : "unpaid";
+    if (invoice.status === "cancelled") {
+      // لا نغيّر حالة فاتورة ملغاة
+    } else if (newPaidCents >= invoiceTotalCents) {
       newInvoiceStatus = "paid";
     } else if (newPaidCents > 0) {
       newInvoiceStatus = "partially_paid";
     }
 
     let newIsArchived = invoice.is_archived;
-    if (newInvoiceStatus !== "paid") {
+    if (newInvoiceStatus !== "paid" && newInvoiceStatus !== "cancelled") {
       newIsArchived = false;
     }
 
@@ -890,6 +1175,7 @@ const voidPayment = async (req, res) => {
       "UPDATE invoices SET status = $1, is_archived = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3 AND clinic_id = $4;",
       [newInvoiceStatus, newIsArchived, invoice.id, clinic_id],
     );
+
     await client.query("COMMIT");
 
     const remainingAmount = Math.max(
@@ -904,13 +1190,20 @@ const voidPayment = async (req, res) => {
         action: "VOID_PAYMENT",
         entity_type: "invoice",
         entity_id: invoice.id,
-        description: `قام ${req.user.name || "مدير العيادة"} بإلغاء دفعة بقيمة ${payment.amount} ج.م للفاتورة #${String(invoice.id).slice(0, 8)} - السبب: ${reason.trim()}`,
+        description: `قام ${req.user.name || "مدير العيادة"} بإلغاء دفعة بقيمة ${payment.amount} ج.م للفاتورة #${String(invoice.id).slice(0, 8)}${
+          revertedInstallment
+            ? ` (إعادة القسط #${revertedInstallment.installment_number} إلى مستحق)`
+            : ""
+        } - السبب: ${reason.trim()}`,
         metadata: {
           payment_id: payment.id,
           invoice_id: invoice.id,
           voided_amount: payment.amount,
           new_paid_total: newPaidCents / 100,
           new_invoice_status: newInvoiceStatus,
+          reverted_installment_id: revertedInstallment?.id || null,
+          reverted_installment_number:
+            revertedInstallment?.installment_number || null,
           reason: reason.trim(),
         },
       });
@@ -919,10 +1212,13 @@ const voidPayment = async (req, res) => {
     }
 
     res.status(200).json({
-      message: "تم إلغاء الدفعة وإعادة تسوية الفاتورة بنجاح",
+      message: revertedInstallment
+        ? `تم إلغاء الدفعة وإعادة القسط #${revertedInstallment.installment_number} إلى مستحق بنجاح`
+        : "تم إلغاء الدفعة وإعادة تسوية الفاتورة بنجاح",
       payment: updatedPaymentResult.rows[0],
       invoice_status: newInvoiceStatus,
       remaining_amount: remainingAmount,
+      reverted_installment: revertedInstallment,
     });
   } catch (error) {
     if (client) {

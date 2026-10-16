@@ -5,7 +5,9 @@ const {
   getLabOrders,
   updateLabOrderStatus,
   updateLabOrder,
+  recordLabOrderPayment,
   getDistinctLabs,
+  saveLabToDirectory,
 } = require("../controllers/labOrdersController");
 const authMiddleware = require("../middleware/authMiddleware");
 const authorizeRole = require("../middleware/roleMiddleware");
@@ -17,27 +19,37 @@ router.use(authMiddleware);
 router.post(
   "/",
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
-  createLabOrder
+  createLabOrder,
 );
 router.get(
   "/",
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
-  getLabOrders
+  getLabOrders,
 );
 router.get(
   "/labs",
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
-  getDistinctLabs
+  getDistinctLabs,
+);
+router.post(
+  "/labs",
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  saveLabToDirectory,
 );
 router.put(
   "/:id",
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
-  updateLabOrder
+  updateLabOrder,
 );
 router.patch(
   "/:id/status",
   authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
-  updateLabOrderStatus
+  updateLabOrderStatus,
+);
+router.post(
+  "/:id/pay",
+  authorizeRole("ClinicAdmin", "Doctor", "Receptionist"),
+  recordLabOrderPayment,
 );
 
 module.exports = router;
