@@ -46,6 +46,62 @@ const DEFAULT_DENTAL_TEMPLATES = [
   },
 ];
 
+// استنتاج ذكي لحالة السن الناتجة عن الإجراء السريري
+const inferResultingCondition = (procedureName) => {
+  const name = String(procedureName || "").toLowerCase();
+
+  if (
+    name.includes("خلع") ||
+    name.includes("extraction") ||
+    name.includes("exo")
+  ) {
+    return "missing";
+  }
+
+  if (
+    name.includes("زراع") ||
+    name.includes("غرس") ||
+    name.includes("implant")
+  ) {
+    return "implant";
+  }
+
+  if (
+    name.includes("تاج") ||
+    name.includes("طربوش") ||
+    name.includes("تركيب") ||
+    name.includes("زيركون") ||
+    name.includes("بورسلين") ||
+    name.includes("إيماكس") ||
+    name.includes("crown") ||
+    name.includes("zircon") ||
+    name.includes("veneer")
+  ) {
+    return "crown";
+  }
+
+  if (
+    name.includes("عصب") ||
+    name.includes("جذور") ||
+    name.includes("rct") ||
+    name.includes("endo") ||
+    name.includes("pulpotomy") ||
+    name.includes("pulpectomy")
+  ) {
+    return "rct";
+  }
+
+  if (name.includes("سيلانت") || name.includes("sealant")) {
+    return "sealant";
+  }
+
+  if (name.includes("كسر") || name.includes("fracture")) {
+    return "fracture";
+  }
+
+  return null;
+};
+
 // التحقق من أرقام الأسنان وفق معيار FDI العالمي (ISO 3950)
 const isFdiToothNumber = (val) => {
   if (val === null || val === undefined || val === "") return true;
@@ -153,7 +209,8 @@ const fetchFullVisitById = async (dbClient, visitId, clinicId) => {
       vp.cost,
       pc.code AS procedure_code,
       pc.description AS procedure_description,
-      pc.default_price
+      pc.default_price,
+      pc.resulting_condition
     FROM visit_procedures vp
     LEFT JOIN procedure_codes pc ON vp.procedure_code_id = pc.id AND vp.clinic_id = pc.clinic_id
     WHERE vp.visit_id = $1 AND vp.clinic_id = $2
@@ -180,7 +237,6 @@ const createOrGetAppointmentVisit = async (req, res) => {
   }
 
   try {
-    // 🔒 1. التحقق من وجود الموعد وفحص صلاحية الطبيب أولاً وقبل أي استعلام آخر
     const apptRes = await pool.query(
       `
       SELECT a.*, u.name as doctor_name 
@@ -200,14 +256,12 @@ const createOrGetAppointmentVisit = async (req, res) => {
 
     const appt = apptRes.rows[0];
 
-    // حظر وصول الطبيب لموعد طبيب آخر سواء أكانت الزيارة موجودة مسبقاً أو لم تنشأ بعد
     if (req.user.role === "Doctor" && appt.doctor_id !== req.user.id) {
       return res.status(403).json({
         error: `هذا الموعد مخصص لـ (${appt.doctor_name}). لا تملك صلاحية فتح أو استعراض كشف لموعد طبيب آخر.`,
       });
     }
 
-    // 2. فحص ما إذا كانت الزيارة منشأة بالفعل لهذا الموعد
     const existingRes = await pool.query(
       `SELECT id FROM visits WHERE appointment_id = $1 AND clinic_id = $2 LIMIT 1`,
       [appointmentId, clinicId],
@@ -222,7 +276,6 @@ const createOrGetAppointmentVisit = async (req, res) => {
       return res.status(200).json({ visit: fullVisit, is_new: false });
     }
 
-    // 3. إنشاء الزيارة مع معالجة الـ Race Conditions بدقة ذرية
     const insertRes = await pool.query(
       `
       INSERT INTO visits (
@@ -296,7 +349,6 @@ const getVisitById = async (req, res) => {
       return res.status(404).json({ error: "سجل الزيارة غير موجود" });
     }
 
-    // الطبيب لا يطّلع على زيارة مسجلة باسم طبيب آخر
     if (req.user.role === "Doctor" && visit.doctor_id !== req.user.id) {
       return res.status(403).json({
         error: "لا تملك صلاحية عرض سجل زيارة مسجل باسم طبيب آخر",
@@ -340,7 +392,8 @@ const getPatientVisits = async (req, res) => {
                 'notes', vp.notes,
                 'cost', vp.cost,
                 'procedure_code', pc.code,
-                'procedure_description', pc.description
+                'procedure_description', pc.description,
+                'resulting_condition', pc.resulting_condition
               )
             )
             FROM visit_procedures vp
@@ -402,7 +455,6 @@ const updateVisit = async (req, res) => {
 
     const currentVisit = visitCheck.rows[0];
 
-    // 🔒 1. حماية الطبيب: لا يعدل طبيب زيارة مسجلة باسم طبيب آخر
     if (req.user.role === "Doctor" && currentVisit.doctor_id !== req.user.id) {
       await client.query("ROLLBACK");
       return res.status(403).json({
@@ -410,7 +462,6 @@ const updateVisit = async (req, res) => {
       });
     }
 
-    // 🔒 2. حماية الزيارات المعتمدة قانونياً (ClinicAdmin حصراً مع ذكر السبب)
     if (currentVisit.status === "final") {
       if (req.user.role !== "ClinicAdmin") {
         await client.query("ROLLBACK");
@@ -435,7 +486,6 @@ const updateVisit = async (req, res) => {
       }
     }
 
-    // 3. تحديث حقول الزيارة النصية
     await client.query(
       `
       UPDATE visits
@@ -459,16 +509,12 @@ const updateVisit = async (req, res) => {
       ],
     );
 
-    // 4. معالجة وتحديث الإجراءات السريرية (visit_procedures)
     if (Array.isArray(procedures)) {
-      // أ) فلترة الصفوف الفارغة تماماً
       const activeProcedures = procedures.filter(
         (p) => !isProcedureRowEmpty(p),
       );
 
-      // ب) التحقق المسبق من أرقام الأسنان FDI والأسطح والتكلفة للصفوف النشطة فقط
       for (const proc of activeProcedures) {
-        // رقم السن
         if (
           proc.tooth_number !== undefined &&
           proc.tooth_number !== null &&
@@ -477,12 +523,11 @@ const updateVisit = async (req, res) => {
           if (!isFdiToothNumber(proc.tooth_number)) {
             await client.query("ROLLBACK");
             return res.status(400).json({
-              error: `رقم السن (${proc.tooth_number}) غير صالح. يجب أن يكون رقماً صحيحاً وفق نظام FDI الدولي.`,
+              error: `رقم السن (${proc.tooth_number}) غير صالح. يجب أن يكون رقماً صحيحاً وفق نظام FDI الدولي (الدائم 11–48 أو اللبني 51–85).`,
             });
           }
         }
 
-        // أسطح السن
         const surfaceCheck = parseAndValidateSurfaces(
           proc.surfaces || proc.surface,
         );
@@ -491,7 +536,6 @@ const updateVisit = async (req, res) => {
           return res.status(400).json({ error: surfaceCheck.error });
         }
 
-        // التكلفة: التحقق من أنها رقم موجب وصحيح
         if (proc.cost !== undefined && proc.cost !== null && proc.cost !== "") {
           const rawCost = Number(proc.cost);
           if (!Number.isFinite(rawCost) || rawCost < 0) {
@@ -503,7 +547,6 @@ const updateVisit = async (req, res) => {
         }
       }
 
-      // ج) استرجاع بيانات أكواد الإجراءات المرجعية دفعة واحدة
       const rawCodeIds = activeProcedures
         .map((p) => p.procedure_code_id)
         .filter((cid) => cid !== null && cid !== undefined && cid !== "");
@@ -521,7 +564,7 @@ const updateVisit = async (req, res) => {
       if (rawCodeIds.length > 0) {
         const catalogRes = await client.query(
           `
-          SELECT id, code, description, default_price 
+          SELECT id, code, description, default_price, resulting_condition
           FROM procedure_codes 
           WHERE id = ANY($1::uuid[]) AND clinic_id = $2;
           `,
@@ -542,7 +585,6 @@ const updateVisit = async (req, res) => {
         }
       }
 
-      // د) حذف الإجراءات السابقة وإدخال الإجراءات المدققة
       await client.query(
         `DELETE FROM visit_procedures WHERE visit_id = $1 AND clinic_id = $2`,
         [id, clinicId],
@@ -565,7 +607,6 @@ const updateVisit = async (req, res) => {
           });
         }
 
-        // حساب التكلفة
         let cost = 0.0;
         if (proc.cost !== undefined && proc.cost !== null && proc.cost !== "") {
           cost = Math.round(Number(proc.cost) * 100) / 100;
@@ -614,7 +655,6 @@ const updateVisit = async (req, res) => {
 
     await client.query("COMMIT");
 
-    // توثيق التعديل الإداري في سجل التدقيق
     if (currentVisit.status === "final") {
       try {
         await logActivity({
@@ -650,7 +690,7 @@ const updateVisit = async (req, res) => {
 };
 
 // ==========================================
-// 5. اعتماد وإغلاق الزيارة السريرية (POST /visits/:id/finalize)
+// 5. اعتماد وإغلاق الزيارة السريرية + التحديث التلقائي لشارت الأسنان والأسطح
 // ==========================================
 const finalizeVisit = async (req, res) => {
   const clinicId = req.user.clinic_id;
@@ -677,7 +717,6 @@ const finalizeVisit = async (req, res) => {
 
     const currentVisit = visitCheck.rows[0];
 
-    // الطبيب يعتمد زياراته فقط، بينما مدير العيادة يمكنه اعتماد أي زيارة
     if (req.user.role === "Doctor" && currentVisit.doctor_id !== req.user.id) {
       await client.query("ROLLBACK");
       return res.status(403).json({
@@ -685,12 +724,9 @@ const finalizeVisit = async (req, res) => {
       });
     }
 
-    // منع إعادة اعتماد زيارة معتمدة بالفعل وتغيير تاريخ اعتمادها الأصلي
     if (currentVisit.status === "final") {
       await client.query("ROLLBACK");
-
       const fullVisit = await fetchFullVisitById(pool, id, clinicId);
-
       return res.status(200).json({
         message: "سجل الزيارة معتمد بالفعل",
         visit: fullVisit,
@@ -698,6 +734,7 @@ const finalizeVisit = async (req, res) => {
       });
     }
 
+    // أ) تحديث حالة الزيارة إلى final
     const visitRes = await client.query(
       `
       UPDATE visits
@@ -713,7 +750,7 @@ const finalizeVisit = async (req, res) => {
 
     const visit = visitRes.rows[0];
 
-    // إكمال الموعد المرتبط تلقائياً
+    // ب) إكمال الموعد المرتبط تلقائياً
     if (visit.appointment_id) {
       await client.query(
         `
@@ -722,6 +759,128 @@ const finalizeVisit = async (req, res) => {
         WHERE id = $1 AND clinic_id = $2 AND status NOT IN ('cancelled', 'no_show');
         `,
         [visit.appointment_id, clinicId],
+      );
+    }
+
+    // ج) 🦷 المزامنة التلقائية مع شارت الأسنان والأسطح لإجراءات الزيارة
+    const proceduresToSync = await client.query(
+      `
+      SELECT
+        vp.tooth_number,
+        vp.surface,
+        vp.procedure_name,
+        pc.resulting_condition AS code_resulting_condition
+      FROM visit_procedures vp
+      LEFT JOIN procedure_codes pc
+        ON vp.procedure_code_id = pc.id AND pc.clinic_id = vp.clinic_id
+      WHERE vp.visit_id = $1
+        AND vp.clinic_id = $2
+        AND vp.tooth_number IS NOT NULL;
+      `,
+      [id, clinicId],
+    );
+
+    for (const proc of proceduresToSync.rows) {
+      const toothNum = Number(proc.tooth_number);
+      const dentition = toothNum >= 51 ? "deciduous" : "permanent";
+      const targetCondition = String(
+        proc.code_resulting_condition ||
+          inferResultingCondition(proc.procedure_name) ||
+          "",
+      )
+        .trim()
+        .toLowerCase();
+
+      // لا نغيّر الشارت إذا كانت الحالة الناتجة غير معروفة
+      if (!targetCondition) {
+        continue;
+      }
+
+      const autoNote = `إجراء سريري معتمد بالزيارة: ${proc.procedure_name}`;
+
+      // 1. تحديث أو إدخال السن في patient_teeth
+      const upsertTooth = await client.query(
+        `INSERT INTO patient_teeth (
+          clinic_id,
+          patient_id,
+          tooth_number,
+          dentition,
+          condition,
+          notes,
+          updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+        ON CONFLICT (clinic_id, patient_id, tooth_number)
+        DO UPDATE SET
+          dentition = EXCLUDED.dentition,
+          condition = EXCLUDED.condition,
+          notes = COALESCE(EXCLUDED.notes, patient_teeth.notes),
+          updated_at = CURRENT_TIMESTAMP
+        RETURNING id;`,
+        [
+          clinicId,
+          visit.patient_id,
+          toothNum,
+          dentition,
+          targetCondition,
+          autoNote,
+        ],
+      );
+
+      const toothRecordId = upsertTooth.rows[0].id;
+
+      // 2. تحديث الأسطح إذا كان الإجراء يحتوي على أسطح (أو مسحها في حال الخلع أو الزراعة)
+      if (["missing", "implant"].includes(targetCondition)) {
+        await client.query(
+          `DELETE FROM tooth_surfaces WHERE clinic_id = $1 AND tooth_record_id = $2;`,
+          [clinicId, toothRecordId],
+        );
+      } else if (proc.surface && /^[MODBLI]+$/.test(proc.surface)) {
+        const surfaceCodes = [...new Set(proc.surface.split(""))];
+        for (const sCode of surfaceCodes) {
+          await client.query(
+            `INSERT INTO tooth_surfaces (
+              clinic_id,
+              tooth_record_id,
+              surface,
+              condition,
+              notes,
+              updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+            ON CONFLICT (tooth_record_id, surface)
+            DO UPDATE SET
+              condition = EXCLUDED.condition,
+              notes = EXCLUDED.notes,
+              updated_at = CURRENT_TIMESTAMP;`,
+            [clinicId, toothRecordId, sCode, targetCondition, autoNote],
+          );
+        }
+      }
+
+      // 3. توثيق الإجراء في تاريخ السن tooth_history
+      await client.query(
+        `INSERT INTO tooth_history (
+          clinic_id,
+          patient_id,
+          tooth_number,
+          condition,
+          procedure_name,
+          surface,
+          notes,
+          created_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8);`,
+        [
+          clinicId,
+          visit.patient_id,
+          toothNum,
+          targetCondition,
+          proc.procedure_name,
+          proc.surface || null,
+          autoNote,
+          req.user.id,
+        ],
       );
     }
 
@@ -734,7 +893,7 @@ const finalizeVisit = async (req, res) => {
         action: "FINALIZE_VISIT",
         entity_type: "visit",
         entity_id: id,
-        description: `قام ${req.user.name || "الطبيب"} باعتماد وإغلاق سجل الزيارة السريري (#${id.slice(0, 8)})`,
+        description: `قام ${req.user.name || "الطبيب"} باعتماد وإغلاق سجل الزيارة السريري (#${id.slice(0, 8)}) وتحديث مخطط الأسنان`,
       });
     } catch (auditErr) {
       console.warn("Audit log failed:", auditErr.message);
@@ -742,7 +901,7 @@ const finalizeVisit = async (req, res) => {
 
     const fullVisit = await fetchFullVisitById(pool, id, clinicId);
     return res.status(200).json({
-      message: "تم اعتماد سجل الزيارة وإغلاقه رسمياً",
+      message: "تم اعتماد سجل الزيارة وتحديث مخطط أسنان المريض رسمياً",
       visit: fullVisit,
     });
   } catch (error) {
@@ -805,7 +964,6 @@ const createNoteTemplate = async (req, res) => {
     return res.status(400).json({ error: "عنوان القالب مطلوب" });
   }
 
-  // مدير العيادة فقط من يمكنه إنشاء قوالب عامة للعيادة كلها
   const targetDoctorId =
     req.user.role === "ClinicAdmin" && is_clinic_wide ? null : req.user.id;
 

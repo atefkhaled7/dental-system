@@ -3,6 +3,7 @@ const router = express.Router();
 const {
   getPatientTeeth,
   updateToothCondition,
+  updateToothSurface,
   getToothHistory,
 } = require("../controllers/dentalChartController");
 const authMiddleware = require("../middleware/authMiddleware");
@@ -18,19 +19,25 @@ router.get(
   "/patients/:patientId",
   authMiddleware,
   authorizeRole(...ALL),
-  getPatientTeeth
+  getPatientTeeth,
 );
 router.put(
   "/patients/:patientId/teeth/:toothNumber",
   authMiddleware,
   authorizeRole(...CLINICAL),
-  updateToothCondition
+  updateToothCondition,
+);
+router.put(
+  "/patients/:patientId/teeth/:toothNumber/surfaces/:surface",
+  authMiddleware,
+  authorizeRole(...CLINICAL),
+  updateToothSurface,
 );
 router.get(
   "/patients/:patientId/teeth/:toothNumber/history",
   authMiddleware,
   authorizeRole(...ALL),
-  getToothHistory
+  getToothHistory,
 );
 
 module.exports = router;

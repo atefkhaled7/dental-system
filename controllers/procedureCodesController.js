@@ -2,10 +2,29 @@ const pool = require("../db");
 const { captureError } = require("../utils/errorTracker");
 const { isValidUuid } = require("../middleware/validateUuid");
 
-// 1. إضافة كود إجراء جديد (مع دعم Auto-Restore إذا كان الكود محذوفاً سابقاً)
+// الحالات الـ 9 المعتمدة للربط التلقائي مع شارت الأسنان
+const VALID_RESULTING_CONDITIONS = new Set([
+  "sound",
+  "caries",
+  "filled",
+  "rct",
+  "crown",
+  "missing",
+  "implant",
+  "fracture",
+  "sealant",
+]);
+
+// 1. إضافة كود إجراء جديد (مع دعم Auto-Restore إذا كان الكود محذوفاً سابقاً ودعم resulting_condition)
 const createProcedureCode = async (req, res) => {
   const clinic_id = req.user.clinic_id;
-  const { default_price, description, code, duration_minutes } = req.body || {};
+  const {
+    default_price,
+    description,
+    code,
+    duration_minutes,
+    resulting_condition,
+  } = req.body || {};
 
   try {
     if (
@@ -75,6 +94,23 @@ const createProcedureCode = async (req, res) => {
       validatedDuration = parsedDuration;
     }
 
+    // فحص الحالة الناتجة للسن (اختيارية)
+    let validatedResultingCondition = null;
+    if (
+      resulting_condition !== undefined &&
+      resulting_condition !== null &&
+      resulting_condition !== ""
+    ) {
+      const cleanCondition = String(resulting_condition).trim().toLowerCase();
+      if (!VALID_RESULTING_CONDITIONS.has(cleanCondition)) {
+        return res.status(400).json({
+          error: "الحالة الناتجة للسن غير صالحة",
+          message: "الحالة الناتجة للسن غير صالحة",
+        });
+      }
+      validatedResultingCondition = cleanCondition;
+    }
+
     // 🔒 1. فحص هل الكود موجود مسبقاً في العيادة (سواء نشط أو معطل)
     const existingCheck = await pool.query(
       "SELECT id, is_active FROM procedure_codes WHERE clinic_id = $1 AND code = $2;",
@@ -93,15 +129,23 @@ const createProcedureCode = async (req, res) => {
 
       // ✅ 2. إذا كان الكود معطلاً، نقوم بإعادة تفعيله فوراً وتحديث بياناته
       const restoreResult = await pool.query(
-        `UPDATE procedure_codes 
-         SET is_active = true, 
-             description = $1, 
-             default_price = $2, 
-             duration_minutes = $3, 
-             updated_at = CURRENT_TIMESTAMP 
-         WHERE id = $4 AND clinic_id = $5 
+        `UPDATE procedure_codes
+         SET is_active = true,
+             description = $1,
+             default_price = $2,
+             duration_minutes = $3,
+             resulting_condition = $4,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $5 AND clinic_id = $6
          RETURNING *;`,
-        [cleanDesc, price, validatedDuration, existing.id, clinic_id],
+        [
+          cleanDesc,
+          price,
+          validatedDuration,
+          validatedResultingCondition,
+          existing.id,
+          clinic_id,
+        ],
       );
 
       return res.status(200).json({
@@ -112,10 +156,25 @@ const createProcedureCode = async (req, res) => {
 
     // 3. إنشاء كود جديد إذا لم يكن موجوداً من قبل
     const result = await pool.query(
-      `INSERT INTO procedure_codes (clinic_id, code, description, default_price, duration_minutes, is_active) 
-       VALUES ($1, $2, $3, $4, $5, true) 
-       RETURNING *;`,
-      [clinic_id, cleanCode, cleanDesc, price, validatedDuration],
+      `INSERT INTO procedure_codes (
+        clinic_id,
+        code,
+        description,
+        default_price,
+        duration_minutes,
+        resulting_condition,
+        is_active
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, true)
+      RETURNING *;`,
+      [
+        clinic_id,
+        cleanCode,
+        cleanDesc,
+        price,
+        validatedDuration,
+        validatedResultingCondition,
+      ],
     );
 
     res.status(201).json(result.rows[0]);
@@ -165,11 +224,17 @@ const getProcedureCodes = async (req, res) => {
   }
 };
 
-// 3. تعديل كود إجراء
+// 3. تعديل كود إجراء (مع دعم resulting_condition)
 const updateProcedureCode = async (req, res) => {
   const clinic_id = req.user.clinic_id;
   const { id } = req.params;
-  const { default_price, description, code, duration_minutes } = req.body || {};
+  const {
+    default_price,
+    description,
+    code,
+    duration_minutes,
+    resulting_condition,
+  } = req.body || {};
 
   if (!isValidUuid(id)) {
     return res.status(400).json({
@@ -180,7 +245,9 @@ const updateProcedureCode = async (req, res) => {
 
   try {
     const checkRes = await pool.query(
-      "SELECT id, code, description, default_price, duration_minutes FROM procedure_codes WHERE id = $1 AND clinic_id = $2 AND is_active = true;",
+      `SELECT id, code, description, default_price, duration_minutes, resulting_condition
+       FROM procedure_codes
+       WHERE id = $1 AND clinic_id = $2 AND is_active = true;`,
       [id, clinic_id],
     );
 
@@ -233,7 +300,24 @@ const updateProcedureCode = async (req, res) => {
       finalPrice = p;
     }
 
-    // 3. فحص الكود وتفادي قفل الأكواد المعطلة
+    // 3. فحص وتحديث الحالة الناتجة للسن
+    let finalResultingCondition = current.resulting_condition;
+    if (resulting_condition !== undefined) {
+      if (resulting_condition === null || resulting_condition === "") {
+        finalResultingCondition = null;
+      } else {
+        const cleanCondition = String(resulting_condition).trim().toLowerCase();
+        if (!VALID_RESULTING_CONDITIONS.has(cleanCondition)) {
+          return res.status(400).json({
+            error: "الحالة الناتجة للسن غير صالحة",
+            message: "الحالة الناتجة للسن غير صالحة",
+          });
+        }
+        finalResultingCondition = cleanCondition;
+      }
+    }
+
+    // 4. فحص الكود وتفادي تكرار الأكواد
     let finalCode = current.code;
     if (code && typeof code === "string") {
       const candidateCode = code.trim().toUpperCase();
@@ -283,15 +367,24 @@ const updateProcedureCode = async (req, res) => {
     }
 
     const result = await pool.query(
-      `UPDATE procedure_codes 
-       SET code = $1, 
-           description = $2, 
-           default_price = $3, 
-           duration_minutes = $4, 
-           updated_at = CURRENT_TIMESTAMP 
-       WHERE id = $5 AND clinic_id = $6 
+      `UPDATE procedure_codes
+       SET code = $1,
+           description = $2,
+           default_price = $3,
+           duration_minutes = $4,
+           resulting_condition = $5,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $6 AND clinic_id = $7
        RETURNING *;`,
-      [finalCode, finalDescription, finalPrice, finalDuration, id, clinic_id],
+      [
+        finalCode,
+        finalDescription,
+        finalPrice,
+        finalDuration,
+        finalResultingCondition,
+        id,
+        clinic_id,
+      ],
     );
 
     res.status(200).json(result.rows[0]);
@@ -331,9 +424,9 @@ const deleteProcedureCode = async (req, res) => {
 
   try {
     const result = await pool.query(
-      `UPDATE procedure_codes 
-       SET is_active = false, updated_at = CURRENT_TIMESTAMP 
-       WHERE id = $1 AND clinic_id = $2 AND is_active = true 
+      `UPDATE procedure_codes
+       SET is_active = false, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND clinic_id = $2 AND is_active = true
        RETURNING id, code;`,
       [id, clinic_id],
     );
@@ -392,9 +485,9 @@ const restoreProcedureCode = async (req, res) => {
     }
 
     const result = await pool.query(
-      `UPDATE procedure_codes 
-       SET is_active = true, updated_at = CURRENT_TIMESTAMP 
-       WHERE id = $1 AND clinic_id = $2 
+      `UPDATE procedure_codes
+       SET is_active = true, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND clinic_id = $2
        RETURNING *;`,
       [id, clinic_id],
     );

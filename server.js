@@ -7,7 +7,7 @@ const multer = require("multer");
 const pool = require("./db");
 const { captureError } = require("./utils/errorTracker");
 const app = express();
-
+const recallRoutes = require("./routes/recallRoutes");
 // 1. خلف Vercel / Reverse Proxy نثق في أول Hop عشان نقرأ IP العميل الحقيقي
 if (process.env.NODE_ENV === "production" || process.env.VERCEL) {
   app.set("trust proxy", 1);
@@ -113,6 +113,7 @@ app.use("/api/dental-chart", require("./routes/dentalChartRoutes"));
 app.use("/api/treatment-plans", require("./routes/treatmentPlansRoutes"));
 app.use("/api/patient-images", require("./routes/patientImagesRoutes"));
 app.use("/api/whatsapp", require("./routes/whatsappRoutes"));
+app.use("/api/recall", recallRoutes);
 app.use("/api/staff", require("./routes/staffRoutes"));
 app.use("/api/audit-logs", require("./routes/auditRoutes"));
 app.use(

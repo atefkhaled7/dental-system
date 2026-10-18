@@ -422,6 +422,18 @@ const getExpenses = async (req, res) => {
   const clinicId = req.user.clinic_id;
   const { from, to, category, search, page, limit } = req.query;
 
+  if (from && !isValidDate(from)) {
+    return res.status(400).json({
+      error: "تاريخ البداية غير صالح (YYYY-MM-DD)",
+    });
+  }
+
+  if (to && !isValidDate(to)) {
+    return res.status(400).json({
+      error: "تاريخ النهاية غير صالح (YYYY-MM-DD)",
+    });
+  }
+
   try {
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 25));
@@ -457,9 +469,15 @@ const getExpenses = async (req, res) => {
          e.amount,
          e.payment_method,
          TO_CHAR(e.expense_date, 'YYYY-MM-DD') AS expense_date,
-         e.vendor_name,
-         e.lab_order_id,
-         e.notes,
+e.vendor_name,
+e.lab_order_id,
+EXISTS (
+  SELECT 1
+  FROM commission_payouts cp
+  WHERE cp.expense_id = e.id
+    AND cp.clinic_id = e.clinic_id
+) AS is_payout,
+e.notes,
          e.created_at,
          u.name AS created_by_name,
          COUNT(*) OVER() AS full_count
@@ -805,15 +823,21 @@ const recordCommissionPayout = async (req, res) => {
       .json({ error: "إجمالي المبلغ المصروف يجب أن يكون أكبر من الصفر" });
   }
 
-  const commissionCents = Math.round(Number(commission_amount ?? 0) * 100);
-  const salaryCents = Math.round(Number(base_salary_amount ?? 0) * 100);
+  const requestedCommissionCents = Math.round(
+    Number(commission_amount ?? 0) * 100,
+  );
+
+  const requestedSalaryCents = Math.round(
+    Number(base_salary_amount ?? 0) * 100,
+  );
 
   if (
-    !Number.isFinite(commissionCents) ||
-    !Number.isFinite(salaryCents) ||
-    commissionCents < 0 ||
-    salaryCents < 0 ||
-    Math.round(parsedTotal * 100) !== commissionCents + salaryCents
+    !Number.isFinite(requestedCommissionCents) ||
+    !Number.isFinite(requestedSalaryCents) ||
+    requestedCommissionCents < 0 ||
+    requestedSalaryCents < 0 ||
+    Math.round(parsedTotal * 100) !==
+      requestedCommissionCents + requestedSalaryCents
   ) {
     return res.status(400).json({
       error:
@@ -832,7 +856,20 @@ const recordCommissionPayout = async (req, res) => {
     await client.query("BEGIN");
 
     const docRes = await client.query(
-      "SELECT id, name FROM users WHERE id = $1 AND clinic_id = $2 AND role = 'Doctor'",
+      `SELECT
+     u.id,
+     u.name,
+     COALESCE(sc.base_salary, 0) AS base_salary,
+     COALESCE(sc.commission_type, 'collected') AS commission_type,
+     COALESCE(sc.commission_rate, 0) AS commission_rate
+   FROM users u
+   LEFT JOIN staff_compensation sc
+     ON sc.user_id = u.id
+    AND sc.clinic_id = u.clinic_id
+   WHERE u.id = $1
+     AND u.clinic_id = $2
+     AND u.role = 'Doctor'
+   FOR UPDATE OF u`,
       [doctor_id, clinicId],
     );
     if (docRes.rows.length === 0) {
@@ -841,7 +878,233 @@ const recordCommissionPayout = async (req, res) => {
     }
 
     const doctorName = docRes.rows[0].name;
-    const cleanTotalPayout = Math.round(parsedTotal * 100) / 100;
+    const doctor = docRes.rows[0];
+
+    const commissionRate = Number(doctor.commission_rate || 0);
+    const baseSalaryCents = Math.round(Number(doctor.base_salary || 0) * 100);
+
+    // الراتب الثابت يُعامل كاستحقاق شهري، لذلك لا نسمح
+    // بتسجيل راتب عن فترة تمتد بين شهرين مختلفين.
+    if (
+      requestedSalaryCents > 0 &&
+      period_start.slice(0, 7) !== period_end.slice(0, 7)
+    ) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error:
+          "صرف الراتب الثابت يجب أن يكون ضمن شهر واحد. اختر فترة داخل الشهر المطلوب.",
+      });
+    }
+
+    // منع إعادة حساب العمولة عن نفس الأيام باستخدام فترة
+    // مختلفة ومتداخلة. يسمح باستكمال صرف جزئي لنفس الفترة بالضبط.
+    if (requestedCommissionCents > 0) {
+      const overlapRes = await client.query(
+        `SELECT 1
+     FROM commission_payouts
+     WHERE clinic_id = $1
+       AND doctor_id = $2
+       AND commission_amount > 0
+       AND period_start <= $4::date
+       AND period_end >= $3::date
+       AND NOT (
+         period_start = $3::date
+         AND period_end = $4::date
+       )
+     LIMIT 1`,
+        [clinicId, doctor_id, period_start, period_end],
+      );
+
+      if (overlapRes.rows.length > 0) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          error:
+            "تم تسجيل عمولة لفترة تتداخل مع الفترة المحددة. استخدم نفس بداية ونهاية الفترة السابقة لاستكمال الصرف، أو اختر فترة غير متداخلة.",
+        });
+      }
+    }
+
+    // حساب الفواتير والتحصيل وتكلفة المعمل من قاعدة البيانات.
+    // لا نثق في القيم المحسوبة التي ترسلها الواجهة.
+    const basisRes = await client.query(
+      `WITH doctor_invoiced AS (
+     SELECT COALESCE(SUM(inv.total_amount), 0) AS total
+     FROM invoices inv
+     LEFT JOIN appointments a
+       ON inv.appointment_id = a.id
+      AND a.clinic_id = $1
+     WHERE inv.clinic_id = $1
+       AND inv.status <> 'cancelled'
+       AND (inv.created_at AT TIME ZONE 'Africa/Cairo')::date
+           BETWEEN $3::date AND $4::date
+       AND COALESCE(inv.doctor_id, a.doctor_id) = $2
+   ),
+   doctor_collected AS (
+     SELECT COALESCE(SUM(pay.amount), 0) AS total
+     FROM payments pay
+     JOIN invoices inv
+       ON pay.invoice_id = inv.id
+      AND inv.clinic_id = $1
+     LEFT JOIN appointments a
+       ON inv.appointment_id = a.id
+      AND a.clinic_id = $1
+     WHERE pay.clinic_id = $1
+       AND pay.status = 'paid'
+       AND inv.status <> 'cancelled'
+       AND (pay.paid_at AT TIME ZONE 'Africa/Cairo')::date
+           BETWEEN $3::date AND $4::date
+       AND COALESCE(inv.doctor_id, a.doctor_id) = $2
+   ),
+   doctor_labs AS (
+     SELECT COALESCE(SUM(lo.cost), 0) AS total
+     FROM lab_orders lo
+     WHERE lo.clinic_id = $1
+       AND lo.status <> 'cancelled'
+       AND (lo.sent_at AT TIME ZONE 'Africa/Cairo')::date
+           BETWEEN $3::date AND $4::date
+       AND lo.doctor_id = $2
+   )
+   SELECT
+     (SELECT total FROM doctor_invoiced) AS total_revenue_generated,
+     (SELECT total FROM doctor_collected) AS total_collected_generated,
+     (SELECT total FROM doctor_labs) AS total_lab_cost`,
+      [clinicId, doctor_id, period_start, period_end],
+    );
+
+    const basisRow = basisRes.rows[0];
+
+    const revenueCents = Math.round(
+      Number(basisRow.total_revenue_generated || 0) * 100,
+    );
+
+    const collectedCents = Math.round(
+      Number(basisRow.total_collected_generated || 0) * 100,
+    );
+
+    const labCents = Math.round(Number(basisRow.total_lab_cost || 0) * 100);
+
+    let commissionBasisCents = collectedCents;
+
+    if (doctor.commission_type === "invoiced") {
+      commissionBasisCents = revenueCents;
+    } else if (doctor.commission_type === "after_lab_cost") {
+      commissionBasisCents = Math.max(0, collectedCents - labCents);
+    }
+
+    // قراءة إجمالي العمولة المصروفة وأساس أول دفعة عن نفس الفترة.
+    const previousCommissionRes = await client.query(
+      `SELECT
+         COALESCE(SUM(cp.commission_amount), 0) AS paid,
+         (
+           SELECT cp0.commission_rate
+           FROM commission_payouts cp0
+           WHERE cp0.clinic_id = $1
+             AND cp0.doctor_id = $2
+             AND cp0.period_start = $3::date
+             AND cp0.period_end = $4::date
+             AND cp0.commission_amount > 0
+           ORDER BY cp0.paid_at ASC, cp0.id ASC
+           LIMIT 1
+         ) AS locked_rate,
+         (
+           SELECT cp0.gross_basis_amount
+           FROM commission_payouts cp0
+           WHERE cp0.clinic_id = $1
+             AND cp0.doctor_id = $2
+             AND cp0.period_start = $3::date
+             AND cp0.period_end = $4::date
+             AND cp0.commission_amount > 0
+           ORDER BY cp0.paid_at ASC, cp0.id ASC
+           LIMIT 1
+         ) AS locked_basis,
+         (
+           SELECT cp0.lab_deduction_amount
+           FROM commission_payouts cp0
+           WHERE cp0.clinic_id = $1
+             AND cp0.doctor_id = $2
+             AND cp0.period_start = $3::date
+             AND cp0.period_end = $4::date
+             AND cp0.commission_amount > 0
+           ORDER BY cp0.paid_at ASC, cp0.id ASC
+           LIMIT 1
+         ) AS locked_lab_deduction
+       FROM commission_payouts cp
+       WHERE cp.clinic_id = $1
+         AND cp.doctor_id = $2
+         AND cp.period_start = $3::date
+         AND cp.period_end = $4::date`,
+      [clinicId, doctor_id, period_start, period_end],
+    );
+
+    const previousCommission = previousCommissionRes.rows[0];
+
+    const previousCommissionCents = Math.round(
+      Number(previousCommission.paid || 0) * 100,
+    );
+
+    const hasPreviousCommission = previousCommissionCents > 0;
+
+    // أول دفعة عمولة تحدد النسبة وأساس الحساب لبقية الدفعات
+    // الجزئية عن الفترة نفسها.
+    const effectiveCommissionRate = hasPreviousCommission
+      ? Number(previousCommission.locked_rate)
+      : commissionRate;
+
+    const effectiveCommissionBasisCents = hasPreviousCommission
+      ? Math.round(Number(previousCommission.locked_basis) * 100)
+      : commissionBasisCents;
+
+    const effectiveLabDeductionCents =
+      hasPreviousCommission && previousCommission.locked_lab_deduction !== null
+        ? Math.round(Number(previousCommission.locked_lab_deduction) * 100)
+        : labCents;
+
+    const calculatedCommissionCents = Math.round(
+      (effectiveCommissionBasisCents * effectiveCommissionRate) / 100,
+    );
+
+    const remainingCommissionCents = Math.max(
+      0,
+      calculatedCommissionCents - previousCommissionCents,
+    );
+
+    if (requestedCommissionCents > remainingCommissionCents) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: `العمولة المطلوبة تتجاوز المتبقي المستحق لهذه الفترة. المتبقي: ${(remainingCommissionCents / 100).toLocaleString("en-US")} ج.م`,
+      });
+    }
+
+    // الراتب يُحسب على مستوى شهر period_start، وليس على مستوى
+    // تاريخ الدفع الفعلي paid_at ولا عدد الأيام في الفلتر.
+    const previousSalaryRes = await client.query(
+      `SELECT COALESCE(SUM(base_salary_amount), 0) AS paid
+   FROM commission_payouts
+   WHERE clinic_id = $1
+     AND doctor_id = $2
+     AND period_start >= date_trunc('month', $3::date)::date
+     AND period_start <
+         (date_trunc('month', $3::date) + INTERVAL '1 month')::date`,
+      [clinicId, doctor_id, period_start],
+    );
+
+    const previousSalaryCents = Math.round(
+      Number(previousSalaryRes.rows[0].paid || 0) * 100,
+    );
+
+    const remainingSalaryCents = Math.max(
+      0,
+      baseSalaryCents - previousSalaryCents,
+    );
+
+    if (requestedSalaryCents > remainingSalaryCents) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        error: `الراتب المطلوب يتجاوز المتبقي من الراتب الثابت للشهر. المتبقي: ${(remainingSalaryCents / 100).toLocaleString("en-US")} ج.م`,
+      });
+    }
+    const cleanTotalPayout =
+      (requestedCommissionCents + requestedSalaryCents) / 100;
 
     // 1. تسجيل عملية الصرف تلقائياً في مصروفات العيادة
     const expenseRes = await client.query(
@@ -879,11 +1142,11 @@ const recordCommissionPayout = async (req, res) => {
         doctor_id,
         period_start,
         period_end,
-        Math.max(0, Math.round(Number(gross_basis_amount || 0) * 100) / 100),
-        Math.max(0, Math.round(Number(lab_deduction_amount || 0) * 100) / 100),
-        Math.min(100, Math.max(0, Number(commission_rate || 0))),
-        Math.max(0, Math.round(Number(commission_amount || 0) * 100) / 100),
-        Math.max(0, Math.round(Number(base_salary_amount || 0) * 100) / 100),
+        effectiveCommissionBasisCents / 100,
+        effectiveLabDeductionCents / 100,
+        effectiveCommissionRate,
+        requestedCommissionCents / 100,
+        requestedSalaryCents / 100,
         cleanTotalPayout,
         cleanMethod,
         createdExpense.id,
