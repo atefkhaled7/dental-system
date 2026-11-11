@@ -510,6 +510,7 @@ const getPatientById = async (req, res) => {
       return res.status(400).json({ error: "معرّف المريض غير صالح" });
     }
 
+
     const patientRes = await pool.query(
       "SELECT * FROM patients WHERE id = $1 AND clinic_id = $2",
       [patientId, clinicId],
@@ -566,6 +567,15 @@ const saveMedicalHistory = async (req, res) => {
     if (!isValidUuid(patientId)) {
       return res.status(400).json({ error: "معرّف المريض غير صالح" });
     }
+
+    const patientRes = await pool.query(
+  "SELECT 1 FROM patients WHERE id = $1 AND clinic_id = $2",
+  [patientId, clinicId],
+);
+
+if (patientRes.rows.length === 0) {
+  return res.status(404).json({ error: "المريض غير موجود" });
+}
 
     // جلب الحساسيات الحالية لإعادة احتساب مستوى الخطر الإجمالي
     const allergiesRes = await pool.query(
@@ -647,6 +657,16 @@ const addAllergy = async (req, res) => {
     if (!isValidUuid(patientId)) {
       return res.status(400).json({ error: "معرّف المريض غير صالح" });
     }
+
+    const patientRes = await pool.query(
+  "SELECT 1 FROM patients WHERE id = $1 AND clinic_id = $2",
+  [patientId, clinicId],
+);
+
+if (patientRes.rows.length === 0) {
+  return res.status(404).json({ error: "المريض غير موجود" });
+}
+
 
     if (!substance || !substance.trim()) {
       return res

@@ -5,6 +5,19 @@ const crypto = require("crypto");
 const { logActivity } = require("../utils/auditLogger");
 const { captureError } = require("../utils/errorTracker");
 const { sendResetPasswordEmail } = require("../services/emailService");
+const {
+  DEMO_CLINIC_SLUG,
+  isDemoUserEmail,
+  startOrTouchDemoSession,
+  endDemoSession,
+  manualResetDemoClinic,
+} = require("../services/demoClinicService");
+
+const isValidUuid = (val) =>
+  typeof val === "string" &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    val.trim(),
+  );
 
 const registerUser = async (req, res) => {
   try {
@@ -75,7 +88,8 @@ const loginUser = async (req, res) => {
       SELECT
         users.*,
         clinics.is_active AS clinic_is_active,
-        clinics.subscription_ends_at
+        clinics.subscription_ends_at,
+        clinics.slug AS clinic_slug
       FROM users
       LEFT JOIN clinics ON users.clinic_id = clinics.id
       WHERE users.email = $1
@@ -114,6 +128,40 @@ const loginUser = async (req, res) => {
       }
     }
 
+    const isDemo =
+      isDemoUserEmail(user.email) || user.clinic_slug === DEMO_CLINIC_SLUG;
+
+    let demoSessionId = null;
+    if (isDemo) {
+      if (!user.clinic_id) {
+        return res.status(500).json({
+          error: "تعذر تهيئة جلسة الحساب التجريبي، يرجى المحاولة مرة أخرى.",
+          code: "DEMO_SESSION_INIT_FAILED",
+        });
+      }
+
+      try {
+        const sessionInfo = await startOrTouchDemoSession({
+          clinicId: user.clinic_id,
+          userId: user.id,
+        });
+
+        if (!sessionInfo?.sessionId) {
+          throw new Error("Failed to obtain demo session_id");
+        }
+
+        demoSessionId = sessionInfo.sessionId;
+      } catch (demoErr) {
+        captureError(demoErr, req);
+        console.error("Failed to initialize demo session:", demoErr.message);
+        return res.status(500).json({
+          error:
+            "تعذر بدء جلسة الحساب التجريبي حالياً، يرجى المحاولة مرة أخرى.",
+          code: "DEMO_SESSION_INIT_FAILED",
+        });
+      }
+    }
+
     const token = jwt.sign(
       {
         id: user.id,
@@ -130,12 +178,15 @@ const loginUser = async (req, res) => {
     return res.status(200).json({
       message: "Login successful",
       token,
+      demo_session_id: demoSessionId,
       user: {
         id: user.id,
         name: user.name,
         email: user.email,
         role: user.role,
         clinic_id: user.clinic_id,
+        clinic_slug: user.clinic_slug,
+        is_demo: isDemo,
         subscription_ends_at: user.subscription_ends_at,
       },
     });
@@ -343,11 +394,7 @@ const updateProfile = async (req, res) => {
       });
     }
 
-    if (
-      ["demo@curosta.com", "doctor.demo@curosta.com"].includes(
-        req.user.email?.toLowerCase(),
-      )
-    ) {
+    if (isDemoUserEmail(req.user.email)) {
       return res.status(403).json({
         error: "هذا الحساب تجريبي للعرض فقط، لا يمكن تعديل بياناته الشخصية.",
         code: "DEMO_ACCOUNT_RESTRICTED",
@@ -385,11 +432,7 @@ const changePassword = async (req, res) => {
       });
     }
 
-    if (
-      ["demo@curosta.com", "doctor.demo@curosta.com"].includes(
-        req.user.email?.toLowerCase(),
-      )
-    ) {
+    if (isDemoUserEmail(req.user.email)) {
       return res.status(403).json({
         error:
           "هذا الحساب تجريبي للعرض فقط، لا يمكن تغيير كلمة المرور الخاصة به.",
@@ -470,7 +513,8 @@ const getMe = async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT users.id, users.name, users.email, users.role, users.clinic_id,
-              clinics.name AS clinic_name, clinics.is_active AS clinic_is_active,
+              clinics.name AS clinic_name, clinics.slug AS clinic_slug,
+              clinics.is_active AS clinic_is_active,
               clinics.subscription_ends_at
        FROM users
        LEFT JOIN clinics ON users.clinic_id = clinics.id
@@ -485,12 +529,149 @@ const getMe = async (req, res) => {
       });
     }
 
-    res.status(200).json({ user: result.rows[0] });
+    const userRow = result.rows[0];
+    userRow.is_demo =
+      isDemoUserEmail(userRow.email) ||
+      userRow.clinic_slug === DEMO_CLINIC_SLUG;
+
+    res.status(200).json({ user: userRow });
   } catch (error) {
     captureError(error, req);
     console.error("Error in getMe:", error.message);
     res.status(500).json({
       error: "خطأ في السيرفر",
+      code: "SERVER_ERROR",
+    });
+  }
+};
+
+// --- تتبع جلسات الديمو وإعادة الضبط الآمنة (Demo Session & Reset) ---
+
+const demoHeartbeat = async (req, res) => {
+  try {
+    const isDemo =
+      isDemoUserEmail(req.user?.email) ||
+      req.clinic?.slug === DEMO_CLINIC_SLUG;
+
+    if (!isDemo || !req.user?.clinic_id) {
+      return res.status(403).json({
+        error: "هذه العملية مخصصة لحساب الديمو فقط",
+        code: "NOT_DEMO_ACCOUNT",
+      });
+    }
+
+    const rawSessionId =
+      req.body?.session_id || req.header("x-demo-session-id") || null;
+    const validSessionId = isValidUuid(rawSessionId)
+      ? rawSessionId.trim()
+      : null;
+
+    const result = await startOrTouchDemoSession({
+      clinicId: req.user.clinic_id,
+      userId: req.user.id,
+      sessionId: validSessionId,
+    });
+
+    return res.status(200).json({
+      session_id: result.sessionId,
+      auto_reset_performed: Boolean(result.autoResetPerformed),
+    });
+  } catch (error) {
+    captureError(error, req);
+    console.error("Error in demoHeartbeat:", error.message);
+    return res.status(500).json({
+      error: "خطأ في تحديث جلسة الديمو",
+      code: "SERVER_ERROR",
+    });
+  }
+};
+
+const demoSessionEnd = async (req, res) => {
+  try {
+    const isDemo =
+      isDemoUserEmail(req.user?.email) ||
+      req.clinic?.slug === DEMO_CLINIC_SLUG;
+
+    if (!isDemo || !req.user?.clinic_id) {
+      return res.status(200).json({ ended: false });
+    }
+
+    const rawSessionId =
+      req.body?.session_id || req.header("x-demo-session-id") || null;
+    const validSessionId = isValidUuid(rawSessionId)
+      ? rawSessionId.trim()
+      : null;
+
+    if (!validSessionId) {
+      return res.status(200).json({ ended: false });
+    }
+
+    const result = await endDemoSession({
+      clinicId: req.user.clinic_id,
+      userId: req.user.id,
+      sessionId: validSessionId,
+    });
+
+    return res.status(200).json({ ended: result.ended });
+  } catch (error) {
+    captureError(error, req);
+    console.error("Error in demoSessionEnd:", error.message);
+    return res.status(500).json({
+      error: "خطأ أثناء إنهاء جلسة الديمو",
+      code: "SERVER_ERROR",
+    });
+  }
+};
+
+const demoManualReset = async (req, res) => {
+  try {
+    const isDemo =
+      isDemoUserEmail(req.user?.email) ||
+      req.clinic?.slug === DEMO_CLINIC_SLUG;
+
+    if (!isDemo || !req.user?.clinic_id) {
+      return res.status(403).json({
+        error: "إعادة ضبط البيانات متاحة لحساب الديمو التجريبي فقط.",
+        code: "NOT_DEMO_ACCOUNT",
+      });
+    }
+
+    if (!isDemoUserEmail(req.user?.email)) {
+  return res.status(403).json({
+    error: "إعادة الضبط متاحة للحسابات التجريبية الأساسية فقط.",
+    code: "DEMO_RESET_RESTRICTED",
+  });
+}
+
+    const rawSessionId =
+      req.body?.session_id || req.header("x-demo-session-id") || null;
+    const validSessionId = isValidUuid(rawSessionId)
+      ? rawSessionId.trim()
+      : null;
+
+    const result = await manualResetDemoClinic({
+      clinicId: req.user.clinic_id,
+      userId: req.user.id,
+      sessionId: validSessionId,
+    });
+
+    if (!result.success) {
+      return res.status(result.status || 409).json({
+        error: result.error,
+        code: result.code,
+      });
+    }
+
+    return res.status(200).json({
+      message:
+        "تمت إعادة ضبط بيانات حساب الديمو للوضع الافتراضي بنجاح.",
+      session_id: result.sessionId,
+    });
+  } catch (error) {
+    captureError(error, req);
+    console.error("Error in demoManualReset:", error.message);
+    return res.status(500).json({
+      error: "حدث خطأ أثناء إعادة ضبط بيانات الديمو",
       code: "SERVER_ERROR",
     });
   }
@@ -520,7 +701,7 @@ const forgotPassword = async (req, res) => {
     if (
       userRes.rows.length === 0 ||
       !userRes.rows[0].is_active ||
-      ["demo@curosta.com", "doctor.demo@curosta.com"].includes(normalizedEmail)
+      isDemoUserEmail(normalizedEmail)
     ) {
       return res.status(200).json({
         message:
@@ -689,6 +870,9 @@ module.exports = {
   updateProfile,
   changePassword,
   getMe,
+  demoHeartbeat,
+  demoSessionEnd,
+  demoManualReset,
   forgotPassword,
   resetPassword,
 };

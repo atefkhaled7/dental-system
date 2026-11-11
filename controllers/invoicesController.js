@@ -1154,7 +1154,7 @@ const getPatientFinancialStatement = async (req, res) => {
           [clinic_id],
         ),
         pool.query(
-          "SELECT id, name, phone_number, age, gender, created_at FROM patients WHERE id = $1 AND clinic_id = $2",
+          "SELECT id, name, phone_number, date_of_birth, gender, created_at FROM patients WHERE id = $1 AND clinic_id = $2",
           [patientId, clinic_id],
         ),
         pool.query(

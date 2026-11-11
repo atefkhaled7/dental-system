@@ -3,8 +3,13 @@ const pool = require("../db");
 const getDashboardStats = async (req, res) => {
   try {
     const clinicId = req.user.clinic_id;
-    const isClinicAdmin =
-      req.user.role === "ClinicAdmin";
+    const isClinicAdmin = req.user.role === "ClinicAdmin";
+    const isDoctor = req.user.role === "Doctor";
+
+    // للطبيب فقط: قصر مواعيد اليوم وطلبات المعامل العاجلة على حالاته الخاصة
+    const appointmentDoctorFilter = isDoctor ? "AND a.doctor_id = $2" : "";
+    const labDoctorFilter = isDoctor ? "AND lo.doctor_id = $2" : "";
+    const scopedParams = isDoctor ? [clinicId, req.user.id] : [clinicId];
 
     // 1. دخل اليوم الفعلي بتوقيت مصر (متاح للجميع لمطابقة كاش الدرج)
     const todayIncomeQuery = `
@@ -29,7 +34,7 @@ const getDashboardStats = async (req, res) => {
            AND p.paid_at < (date_trunc('month', NOW() AT TIME ZONE 'Africa/Cairo') + INTERVAL '1 month') AT TIME ZONE 'Africa/Cairo';`
       : `SELECT 0 AS month_income;`;
 
-    // 3. فلوس برة (تُحسب فقط لمدير العيادة لحماية الخصوصية)
+    // 3. إجمالي المستحقات (تُحسب فقط لمدير العيادة لحماية الخصوصية)
     const totalDuesQuery = isClinicAdmin
       ? `SELECT COALESCE(SUM(inv.total_amount - COALESCE(p_sum.total_paid, 0)), 0) AS total_dues
          FROM invoices inv
@@ -91,6 +96,7 @@ const getDashboardStats = async (req, res) => {
         GROUP BY i.patient_id
       ) patient_dues ON p.id = patient_dues.patient_id
       WHERE a.clinic_id = $1
+        ${appointmentDoctorFilter}
         AND DATE(a.appointment_date AT TIME ZONE 'Africa/Cairo') =
             (NOW() AT TIME ZONE 'Africa/Cairo')::date
       ORDER BY a.appointment_date ASC;
@@ -116,6 +122,7 @@ const getDashboardStats = async (req, res) => {
       JOIN patients p ON lo.patient_id = p.id AND p.clinic_id = lo.clinic_id
       JOIN users u ON lo.doctor_id = u.id AND u.clinic_id = lo.clinic_id
       WHERE lo.clinic_id = $1 
+        ${labDoctorFilter}
         AND lo.status NOT IN ('received', 'cancelled')
         AND (lo.expected_at AT TIME ZONE 'Africa/Cairo')::date <= (NOW() AT TIME ZONE 'Africa/Cairo')::date + 1
       ORDER BY lo.expected_at ASC;
@@ -148,23 +155,21 @@ const getDashboardStats = async (req, res) => {
       pendingBookingsRes,
     ] = await Promise.all([
       pool.query(todayIncomeQuery, [clinicId]),
-
       isClinicAdmin
         ? pool.query(monthIncomeQuery, [clinicId])
         : Promise.resolve({ rows: [{ month_income: 0 }] }),
-
       isClinicAdmin
         ? pool.query(totalDuesQuery, [clinicId])
         : Promise.resolve({ rows: [{ total_dues: 0 }] }),
-      pool.query(todayAppointmentsQuery, [clinicId]),
-      pool.query(urgentLabOrdersQuery, [clinicId]),
+      pool.query(todayAppointmentsQuery, scopedParams),
+      pool.query(urgentLabOrdersQuery, scopedParams),
       pool.query(activePatientsQuery, [clinicId]),
       pool.query(pendingBookingsQuery, [clinicId]),
     ]);
 
     const todayAppointments = appointmentsRes.rows;
 
-    // 👈 استبعاد المواعيد الملغية من عداد مواعيد اليوم النشطة
+    // استبعاد المواعيد الملغية من عداد مواعيد اليوم النشطة
     const activeAppointmentsCount = todayAppointments.filter(
       (a) => a.status !== "cancelled",
     ).length;
@@ -183,7 +188,7 @@ const getDashboardStats = async (req, res) => {
         total_dues: isClinicAdmin
           ? parseFloat(duesRes.rows[0]?.total_dues || 0)
           : null,
-        today_appointments_count: activeAppointmentsCount, // 👈 محسوب بدون الملغي
+        today_appointments_count: activeAppointmentsCount,
         today_completed_count: completedCount,
         urgent_lab_orders_count: labRes.rows.length,
         active_patients_count: parseInt(
@@ -193,7 +198,7 @@ const getDashboardStats = async (req, res) => {
         pending_bookings_count: parseInt(
           pendingBookingsRes.rows[0]?.pending_count || 0,
           10,
-        ), // 👈 عدد طلبات الأونلاين
+        ),
       },
       today_appointments: todayAppointments,
       urgent_lab_orders: labRes.rows,
