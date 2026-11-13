@@ -21,9 +21,21 @@ const bookingLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// تحديد معدل تسجيل بيانات زوار الديمو: أقصى حد 10 محاولات لكل IP كل 15 دقيقة
+const demoLeadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: {
+    error:
+      "تم تجاوز الحد المسموح به من المحاولات، يرجى المحاولة مرة أخرى بعد قليل.",
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // ميدلوير فخ البوتات (Honeypot)
 const checkHoneypot = (req, res, next) => {
-  if (req.body && req.body.fax_number) {
+  if (req.body && (req.body.fax_number || req.body.website)) {
     return res.status(400).json({ error: "تم رفض الطلب." });
   }
   next();
@@ -32,13 +44,18 @@ const checkHoneypot = (req, res, next) => {
 // ==========================================
 // أولاً: مسارات الجمهور (Public Endpoints)
 // ==========================================
-router.get("/clinics/:slug", publicBookingController.getPublicClinicProfile);
+router.post(
+  "/demo-leads",
+  demoLeadLimiter,
+  checkHoneypot,
+  publicBookingController.createDemoLead,
+);
 
+router.get("/clinics/:slug", publicBookingController.getPublicClinicProfile);
 router.get(
   "/clinics/:slug/slots",
   publicBookingController.getPublicAvailableSlots,
 );
-
 router.post(
   "/clinics/:slug/booking-requests",
   bookingLimiter,
@@ -55,14 +72,12 @@ router.get(
   authorizeRole("ClinicAdmin"),
   publicBookingController.getMyClinicSiteSettings,
 );
-
 router.put(
   "/site-settings/me",
   authMiddleware,
   authorizeRole("ClinicAdmin"),
   publicBookingController.updateMyClinicSiteSettings,
 );
-
 router.post(
   "/site-settings/upload-image",
   authMiddleware,
@@ -70,42 +85,36 @@ router.post(
   upload.single("image"),
   publicBookingController.uploadSiteAsset,
 );
-
 router.post(
   "/site-settings/gallery",
   authMiddleware,
   authorizeRole("ClinicAdmin"),
   publicBookingController.addGalleryItem,
 );
-
 router.delete(
   "/site-settings/gallery/:id",
   authMiddleware,
   authorizeRole("ClinicAdmin"),
   publicBookingController.deleteGalleryItem,
 );
-
 router.post(
   "/site-settings/faqs",
   authMiddleware,
   authorizeRole("ClinicAdmin"),
   publicBookingController.addClinicFaq,
 );
-
 router.delete(
   "/site-settings/faqs/:id",
   authMiddleware,
   authorizeRole("ClinicAdmin"),
   publicBookingController.deleteClinicFaq,
 );
-
 router.post(
   "/site-settings/testimonials",
   authMiddleware,
   authorizeRole("ClinicAdmin"),
   publicBookingController.addClinicTestimonial,
 );
-
 router.delete(
   "/site-settings/testimonials/:id",
   authMiddleware,

@@ -3,7 +3,17 @@ const bcrypt = require("bcrypt");
 
 const DEMO_CLINIC_SLUG = "curosta-demo";
 const DEMO_EMAILS = ["demo@curosta.com", "doctor.demo@curosta.com"];
+const DEMO_CLINIC_LOGO_URL =
+  "https://res.cloudinary.com/vpdxqgyw/image/upload/v1794436001/curosta_public_site/9995c997-f774-4978-9b5c-50f0f2555323/45996b4f-7d0d-4196-86a0-10732504211f.webp";
 
+const DEMO_CLINIC_COVER_URL =
+  "https://res.cloudinary.com/vpdxqgyw/image/upload/v1794436007/curosta_public_site/9995c997-f774-4978-9b5c-50f0f2555323/0ee8bf48-8200-4d1d-8d77-1664d7d4cce4.webp";
+
+const DEMO_CLINIC_LOGO_PUBLIC_ID =
+  "curosta_public_site/9995c997-f774-4978-9b5c-50f0f2555323/45996b4f-7d0d-4196-86a0-10732504211f";
+
+const DEMO_CLINIC_COVER_PUBLIC_ID =
+  "curosta_public_site/9995c997-f774-4978-9b5c-50f0f2555323/0ee8bf48-8200-4d1d-8d77-1664d7d4cce4";
 // مدة صلاحية الجلسة بدون Heartbeat (90 ثانية)
 const SESSION_TTL_SECONDS = 300;
 // مهلة السماح بعد انتهاء آخر جلسة قبل السماح بالـ Auto-Reset (60 ثانية)
@@ -251,48 +261,54 @@ const executeDemoResetInTransaction = async (
   );
 
   // 5. إعادة زراعة إعدادات الموقع العام والحجز الأونلاين ومواعيد عمل العيادة والمعرض والأسئلة والتقييمات
-  await client.query(
-    `INSERT INTO public.clinic_site (
-       clinic_id,
-       hero_title,
-       hero_subtitle,
-       logo_url,
-       cover_url,
-       logo_public_id,
-       cover_public_id,
-       whatsapp_number,
-       facebook_url,
-       instagram_url,
-       tiktok_url,
-       google_maps_url,
-       city,
-       area,
-       theme_color,
-       seo_title,
-       seo_description,
-       is_published
-     ) VALUES (
-       $1,
-       'مركز كوروستا التخصصي لطب الأسنان',
-       'مركز متكامل لجراحة وزراعة وتجميل الأسنان وعلاج الجذور بأحدث التقنيات.',
-       NULL,
-       NULL,
-       NULL,
-       NULL,
-       '01012345678',
-       'https://facebook.com/curosta',
-       'https://instagram.com/curosta',
-       NULL,
-       'https://maps.google.com',
-       'الجيزة',
-       'الدقي',
-       '#14b8a6',
-       'مركز كوروستا التخصصي لطب الأسنان | احجز موعدك أونلاين',
-       'مركز متكامل لجراحة وزراعة وتجميل الأسنان وعلاج الجذور في الدقي - الجيزة. احجز موعدك الآن أونلاين بسهولة.',
-       TRUE
-     );`,
-    [clinicId],
-  );
+await client.query(
+  `INSERT INTO public.clinic_site (
+     clinic_id,
+     hero_title,
+     hero_subtitle,
+     logo_url,
+     cover_url,
+     logo_public_id,
+     cover_public_id,
+     whatsapp_number,
+     facebook_url,
+     instagram_url,
+     tiktok_url,
+     google_maps_url,
+     city,
+     area,
+     theme_color,
+     seo_title,
+     seo_description,
+     is_published
+   ) VALUES (
+     $1,
+     'مركز كوروستا التخصصي لطب الأسنان',
+     'مركز متكامل لجراحة وزراعة وتجميل الأسنان وعلاج الجذور بأحدث التقنيات.',
+     $2,
+     $3,
+     $4,
+     $5,
+     '01012345678',
+     'https://facebook.com/curosta',
+     'https://instagram.com/curosta',
+     NULL,
+     'https://maps.google.com',
+     'الجيزة',
+     'الدقي',
+     '#14b8a6',
+     'مركز كوروستا التخصصي لطب الأسنان | احجز موعدك أونلاين',
+     'مركز متكامل لجراحة وزراعة وتجميل الأسنان وعلاج الجذور في الدقي - الجيزة. احجز موعدك الآن أونلاين بسهولة.',
+     TRUE
+   );`,
+  [
+    clinicId,
+    DEMO_CLINIC_LOGO_URL,
+    DEMO_CLINIC_COVER_URL,
+    DEMO_CLINIC_LOGO_PUBLIC_ID,
+    DEMO_CLINIC_COVER_PUBLIC_ID,
+  ],
+);
 
   await client.query(
     `INSERT INTO public.booking_settings (
@@ -360,7 +376,7 @@ const executeDemoResetInTransaction = async (
     [clinicId],
   );
 
-  // 6. إعادة زراعة قائمة الخدمات والأسعار الأساسية
+ // 6. إعادة زراعة قائمة الخدمات والأسعار الأساسية
   const procRes = await client.query(
     `INSERT INTO public.procedure_codes (clinic_id, code, description, default_price, duration_minutes, resulting_condition) VALUES
        ($1, 'CONS-01', 'كشف واستشارة وتشخيص شامل', 200, 20, NULL),
@@ -374,6 +390,7 @@ const executeDemoResetInTransaction = async (
   );
   const endoProc = procRes.rows.find((p) => p.code === "ENDO-01");
   const scalProc = procRes.rows.find((p) => p.code === "SCAL-01");
+  const prosProc = procRes.rows.find((p) => p.code === "PROS-01");
 
   // 7. شفتات عمل الطبيبة (طوال الأسبوع ما عدا الجمعة من 2 ظهراً لـ 10 مساءً)
   for (let day = 0; day <= 6; day++) {
@@ -386,22 +403,24 @@ const executeDemoResetInTransaction = async (
     }
   }
 
-  // 8. إضافة مرضى ببيانات مصرية صحيحة
+  // 8. إضافة مرضى ببيانات مصرية صحيحة (5 مرضى لتغطية المواعيد الحالية والاستدعاء الدوري بعد 6 شهور)
   const patientsRes = await client.query(
     `INSERT INTO public.patients (clinic_id, name, phone_number, gender, date_of_birth, medical_alerts, is_active) VALUES
        ($1, 'أحمد محمود إبراهيم', '01098765432', 'Male', '1992-05-14', 'حساسية شديدة من البنسلين ومشتقاته', TRUE),
        ($1, 'سارة عبد الرحمن', '01123456789', 'Female', '1998-11-20', 'ضغط دم منخفض', TRUE),
        ($1, 'محمد طارق حسن', '01234567890', 'Male', '1985-03-01', 'مريض سكري نوع ثاني منتظم', TRUE),
-       ($1, 'مريم خالد يوسف', '01555554433', 'Female', '2001-08-15', NULL, TRUE)
+       ($1, 'مريم خالد يوسف', '01555554433', 'Female', '2001-08-15', NULL, TRUE),
+       ($1, 'خالد فؤاد المنيري', '01066778899', 'Male', '1988-09-10', NULL, TRUE)
      RETURNING id, name;`,
     [clinicId],
   );
   const p1 = patientsRes.rows[0];
   const p2 = patientsRes.rows[1];
   const p3 = patientsRes.rows[2];
+  const p4 = patientsRes.rows[3];
+  const p5 = patientsRes.rows[4];
 
-  // 9. مواعيد منطقية
-  // 9. مواعيد ديمو متوافقة مع شيفت الطبيبة (2 ظهراً - 10 مساءً)
+  // 9. مواعيد ديمو متوافقة مع شيفت الطبيبة + مواعيد مكتملة أقدم من 6 شهور للاستدعاء الدوري (Recall)
   const apptRes = await client.query(
     `WITH cairo_clock AS (
        SELECT CURRENT_TIMESTAMP AT TIME ZONE 'Africa/Cairo' AS now_local
@@ -412,6 +431,26 @@ const executeDemoResetInTransaction = async (
            AT TIME ZONE 'Africa/Cairo' AS appointment_date
        FROM cairo_clock c
        CROSS JOIN generate_series(1, 7) AS offsets(day_offset)
+       WHERE EXTRACT(DOW FROM (c.now_local::date - offsets.day_offset)) <> 5
+       ORDER BY offsets.day_offset
+       LIMIT 1
+     ),
+     recall_slot_1 AS (
+       SELECT
+         ((c.now_local::date - offsets.day_offset) + TIME '16:00')
+           AT TIME ZONE 'Africa/Cairo' AS appointment_date
+       FROM cairo_clock c
+       CROSS JOIN generate_series(210, 220) AS offsets(day_offset)
+       WHERE EXTRACT(DOW FROM (c.now_local::date - offsets.day_offset)) <> 5
+       ORDER BY offsets.day_offset
+       LIMIT 1
+     ),
+     recall_slot_2 AS (
+       SELECT
+         ((c.now_local::date - offsets.day_offset) + TIME '18:00')
+           AT TIME ZONE 'Africa/Cairo' AS appointment_date
+       FROM cairo_clock c
+       CROSS JOIN generate_series(245, 255) AS offsets(day_offset)
        WHERE EXTRACT(DOW FROM (c.now_local::date - offsets.day_offset)) <> 5
        ORDER BY offsets.day_offset
        LIMIT 1
@@ -443,7 +482,9 @@ const executeDemoResetInTransaction = async (
        SELECT
          (SELECT appointment_date FROM past_slot) AS past_date,
          (SELECT appointment_date FROM future_slots WHERE slot_number = 1) AS future_date_1,
-         (SELECT appointment_date FROM future_slots WHERE slot_number = 2) AS future_date_2
+         (SELECT appointment_date FROM future_slots WHERE slot_number = 2) AS future_date_2,
+         (SELECT appointment_date FROM recall_slot_1) AS recall_date_1,
+         (SELECT appointment_date FROM recall_slot_2) AS recall_date_2
      )
      INSERT INTO public.appointments (
        clinic_id,
@@ -456,12 +497,14 @@ const executeDemoResetInTransaction = async (
      ) VALUES
        ($1, $2, $3, (SELECT past_date FROM chosen_dates), 45, 'completed', 'تمت جلسة حشو العصب بنجاح'),
        ($1, $4, $3, (SELECT future_date_1 FROM chosen_dates), 30, 'scheduled', 'جلسة تنظيف وتلميع أسنان دورية'),
-       ($1, $5, $3, (SELECT future_date_2 FROM chosen_dates), 45, 'scheduled', 'أخذ مقاسات تركيبة زيركون')
+       ($1, $5, $3, (SELECT future_date_2 FROM chosen_dates), 45, 'scheduled', 'أخذ مقاسات تركيبة زيركون'),
+       ($1, $6, $3, (SELECT recall_date_1 FROM chosen_dates), 30, 'completed', 'تنظيف جير وتلميع دوري - يوصى بالمتابعة بعد 6 أشهر'),
+       ($1, $7, $3, (SELECT recall_date_2 FROM chosen_dates), 45, 'completed', 'حشو تجميلي وفحص شامل للثة - استدعاء دوري كل 6 أشهر')
      RETURNING id, patient_id;`,
-    [clinicId, p1.id, doctorId, p2.id, p3.id],
+    [clinicId, p1.id, doctorId, p2.id, p3.id, p4.id, p5.id],
   );
 
-  // 10. فواتير ومدفوعات
+  // 10. فواتير ومدفوعات (تشمل partially_paid و unpaid و paid لعرض المتأخرات بوضوح في الديمو)
   const inv1Res = await client.query(
     `INSERT INTO public.invoices (clinic_id, patient_id, appointment_id, doctor_id, subtotal_amount, total_amount, status)
      VALUES ($1, $2, $3, $4, 1200, 1200, 'partially_paid') RETURNING id;`,
@@ -492,6 +535,18 @@ const executeDemoResetInTransaction = async (
     `INSERT INTO public.payments (clinic_id, invoice_id, amount, payment_method, status, paid_at, created_by)
      VALUES ($1, $2, 500, 'card', 'paid', CURRENT_TIMESTAMP, $3);`,
     [clinicId, inv2Res.rows[0].id, adminId],
+  );
+
+  // فاتورة غير مدفوعة (unpaid) لعرضها عند الضغط على رابط المتأخرات في شريط الديمو (/invoices?status=unpaid)
+  const inv3Res = await client.query(
+    `INSERT INTO public.invoices (clinic_id, patient_id, appointment_id, doctor_id, subtotal_amount, total_amount, status)
+     VALUES ($1, $2, $3, $4, 2500, 2500, 'unpaid') RETURNING id;`,
+    [clinicId, p3.id, apptRes.rows[2].id, doctorId],
+  );
+  await client.query(
+    `INSERT INTO public.invoice_items (clinic_id, invoice_id, procedure_code_id, description, quantity, unit_price, total_price)
+     VALUES ($1, $2, $3, 'تركيبة زيركون ألماني للضرس', 1, 2500, 2500);`,
+    [clinicId, inv3Res.rows[0].id, prosProc?.id || null],
   );
 
   // 11. طلب معمل

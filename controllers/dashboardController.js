@@ -11,16 +11,16 @@ const getDashboardStats = async (req, res) => {
     const labDoctorFilter = isDoctor ? "AND lo.doctor_id = $2" : "";
     const scopedParams = isDoctor ? [clinicId, req.user.id] : [clinicId];
 
-    // 1. دخل اليوم الفعلي بتوقيت مصر (متاح للجميع لمطابقة كاش الدرج)
-    const todayIncomeQuery = `
-      SELECT COALESCE(SUM(p.amount), 0) AS today_income
-      FROM payments p
-      JOIN invoices inv ON p.invoice_id = inv.id
-      WHERE p.clinic_id = $1 
-        AND p.status = 'paid'
-        AND inv.status <> 'cancelled'
-        AND (p.paid_at AT TIME ZONE 'Africa/Cairo')::date = (NOW() AT TIME ZONE 'Africa/Cairo')::date;
-    `;
+    // 1. دخل اليوم الفعلي بتوقيت مصر (يُجلب لمدير العيادة فقط لمنع تسريب أرقام الإيرادات لموظف الاستقبال من الـ API)
+    const todayIncomeQuery = isClinicAdmin
+      ? `SELECT COALESCE(SUM(p.amount), 0) AS today_income
+         FROM payments p
+         JOIN invoices inv ON p.invoice_id = inv.id
+         WHERE p.clinic_id = $1 
+           AND p.status = 'paid'
+           AND inv.status <> 'cancelled'
+           AND (p.paid_at AT TIME ZONE 'Africa/Cairo')::date = (NOW() AT TIME ZONE 'Africa/Cairo')::date;`
+      : `SELECT 0 AS today_income;`;
 
     // 2. إيرادات الشهر الحالي (تُحسب فقط لمدير العيادة لحماية الخصوصية)
     const monthIncomeQuery = isClinicAdmin
@@ -154,7 +154,9 @@ const getDashboardStats = async (req, res) => {
       patientsRes,
       pendingBookingsRes,
     ] = await Promise.all([
-      pool.query(todayIncomeQuery, [clinicId]),
+      isClinicAdmin
+        ? pool.query(todayIncomeQuery, [clinicId])
+        : Promise.resolve({ rows: [{ today_income: 0 }] }),
       isClinicAdmin
         ? pool.query(monthIncomeQuery, [clinicId])
         : Promise.resolve({ rows: [{ month_income: 0 }] }),
@@ -168,20 +170,20 @@ const getDashboardStats = async (req, res) => {
     ]);
 
     const todayAppointments = appointmentsRes.rows;
-
     // استبعاد المواعيد الملغية من عداد مواعيد اليوم النشطة
     const activeAppointmentsCount = todayAppointments.filter(
       (a) => a.status !== "cancelled",
     ).length;
-
     const completedCount = todayAppointments.filter(
       (a) => a.status === "completed",
     ).length;
 
     res.status(200).json({
       stats: {
-        today_income: parseFloat(incomeRes.rows[0]?.today_income || 0),
-        // لو مش أدمن هترجع null لحماية الأسرار المالية
+        // إخفاء جميع أرقام الإيرادات والمستحقات عن غير الـ ClinicAdmin من الـ API نفسه
+        today_income: isClinicAdmin
+          ? parseFloat(incomeRes.rows[0]?.today_income || 0)
+          : null,
         month_income: isClinicAdmin
           ? parseFloat(monthIncomeRes.rows[0]?.month_income || 0)
           : null,

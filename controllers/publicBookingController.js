@@ -136,32 +136,6 @@ const resolveClinic = async (identifier) => {
   return null;
 };
 
-// التحقق الاختياري من Cloudflare Turnstile إن كان مفعلاً في السيرفر
-const verifyTurnstileToken = async (token, remoteIp) => {
-  const secretKey = process.env.TURNSTILE_SECRET_KEY;
-  if (!secretKey) return true; // غير مفعل في البيئة الحالية
-  if (!token) return false;
-
-  try {
-    const response = await fetch(
-      "https://challenges.cloudflare.com/turnstile/v0/siteverify",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          secret: secretKey,
-          response: token,
-          remoteip: remoteIp,
-        }),
-      },
-    );
-    const data = await response.json();
-    return Boolean(data.success);
-  } catch (err) {
-    console.error("Turnstile verification error:", err.message);
-    return false;
-  }
-};
 
 // ==========================================
 // 1. جلب بيانات الموقع العام للعيادة + SEO JSON-LD (GET /public/clinics/:slug)
@@ -695,6 +669,7 @@ const getPublicAvailableSlots = async (req, res) => {
 // 3. إنشاء طلب حجز عام (POST /public/clinics/:slug/booking-requests)
 // يستهلك محرك التعارضات المركزي وفحص الكراسي
 // ==========================================
+// ✅ بعد (الاعتماد على Honeypot + Rate Limit + منع تكرار الطلب المعلق لنفس الرقم دون رفض الطلب عند غياب Turnstile):
 const createPublicBookingRequest = async (req, res) => {
   const slug = req.params.slug || req.params.slugOrId;
   const {
@@ -704,20 +679,11 @@ const createPublicBookingRequest = async (req, res) => {
     patient_name,
     patient_phone,
     notes,
-    cf_turnstile_token,
   } = req.body || {};
 
   let client;
 
   try {
-    // التحقق من Cloudflare Turnstile إن كان مفعلاً
-    const turnstileOk = await verifyTurnstileToken(cf_turnstile_token, req.ip);
-    if (!turnstileOk) {
-      return res.status(400).json({
-        error:
-          "فشل التحقق الأمني ضد البوتات، يرجى تحديث الصفحة والمحاولة ثانية.",
-      });
-    }
 
     const resolved = await resolveClinic(slug);
     if (!resolved || !resolved.clinic) {
@@ -1893,10 +1859,179 @@ const deleteClinicTestimonial = async (req, res) => {
   }
 };
 
+
+
+// ==========================================
+// 5. حفظ بيانات زوار الديمو (POST /api/public/demo-leads)
+// يحفظ في قاعدة البيانات أولاً ثم يرسل إشعار تليجرام معزول بـ AbortSignal.timeout(2500)
+// ==========================================
+
+const escapeTelegramHtml = (value) =>
+  String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[char]);
+
+const sendTelegramLeadAlert = async (lead) => {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!botToken || !chatId) return;
+
+ const phoneDigits = String(lead.phone || "").replace(/\D/g, "");
+const waPhone = phoneDigits.startsWith("20")
+  ? phoneDigits
+  : `2${phoneDigits}`;
+
+const lines = [
+  "🔥 <b>زائر جديد دخل الديمو (Curosta Lead)</b>",
+  `👤 <b>الاسم:</b> ${escapeTelegramHtml(lead.name)}`,
+  `📱 <b>واتساب:</b> <code>${escapeTelegramHtml(lead.phone)}</code>`,
+  `💬 <a href="https://wa.me/${waPhone}">فتح محادثة واتساب فوراً</a>`,
+];
+
+if (lead.utm_source || lead.utm_campaign || lead.utm_content) {
+  const campaign = [
+    lead.utm_source,
+    lead.utm_medium,
+    lead.utm_campaign,
+    lead.utm_content,
+  ]
+    .filter(Boolean)
+    .map(escapeTelegramHtml)
+    .join(" / ");
+
+  lines.push(`📊 <b>الحملة:</b> ${campaign}`);
+}
+
+  try {
+    const response = await fetch(
+  `https://api.telegram.org/bot${botToken}/sendMessage`,
+  {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: lines.join("\n"),
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      }),
+      signal: AbortSignal.timeout(2500),
+    });
+    if (!response.ok) {
+  console.error(
+    "Telegram lead notification failed:",
+    response.status,
+  );
+}
+  } catch (err) {
+    console.error("Telegram lead notification skipped/timed out:", err.message);
+  }
+};
+
+const createDemoLead = async (req, res) => {
+  const {
+    name,
+    phone,
+    consent_given,
+    consent_purpose,
+    utm_source,
+    utm_medium,
+    utm_campaign,
+    utm_content,
+    fbclid,
+    fax_number,
+    website,
+  } = req.body || {};
+
+  // فحص Honeypot إضافي
+  if (fax_number || website) {
+    return res.status(400).json({ error: "تم رفض الطلب." });
+  }
+
+  if (!name || typeof name !== "string" || name.trim().length < 2) {
+    return res.status(400).json({
+      error: "يرجى إدخال اسم الطبيب أو العيادة (حرفين على الأقل)",
+    });
+  }
+
+  const cleanPhone = normalizeEgyptianPhone(phone);
+  if (!cleanPhone) {
+    return res.status(400).json({
+      error: "يرجى إدخال رقم موبايل مصري صحيح (مثال: 01012345678)",
+    });
+  }
+
+  if (consent_given !== true) {
+    return res.status(400).json({
+      error: "يرجى الموافقة على التواصل عبر الواتساب للدخول للتجربة",
+    });
+  }
+
+  const cleanStr = (val, max) =>
+    typeof val === "string" && val.trim() ? val.trim().slice(0, max) : null;
+
+  try {
+    const insertRes = await pool.query(
+      `INSERT INTO demo_leads (
+        name,
+        phone,
+        consent_given,
+        consent_at,
+        consent_purpose,
+        utm_source,
+        utm_medium,
+        utm_campaign,
+        utm_content,
+        fbclid,
+        ip_address,
+        user_agent
+      )
+      VALUES ($1, $2, TRUE, CURRENT_TIMESTAMP, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING id, name, phone, utm_source, utm_medium, utm_campaign, utm_content, created_at;`,
+      [
+        name.trim().slice(0, 120),
+        cleanPhone,
+        cleanStr(consent_purpose, 255) || "demo_followup_and_onboarding",
+        cleanStr(utm_source, 100),
+        cleanStr(utm_medium, 100),
+        cleanStr(utm_campaign, 150),
+        cleanStr(utm_content, 150),
+        cleanStr(fbclid, 255),
+        cleanStr(req.ip, 64),
+        cleanStr(req.get("user-agent"), 500),
+      ],
+    );
+
+    const savedLead = insertRes.rows[0];
+
+    // إشعار التليجرام يتنفذ بـ await داخل try/catch معزول بـ AbortSignal.timeout(2500) قبل res.status(201)
+    try {
+      await sendTelegramLeadAlert(savedLead);
+    } catch {
+      // معزول تماماً لا يعطل الرد
+    }
+
+    return res.status(201).json({
+      success: true,
+      lead_id: savedLead.id,
+    });
+  } catch (error) {
+    captureError(error, req);
+    console.error("Error saving demo lead:", error.message);
+    return res.status(500).json({
+      error: "حدث خطأ أثناء حفظ البيانات",
+    });
+  }
+};
+
 module.exports = {
   getPublicClinicProfile,
   getPublicAvailableSlots,
   createPublicBookingRequest,
+  createDemoLead,
   getMyClinicSiteSettings,
   updateMyClinicSiteSettings,
   uploadSiteAsset,
